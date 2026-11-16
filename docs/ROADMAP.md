@@ -41,10 +41,10 @@
 ## M3 — 过程化核心
 
 - ChaCha8 路径键控 RNG 流
-- RusdScatter / RusdGrid / RusdInstance（展开结果写入 openusd Stage）
-- 预算、增量展开、内容哈希缓存、实例覆盖
+- 城市 suite（D4，docs/GENERATORS.md）：RusdStreetGrid / RusdBuilding / RusdBlockFill + 通用 RusdScatter（写入 openusd Stage）
+- 分区预设、预算与确定性截断、增量展开、内容哈希缓存、实例覆盖
 - `rusd expand`（含 --dry-run）
-- 验收：同 seed 两次展开逐字节一致；改兄弟节点不 reshuffle；超预算有诊断
+- 验收：同 seed 逐字节一致；改街区 A 不 reshuffle 街区 B；6×6 城市在预算内；超预算确定性截断+诊断
 
 ## M4 — 渲染 MVP
 

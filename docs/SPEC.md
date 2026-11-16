@@ -75,8 +75,9 @@ Rusd 专注 agent 优先的表层语法、过程化展开、增量前端与渲�
 - 内建 schema（首批）：`Xform, Cube, Sphere, Cylinder, Mesh, Camera, Material,
   DirectionalLight, PointLight`。几何/材质/灯光尽量映射到 openusd 的 UsdGeom/UsdShade/UsdLux
   schema，减少自维护表面。
-- Generator schema（`Rusd` 命名空间，按里程碑引入）：`RusdScatter, RusdGrid, RusdInstance,
-  RusdLSystem, RusdTerrain, RusdWfc`。这些是 Rusd 独有、openusd 没有的过程化扩展。
+- Generator schema（`Rusd` 命名空间，Rusd 独有、openusd 没有的过程化扩展）。**首批做城市（D4）**：
+  `RusdStreetGrid, RusdBuilding, RusdBlockFill` + 通用 `RusdScatter`；后续 `RusdLSystem,
+  RusdTerrain, RusdWfc`。参数与组合详见 `docs/GENERATORS.md`。
 - 未知 schema：警告 `W_UNKNOWN_SCHEMA`，按无类型 prim 保留（前向兼容，同 USD 精神）。
 - **诊断**（JSON，code 稳定、一旦发布不复用）：
 
@@ -97,6 +98,8 @@ Rusd 专注 agent 优先的表层语法、过程化展开、增量前端与渲�
   openusd 的 `StageSink` 编辑事件 + 可回放 `Diff` 直接支撑 provenance/diff/undo。
 
 ## 5. 过程化语义（核心差异，Rusd 独有）
+
+首批 generator 域 = 城市（D4）；suite 设计见 `docs/GENERATORS.md`。
 
 - Generator = **纯函数**：`(params, seed, inputs) → 子树`。禁止隐式全局状态、时钟、外部随机源。
 - **RNG**：ChaCha8；流键 = `hash(stage.seed, prim_path, local_seed)`。
@@ -203,10 +206,10 @@ parse (CST) → compose → validate → expand → render
 - **D2**（2026-11-16）：增量管线为一等需求（§6），含"增量 ≡ 全量"不变量与延迟目标。
 - **D3**（2026-11-16）：依赖 openusd 0.8 作为场景/合成/互操作后端（§6/§9，源码 + 实证）。
   原 O6 关闭。workspace MSRV 提升至 1.96。
+- **D4**（2026-11-16）：首批 generator 域 = 城市（§3/§5，docs/GENERATORS.md）。原 O3 关闭。
 
 开放：
 
 - **O2** 互操作硬约束——D3 后基本满足（openusd 原生 usdc/usdz 导出）；待确认目标 DCC 清单。
-- **O3** 首批 generator 的内容域：自然（森林 / 地形）、城市 / 建筑，还是通用？
 - **O4** 默认 `up_axis`：建议 Z-up 右手系（PCG 数学习惯）；USD 默认 Y-up，导出时转换。
 - **O5** MCP adapter 的优先级（M5 内做，还是提前）。
