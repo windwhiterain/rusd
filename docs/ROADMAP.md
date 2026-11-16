@@ -62,11 +62,11 @@
 
 - [x] wgpu device/headless 出图 spike（DX12 + RTX 3060 Ti，离屏渲染 + readback + PNG，2026-11-16）
 - [x] 几何提取层 rusd-scene::geometry：Stage→网格/世界变换/相机（xformOpOrder 复合、内建细分、Mesh 三角化、容错占位）；city/forest 验收（2026-11-16）
-- [ ] wgpu headless：beauty + prim-id pass、camera、确定性截图
-- 容错占位 + 诊断叠加；确定性截图
-- 热重载交互 viewer（winit + egui），走 SPEC §6 增量管线
-- `rusd render` / `rusd pick`
-- 验收：forest.rusd 出图；id pass 像素 → prim path 往返正确
+- [x] wgpu headless：beauty + prim-id（R32Uint）pass、look-at 相机、确定性截图（2026-11-16）
+- [x] 容错品红占位 + 确定性截图；诊断叠加待做
+- [ ] 热重载交互 viewer（winit + egui），走 SPEC §6 增量管线
+- [x] `rusd render` / `rusd pick`（beauty/ids PNG + metadata JSON；pick 像素→path，2026-11-16）
+- [x] 验收：forest/city 出图；id pass 像素 → prim path 往返正确（2000/2000，确定性，2026-11-16）
 
 ## M5 — Agent 协议
 

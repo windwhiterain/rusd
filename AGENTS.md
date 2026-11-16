@@ -44,3 +44,22 @@ cargo run -p spike-openusd    # O6 增量合成实证基准（SPEC §6）
 - **语法改动先改 SPEC**，再改实现与测试；每个语法规则配往返测试。
 - 过程化输出必须可复现：RNG 只从 `(stage.seed, prim_path, local_seed)` 派生。
 - 提交信息：`<crate>: <做了什么>`，小步提交；提交前 fmt + test 全绿。
+
+## wgpu 30 API 注意（M4 渲染器，已踩平）
+
+- `Instance::new` 收**值**（非引用）；`InstanceDescriptor` 无 Default，用
+  `..InstanceDescriptor::new_without_display_handle()`。
+- `RequestAdapterOptions` / `DeviceDescriptor` 有 Default，可 `..Default::default()`。
+- `RenderPassColorAttachment` 需 `depth_slice: None`；`RenderPassDescriptor` /
+  `RenderPipelineDescriptor` 需 `multiview_mask: None`（不是 multiview）。
+- `DepthStencilState.depth_write_enabled` / `depth_compare` 是 `Option`；
+  `VertexState.buffers` 元素是 `Option<VertexBufferLayout>`。
+- `PipelineLayoutDescriptor.bind_group_layouts` 元素是 `Option<&BindGroupLayout>`；
+  无 `push_constant_ranges`，改 `immediate_size: 0`。
+- 两个 pipeline 共用 bind group ⇒ 必须显式共享 BindGroupLayout + PipelineLayout
+  （`layout: None` 的自动布局互斥，跨 pipeline 用会 validation error）。
+- copy 用 `TexelCopyTextureInfo` / `TexelCopyBufferInfo` / `TexelCopyBufferLayout`；
+  `device.poll(wgpu::PollType::wait_indefinitely())`；`get_mapped_range()` 返回 Result。
+- readback 行距须对齐 `COPY_BYTES_PER_ROW_ALIGNMENT`(256)，读回按行去 padding。
+- prim-id pass 用 `R32Uint` 渲染目标 + `@interpolate(flat)` u32，pick 读精确整数 id。
+- 相机：Z-up look-at + 透视，wgpu clip z 在 [0,1]（near→0, far→1），depth_compare Less。
