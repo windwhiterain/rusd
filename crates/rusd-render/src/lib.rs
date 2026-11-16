@@ -19,7 +19,7 @@ pub mod annotate;
 pub mod capture;
 pub mod render;
 
-pub use render::{RenderOutput, render};
+pub use render::{RenderConfig, RenderOutput, render, render_with};
 pub use rusd_core as core;
 pub use rusd_proc as proc;
 pub use rusd_scene as scene;
@@ -116,6 +116,7 @@ mod tests {
                 color: [255, 0, 0],
                 mode: crate::annotate::SelectMode::Recolor,
             }],
+            &crate::annotate::Style::default(),
         );
         let after = r.beauty[pos * 4..pos * 4 + 3].to_vec();
         assert_ne!(before, after, "selected pixel recolored");

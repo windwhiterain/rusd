@@ -5,13 +5,39 @@
 //! - [`draw_markers`]: reticles at the pixels the agent reported, so it can see
 //!   where it pointed.
 //! - [`apply_selection`]: highlight selected prims by id — recolor (preserving
-//!   shading) and/or a screen-space silhouette outline. Multi-select, one color
-//!   per prim.
+//!   shading) and/or a silhouette outline. Multi-select, one color per prim.
 //!
 //! Selection is addressed by stable prim path (mapped to the render's id table),
 //! never by pixel, so it survives re-renders.
+//!
+//! All visual knobs live in [`Style`] (outline width, marker radius, recolor
+//! shading) so nothing is hardcoded. The outline expands **only inward into its
+//! own id's pixels**, so two selected prims' outlines never overwrite each other.
 
 use crate::render::RenderOutput;
+
+/// Tunable annotation parameters (all configurable; sensible defaults).
+#[derive(Clone, Copy, Debug)]
+pub struct Style {
+    /// Outline thickness in pixels, expanding inward into the prim's own region.
+    /// 0 disables the outline.
+    pub outline_width: u32,
+    /// Reticle ring radius in pixels (arms extend to ~2× radius).
+    pub marker_radius: u32,
+    /// How much of the original shading a recolor keeps: 0 = flat selection color,
+    /// 1 = full original luminance. Default 0.7.
+    pub recolor_shading: f32,
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Self {
+            outline_width: 2,
+            marker_radius: 6,
+            recolor_shading: 0.7,
+        }
+    }
+}
 
 /// A point the agent reported, drawn as a reticle.
 #[derive(Clone, Copy, Debug)]
@@ -85,29 +111,30 @@ pub fn parse_color(s: &str) -> Option<[u8; 3]> {
 
 /// Highlight selected prims in the beauty buffer (ids/paths unchanged, so picking
 /// still works). Unknown paths are skipped.
-pub fn apply_selection(r: &mut RenderOutput, selections: &[Selection]) {
+pub fn apply_selection(r: &mut RenderOutput, selections: &[Selection], style: &Style) {
     for sel in selections {
         let Some(idx) = r.paths.iter().position(|p| p == &sel.path) else {
             continue;
         };
         let id = (idx + 1) as u32;
         if matches!(sel.mode, SelectMode::Recolor | SelectMode::Both) {
-            recolor_id(r, id, sel.color);
+            recolor_id(r, id, sel.color, style.recolor_shading);
         }
         if matches!(sel.mode, SelectMode::Outline | SelectMode::Both) {
-            outline_id(r, id, sel.color);
+            outline_id(r, id, sel.color, style.outline_width);
         }
     }
 }
 
-fn recolor_id(r: &mut RenderOutput, id: u32, color: [u8; 3]) {
+fn recolor_id(r: &mut RenderOutput, id: u32, color: [u8; 3], shading: f32) {
+    let keep = shading.clamp(0.0, 1.0);
     for (i, &pid) in r.ids.iter().enumerate() {
         if pid != id {
             continue;
         }
         let px = &mut r.beauty[i * 4..i * 4 + 4];
         let luma = 0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32;
-        let k = 0.3 + 0.7 * (luma / 255.0);
+        let k = (1.0 - keep) + keep * (luma / 255.0);
         px[0] = (color[0] as f32 * k) as u8;
         px[1] = (color[1] as f32 * k) as u8;
         px[2] = (color[2] as f32 * k) as u8;
@@ -115,35 +142,42 @@ fn recolor_id(r: &mut RenderOutput, id: u32, color: [u8; 3]) {
     }
 }
 
-fn outline_id(r: &mut RenderOutput, id: u32, color: [u8; 3]) {
+/// Inward-only silhouette outline: paint only pixels that belong to `id` and lie
+/// within `width` px of a pixel that does not (or the image border). Because it
+/// never touches another id's pixels, overlapping selections cannot cover each
+/// other's outlines.
+fn outline_id(r: &mut RenderOutput, id: u32, color: [u8; 3], width: u32) {
+    if width == 0 {
+        return;
+    }
     let w = r.width as i32;
     let h = r.height as i32;
-    // A pixel is on the silhouette if its 3x3 neighborhood mixes this id with
-    // something else (background or another prim). Collect first, then paint, so
-    // the boundary test reads the original ids, not freshly painted colors.
+    let t = width as i32;
+    // Collect first, then paint, so the boundary test reads original ids.
     let mut edge: Vec<usize> = Vec::new();
     for y in 0..h {
         for x in 0..w {
-            let mut has_id = false;
-            let mut has_other = false;
-            for dy in -1..=1 {
-                for dx in -1..=1 {
+            let p = (y * w + x) as usize;
+            if r.ids[p] != id {
+                continue; // only expand into our own region
+            }
+            let mut boundary = false;
+            'outer: for dy in -t..=t {
+                for dx in -t..=t {
                     let nx = x + dx;
                     let ny = y + dy;
                     if nx < 0 || ny < 0 || nx >= w || ny >= h {
-                        has_other = true; // image border counts as outside
-                        continue;
+                        boundary = true;
+                        break 'outer;
                     }
-                    let nid = r.ids[(ny * w + nx) as usize];
-                    if nid == id {
-                        has_id = true;
-                    } else {
-                        has_other = true;
+                    if r.ids[(ny * w + nx) as usize] != id {
+                        boundary = true;
+                        break 'outer;
                     }
                 }
             }
-            if has_id && has_other {
-                edge.push((y * w + x) as usize);
+            if boundary {
+                edge.push(p);
             }
         }
     }
@@ -157,18 +191,23 @@ fn outline_id(r: &mut RenderOutput, id: u32, color: [u8; 3]) {
 }
 
 /// Draw reticles (ring + four arms) at the reported pixels, on top of everything.
-pub fn draw_markers(r: &mut RenderOutput, markers: &[Marker]) {
+pub fn draw_markers(r: &mut RenderOutput, markers: &[Marker], style: &Style) {
     let w = r.width as i32;
     let h = r.height as i32;
+    let rad = style.marker_radius.max(1) as i32;
+    let ring_lo = (rad - 1) * (rad - 1);
+    let ring_hi = (rad + 1) * (rad + 1);
+    let arm_lo = rad + 2;
+    let arm_hi = rad * 2;
     for m in markers {
         let cx = m.x as i32;
         let cy = m.y as i32;
-        for dy in -13i32..=13 {
-            for dx in -13i32..=13 {
+        for dy in -arm_hi..=arm_hi {
+            for dx in -arm_hi..=arm_hi {
                 let d2 = dx * dx + dy * dy;
-                let ring = (25..=49).contains(&d2); // radius ~5..7
-                let arm = (dx.abs() <= 1 && (64..=144).contains(&d2) && dy.abs() >= 8)
-                    || (dy.abs() <= 1 && (64..=144).contains(&d2) && dx.abs() >= 8);
+                let ring = d2 >= ring_lo && d2 <= ring_hi;
+                let arm = (dx.abs() <= 1 && dy.abs() >= arm_lo && dy.abs() <= arm_hi)
+                    || (dy.abs() <= 1 && dx.abs() >= arm_lo && dx.abs() <= arm_hi);
                 if !(ring || arm) {
                     continue;
                 }
@@ -191,21 +230,19 @@ pub fn draw_markers(r: &mut RenderOutput, markers: &[Marker]) {
 mod tests {
     use super::*;
 
-    /// A tiny synthetic render: 8x8, prim id 1 fills a 4x4 block at (2,2)-(5,5),
-    /// rest background (id 0). Beauty is mid-gray everywhere.
+    /// 16x16, prim id 1 fills a 10x10 block (3,3)-(12,12), rest background.
     fn fake() -> RenderOutput {
-        let (w, h) = (8u32, 8u32);
+        let (w, h) = (16u32, 16u32);
         let mut ids = vec![0u32; (w * h) as usize];
-        for y in 2..6 {
-            for x in 2..6 {
+        for y in 3..13 {
+            for x in 3..13 {
                 ids[(y * w + x) as usize] = 1;
             }
         }
-        let beauty = vec![128u8; (w * h * 4) as usize];
         RenderOutput {
             width: w,
             height: h,
-            beauty,
+            beauty: vec![128u8; (w * h * 4) as usize],
             ids,
             paths: vec!["/World/Box".to_owned()],
             diags: vec![],
@@ -230,17 +267,14 @@ mod tests {
                 color: [255, 0, 0],
                 mode: SelectMode::Recolor,
             }],
+            &Style::default(),
         );
-        // inside the block: recolored red-ish, green/blue zero
-        let inside = (3 * 8 + 3) * 4;
+        let inside = (7 * 16 + 7) * 4;
         assert!(r.beauty[inside] > 100);
         assert_eq!(r.beauty[inside + 1], 0);
         assert_eq!(r.beauty[inside + 2], 0);
-        // background untouched
-        let outside = 0;
-        assert_eq!(&r.beauty[outside..outside + 3], &[128, 128, 128]);
-        // ids unchanged
-        assert_eq!(r.ids[3 * 8 + 3], 1);
+        assert_eq!(&r.beauty[0..3], &[128, 128, 128]); // background untouched
+        assert_eq!(r.ids[7 * 16 + 7], 1); // ids unchanged
     }
 
     #[test]
@@ -253,13 +287,101 @@ mod tests {
                 color: [0, 255, 0],
                 mode: SelectMode::Outline,
             }],
+            &Style {
+                outline_width: 2,
+                ..Style::default()
+            },
         );
-        // deep interior pixel (3,3) has all neighbors id 1 -> not painted
-        let interior = (3 * 8 + 3) * 4;
+        // deep interior (7,7) is >2px from any non-id -> not painted
+        let interior = (7 * 16 + 7) * 4;
         assert_eq!(&r.beauty[interior..interior + 3], &[128, 128, 128]);
-        // a boundary pixel (2,2) neighbors background -> painted green
-        let boundary = (2 * 8 + 2) * 4;
+        // boundary (3,3) neighbors background -> painted green
+        let boundary = (3 * 16 + 3) * 4;
         assert_eq!(&r.beauty[boundary..boundary + 3], &[0, 255, 0]);
+    }
+
+    #[test]
+    fn outline_width_is_configurable() {
+        let mut r1 = fake();
+        apply_selection(
+            &mut r1,
+            &[Selection {
+                path: "/World/Box".into(),
+                color: [0, 255, 0],
+                mode: SelectMode::Outline,
+            }],
+            &Style {
+                outline_width: 1,
+                ..Style::default()
+            },
+        );
+        // (4,4) is 1px inside the edge: painted at width 1? its nearest non-id is
+        // (2,4) at distance 2 -> NOT within 1, so stays gray at width 1.
+        let p = (4 * 16 + 4) * 4;
+        assert_eq!(&r1.beauty[p..p + 3], &[128, 128, 128]);
+        let mut r2 = fake();
+        apply_selection(
+            &mut r2,
+            &[Selection {
+                path: "/World/Box".into(),
+                color: [0, 255, 0],
+                mode: SelectMode::Outline,
+            }],
+            &Style {
+                outline_width: 2,
+                ..Style::default()
+            },
+        );
+        // at width 2 the same pixel is within 2 of the edge -> painted
+        assert_eq!(&r2.beauty[p..p + 3], &[0, 255, 0]);
+    }
+
+    #[test]
+    fn outline_stays_within_own_id_no_overwrite() {
+        // Two adjacent blocks: id 1 x[2,6), id 2 x[6,10), y[2,10) in a 12x12.
+        let (w, h) = (12u32, 12u32);
+        let mut ids = vec![0u32; (w * h) as usize];
+        for y in 2..10 {
+            for x in 2..6 {
+                ids[(y * w + x) as usize] = 1;
+            }
+            for x in 6..10 {
+                ids[(y * w + x) as usize] = 2;
+            }
+        }
+        let mut r = RenderOutput {
+            width: w,
+            height: h,
+            beauty: vec![128u8; (w * h * 4) as usize],
+            ids,
+            paths: vec!["/A".to_owned(), "/B".to_owned()],
+            diags: vec![],
+        };
+        apply_selection(
+            &mut r,
+            &[Selection {
+                path: "/A".into(),
+                color: [255, 0, 0],
+                mode: SelectMode::Outline,
+            }],
+            &Style {
+                outline_width: 2,
+                ..Style::default()
+            },
+        );
+        // every id-2 pixel must be untouched (inward-only outline never crosses ids)
+        for (i, &pid) in r.ids.iter().enumerate() {
+            if pid == 2 {
+                assert_eq!(
+                    &r.beauty[i * 4..i * 4 + 3],
+                    &[128, 128, 128],
+                    "id2 pixel {i} overwritten"
+                );
+            }
+        }
+        // and id 1's shared edge (5,5) is painted red
+        let edge = (5 * 12 + 5) * 4;
+        assert_eq!(&r.beauty[edge..edge + 3], &[255, 0, 0]);
     }
 
     #[test]
@@ -273,6 +395,7 @@ mod tests {
                 color: [255, 0, 0],
                 mode: SelectMode::Both,
             }],
+            &Style::default(),
         );
         assert_eq!(r.beauty, before);
     }
@@ -295,11 +418,10 @@ mod tests {
                 y: 16,
                 color: [255, 255, 0],
             }],
+            &Style::default(),
         );
-        // ring pixel at (16+6,16): d2=36 in 25..=49 -> yellow
-        let ring = (16 * w + 22) as usize * 4;
+        let ring = (16 * w + 22) as usize * 4; // radius 6
         assert_eq!(&r.beauty[ring..ring + 3], &[255, 255, 0]);
-        // hollow center stays gray
         let center = (16 * w + 16) as usize * 4;
         assert_eq!(&r.beauty[center..center + 3], &[128, 128, 128]);
     }

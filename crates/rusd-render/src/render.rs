@@ -1,19 +1,23 @@
 //! Headless wgpu rendering core (SPEC §7): bake extracted geometry to world-space
 //! GPU buffers, render a beauty pass and a prim-id pass, read both back.
 //!
-//! - Beauty: simple forward directional + ambient lighting into an sRGB target.
+//! - Beauty: forward directional + ambient lighting into an sRGB target.
 //! - Prim-id: each prim flat-shaded with its stable id (index+1) into an `R32Uint`
 //!   target, so `pick(x, y)` reads an exact integer id → prim path (0 = background).
 //! - Z-up right-handed camera (D7); wgpu clip z in [0, 1].
 //! - Error-tolerant: a device/render failure returns diagnostics, never panics.
 //!
-//! v0 bakes one world-space mesh and issues a single draw per pass (GPU instancing
-//! and the content-hash mesh cache land later in M4).
+//! Every visual knob is in [`RenderConfig`] (size, background, fov override, light
+//! direction / ambient / diffuse, and the annotation [`Style`]); nothing is
+//! hardcoded. v0 bakes one world-space mesh and issues a single draw per pass (GPU
+//! instancing and the content-hash mesh cache land later in M4).
 
 use bytemuck::{Pod, Zeroable};
 use rusd_core::Diagnostic;
 use rusd_scene::geometry::{self, Mat, SceneGeometry};
 use wgpu::util::DeviceExt;
+
+use crate::annotate::Style;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -50,8 +54,45 @@ impl RenderOutput {
     }
 }
 
+/// All configurable render parameters. Defaults reproduce the reference look.
+#[derive(Clone, Debug)]
+pub struct RenderConfig {
+    pub width: u32,
+    pub height: u32,
+    /// Linear clear color (sky).
+    pub background: [f32; 3],
+    /// Override the scene camera's vertical fov (degrees); `None` uses the scene's.
+    pub fov_deg: Option<f64>,
+    /// Direction the light travels *from* (normalized in-shader).
+    pub light_dir: [f32; 3],
+    pub ambient: f32,
+    pub diffuse: f32,
+    /// Annotation knobs (outline width, marker radius, recolor shading).
+    pub style: Style,
+}
+
+impl Default for RenderConfig {
+    fn default() -> Self {
+        Self {
+            width: 800,
+            height: 600,
+            background: [0.55, 0.7, 0.85],
+            fov_deg: None,
+            light_dir: [0.5, -0.6, 0.8],
+            ambient: 0.28,
+            diffuse: 0.82,
+            style: Style::default(),
+        }
+    }
+}
+
 const SHADER: &str = r#"
-@group(0) @binding(0) var<uniform> view_proj: mat4x4<f32>;
+struct Uniforms {
+    view_proj: mat4x4<f32>,
+    light: vec4<f32>,    // xyz = direction, w = ambient
+    params: vec4<f32>,   // x = diffuse
+};
+@group(0) @binding(0) var<uniform> u: Uniforms;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -68,7 +109,7 @@ fn vs_main(
     @location(3) id: u32,
 ) -> VsOut {
     var out: VsOut;
-    out.pos = view_proj * vec4<f32>(pos, 1.0);
+    out.pos = u.view_proj * vec4<f32>(pos, 1.0);
     out.normal = normal;
     out.color = color;
     out.id = id;
@@ -78,9 +119,9 @@ fn vs_main(
 @fragment
 fn fs_beauty(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.normal);
-    let l = normalize(vec3<f32>(0.5, -0.6, 0.8));
+    let l = normalize(u.light.xyz);
     let diff = max(dot(n, l), 0.0);
-    let c = in.color * (0.28 + 0.82 * diff);
+    let c = in.color * (u.light.w + u.params.x * diff);
     return vec4<f32>(c, 1.0);
 }
 
@@ -90,13 +131,26 @@ fn fs_id(in: VsOut) -> @location(0) u32 {
 }
 "#;
 
-/// Render a scene headlessly at `width`×`height`.
+/// Render headlessly at `width`×`height` with default configuration.
 pub fn render(
     geo: &SceneGeometry,
     width: u32,
     height: u32,
 ) -> Result<RenderOutput, Vec<Diagnostic>> {
-    pollster::block_on(render_async(geo, width, height))
+    let cfg = RenderConfig {
+        width,
+        height,
+        ..Default::default()
+    };
+    render_with(geo, &cfg)
+}
+
+/// Render headlessly with a full configuration.
+pub fn render_with(
+    geo: &SceneGeometry,
+    cfg: &RenderConfig,
+) -> Result<RenderOutput, Vec<Diagnostic>> {
+    pollster::block_on(render_async(geo, cfg))
 }
 
 fn device_err(e: impl std::fmt::Display) -> Vec<Diagnostic> {
@@ -105,9 +159,9 @@ fn device_err(e: impl std::fmt::Display) -> Vec<Diagnostic> {
 
 async fn render_async(
     geo: &SceneGeometry,
-    width: u32,
-    height: u32,
+    cfg: &RenderConfig,
 ) -> Result<RenderOutput, Vec<Diagnostic>> {
+    let (width, height) = (cfg.width, cfg.height);
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::DX12,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -131,30 +185,39 @@ async fn render_async(
 
     // --- bake world-space geometry ---
     let (vertices, indices, paths) = bake(geo);
-    let vertex_bytes = bytemuck::cast_slice(&vertices);
-    let index_bytes = bytemuck::cast_slice(&indices);
     let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("vertices"),
-        contents: vertex_bytes,
+        contents: bytemuck::cast_slice(&vertices),
         usage: wgpu::BufferUsages::VERTEX,
     });
     let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("indices"),
-        contents: index_bytes,
+        contents: bytemuck::cast_slice(&indices),
         usage: wgpu::BufferUsages::INDEX,
     });
 
-    // --- camera ---
-    let cam = geo.camera.unwrap_or(geometry::Camera {
+    // --- camera + lighting uniforms ---
+    let mut cam = geo.camera.unwrap_or(geometry::Camera {
         position: [0.0, -10.0, 5.0],
         look_at: [0.0; 3],
         fov_deg: 50.0,
     });
+    if let Some(fov) = cfg.fov_deg {
+        cam.fov_deg = fov;
+    }
     let view_proj = camera_matrix(cam, geo.bounds, width, height);
-    let vp_f32: [f32; 16] = view_proj.map(|v| v as f32);
-    let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("camera"),
-        contents: bytemuck::cast_slice(&vp_f32),
+    let mut uni = [0f32; 24];
+    for (i, v) in view_proj.iter().enumerate() {
+        uni[i] = *v as f32;
+    }
+    uni[16] = cfg.light_dir[0];
+    uni[17] = cfg.light_dir[1];
+    uni[18] = cfg.light_dir[2];
+    uni[19] = cfg.ambient;
+    uni[20] = cfg.diffuse;
+    let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("uniforms"),
+        contents: bytemuck::cast_slice(&uni),
         usage: wgpu::BufferUsages::UNIFORM,
     });
 
@@ -198,10 +261,28 @@ async fn render_async(
     let id_view = id_tex.create_view(&Default::default());
     let depth_view = depth_tex.create_view(&Default::default());
 
-    // --- pipelines ---
+    // --- pipelines (shared explicit layout so one bind group serves both) ---
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("rusd"),
         source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+    });
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("uniforms"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("rusd"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
     });
     let vertex_layout = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<Vertex>() as u64,
@@ -236,24 +317,6 @@ async fn render_async(
         stencil: Default::default(),
         bias: Default::default(),
     };
-    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("camera"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        }],
-    });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: Some("rusd"),
-        bind_group_layouts: &[Some(&bgl)],
-        immediate_size: 0,
-    });
     let beauty_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("beauty"),
         layout: Some(&pipeline_layout),
@@ -311,15 +374,21 @@ async fn render_async(
         cache: None,
     });
     let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("camera"),
+        label: Some("uniforms"),
         layout: &bgl,
         entries: &[wgpu::BindGroupEntry {
             binding: 0,
-            resource: camera_buf.as_entire_binding(),
+            resource: uniform_buf.as_entire_binding(),
         }],
     });
 
     // --- encode both passes ---
+    let bg = wgpu::Color {
+        r: cfg.background[0] as f64,
+        g: cfg.background[1] as f64,
+        b: cfg.background[2] as f64,
+        a: 1.0,
+    };
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("rusd"),
     });
@@ -331,12 +400,7 @@ async fn render_async(
                 resolve_target: None,
                 depth_slice: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: 0.55,
-                        g: 0.7,
-                        b: 0.85,
-                        a: 1.0,
-                    }),
+                    load: wgpu::LoadOp::Clear(bg),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -480,7 +544,6 @@ struct NormalMatrix {
 
 impl NormalMatrix {
     fn new(m: Mat) -> Self {
-        // upper 3x3 in row-major
         let r = [m[0], m[4], m[8], m[1], m[5], m[9], m[2], m[6], m[10]];
         let det = r[0] * (r[4] * r[8] - r[5] * r[7]) - r[1] * (r[3] * r[8] - r[5] * r[6])
             + r[2] * (r[3] * r[7] - r[4] * r[6]);
