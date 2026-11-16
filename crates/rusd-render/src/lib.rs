@@ -15,6 +15,7 @@
 //! Error-tolerant by contract: invalid prims become magenta placeholders plus
 //! diagnostics; a render call always returns, never panics the agent loop.
 
+pub mod annotate;
 pub mod capture;
 pub mod render;
 
@@ -98,6 +99,31 @@ mod tests {
         let r2 = crate::render::render(&geo, 320, 240).expect("re-render");
         assert_eq!(r.beauty, r2.beauty, "deterministic beauty pixels");
         assert_eq!(r.ids, r2.ids, "deterministic id pixels");
+    }
+
+    #[test]
+    fn selection_recolor_and_pick_still_works() {
+        let geo = extract(CITY);
+        let mut r = crate::render::render(&geo, 320, 240).expect("render");
+        let target = "/World/City/b1_1/lot0_0";
+        let id = (r.paths.iter().position(|p| p == target).unwrap() + 1) as u32;
+        let pos = r.ids.iter().position(|&i| i == id).expect("prim visible");
+        let before = r.beauty[pos * 4..pos * 4 + 3].to_vec();
+        crate::annotate::apply_selection(
+            &mut r,
+            &[crate::annotate::Selection {
+                path: target.into(),
+                color: [255, 0, 0],
+                mode: crate::annotate::SelectMode::Recolor,
+            }],
+        );
+        let after = r.beauty[pos * 4..pos * 4 + 3].to_vec();
+        assert_ne!(before, after, "selected pixel recolored");
+        assert!(after[0] > after[1] && after[0] > after[2], "red-dominant");
+        // ids unchanged -> pick still resolves the same path
+        let x = (pos as u32) % r.width;
+        let y = (pos as u32) / r.width;
+        assert_eq!(r.pick(x, y), Some(target));
     }
 
     #[test]
