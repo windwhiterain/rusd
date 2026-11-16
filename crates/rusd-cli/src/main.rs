@@ -78,6 +78,30 @@ fn main() {
                 Err(diags) => print_diags(&diags),
             }
         }
+        Some("query") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: rusd query <file.rusd>");
+                std::process::exit(2);
+            };
+            let text = read(path);
+            match rusd_core::syntax::parse(&text) {
+                Ok(doc) => match rusd_scene::lower(&doc) {
+                    Ok(stage) => {
+                        for d in rusd_scene::composition_diags(&stage) {
+                            println!("{}", d.to_json());
+                        }
+                        for info in rusd_scene::query(&stage, &doc) {
+                            println!("[{}] type={}", info.path, info.type_name);
+                            for (n, v) in &info.props {
+                                println!("  {n} = {v}");
+                            }
+                        }
+                    }
+                    Err(diags) => print_diags(&diags),
+                },
+                Err(diags) => print_diags(&diags),
+            }
+        }
         Some(other) => {
             eprintln!("rusd: '{other}' is not implemented yet — see docs/ROADMAP.md");
             std::process::exit(2);

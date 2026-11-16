@@ -1,11 +1,15 @@
 //! # rusd-scene
 //!
-//! The scene layer (SPEC §3–4). M2 step 1: schema registry + validation.
-//! M2 step 2 adds the openusd Stage adapter (TOML → Stage lowering, cook engine,
-//! session overlay, diagnostics mapping).
+//! The scene layer (SPEC §3–4):
+//! - [`schema`]: typed property registry for builtin + generator schemas.
+//! - [`validate`]: schema/type/required checks producing stable-code diagnostics.
+//! - [`adapter`]: lower a parsed document into a composed openusd Stage (D3),
+//!   query it, and map composition diagnostics back to Rusd JSON.
 
+pub mod adapter;
 pub mod schema;
 pub mod validate;
 
+pub use adapter::{PrimInfo, composition_diags, lower, query};
 pub use schema::{PropType, SchemaDef, SchemaKind};
 pub use validate::validate;

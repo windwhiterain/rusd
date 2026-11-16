@@ -38,12 +38,13 @@
 
 **Step 2（进行中）**：openusd Stage 适配 + cook 引擎通用化
 
-- [ ] `rusd-scene`：TOML prim 树 → openusd Stage 下沉（匿名 root + LayerRegistry，Z-up）
-- [ ] 字符串 coerce + 内建几何映射 UsdGeom / UsdShade / UsdLux
+- [x] `rusd-scene`：TOML prim 树 → openusd Stage 下沉（`in_memory` 匿名 root，Z-up 元数据）
+- [x] 值 coerce：标量/向量/数组 → USD 类型；generator 参数 author 为 custom 属性
+- [x] 诊断映射：`CompositionDiagnostic` → Rusd JSON（E_ARC_CYCLE / E_UNRESOLVED_LAYER / …）
+- [x] `rusd query`：合成 prim + USD 类型名 + 属性值（forest/city 实测，adapter 4 测试）
 - [ ] cook 引擎通用化（cook_graph spike → 拓扑排序 + 内容哈希 memo + 脏传播）
 - [ ] session overlay（edit_target_session）+ provenance（StageSink/Diff）
-- [ ] 诊断映射：openusd CompositionDiagnostic → Rusd JSON
-- [ ] `rusd query` / `rusd expand` 雏形
+- [ ] `rusd expand` 雏形
 - 验收：forest.rusd 下沉为合规 Stage；非法场景给可定位诊断；overlay 覆盖 base 可演示；
       单属性编辑走 openusd 定向失效（复用 spike 基准）
 
