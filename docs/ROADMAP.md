@@ -72,7 +72,8 @@
 
 ## M5 — Agent 协议
 
-- `rusd serve`：stdio JSON-RPC 工具集（SPEC §8）；diff/undo 复用 openusd
+- [x] `rusd serve`：stdio JSON-RPC（NDJSON）有状态 session + open/query/validate/expand/render/pick（2026-11-16）
+- [ ] patch（编辑文档 CST，D11）+ diff/undo/redo
 - Python 操作脚本套件（D10，替代 MCP）：subprocess 驱动 `rusd` CLI / JSON-RPC，机器可读 JSON
 - 验收：一个 agent 从一句 prompt 出发，经 query→patch→validate→render 循环建出森林场景
 

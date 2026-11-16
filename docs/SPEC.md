@@ -222,6 +222,7 @@ parse (CST) → compose → validate → expand → render
 - **D8**（2026-11-16）：cook 图 = 路径依赖隐式 DAG（read∩write 诱导），cook 包裹 USD 合成；节点输出 layer 非 stage（docs/PIPELINE.md §10，implicit_cook 实证）。
 - **D9**（2026-11-16）：cook 只包过程化生成，不包 USD 合成操作；compose op 全归 openusd pcp（docs/PIPELINE.md §10）。
 - **D10**（2026-11-16）：agent 操作接口 = 一套 Python 脚本（subprocess 驱动 rusd CLI / JSON-RPC），不做 MCP adapter。原 O5 关闭。
+- **D11**（2026-11-16）：`patch` 编辑 TOML 文档本身（toml_edit CST opinion ops），非 session-layer——cook 从文档读 generator 节点，文档是唯一事实来源（可编辑性）。解决 §6/§8 措辞张力，取 §6；M2 Overlay 保留为独立非破坏运行时机制。undo/redo = 文档快照回放。
 
 开放：
 
