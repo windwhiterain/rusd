@@ -1,0 +1,6 @@
+# Rusd canonical form is LF (SPEC §2); keep it everywhere, including shell scripts.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.exr binary
+*.hdr binary
