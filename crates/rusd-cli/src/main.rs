@@ -2,6 +2,8 @@
 //! fmt/parse (M1), validate/query (M2), expand (M3), render/pick (M4),
 //! serve (M5), export (M6).
 
+use rusd_render::annotate::{self, Marker, SelectMode, Selection};
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -139,7 +141,9 @@ fn main() {
         }
         Some("render") => {
             let Some(path) = args.get(1) else {
-                eprintln!("usage: rusd render <file.rusd> [--out PREFIX] [--width W] [--height H]");
+                eprintln!(
+                    "usage: rusd render <file.rusd> [--out PREFIX] [--width W] [--height H] [--select path[=color][:mode]]... [--mark x,y[,color]]..."
+                );
                 std::process::exit(2);
             };
             let width = flag_val(&args, "--width")
@@ -149,12 +153,23 @@ fn main() {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(600u32);
             let prefix = flag_val(&args, "--out").unwrap_or_else(|| default_prefix(path));
+            let selections: Vec<Selection> = flag_vals(&args, "--select")
+                .iter()
+                .filter_map(|s| parse_select(s))
+                .collect();
+            let markers: Vec<Marker> = flag_vals(&args, "--mark")
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| parse_mark(s, i))
+                .collect();
             let geo = load_scene(path);
             match rusd_render::render(&geo, width, height) {
-                Ok(r) => {
+                Ok(mut r) => {
                     for d in &r.diags {
                         println!("{}", d.to_json());
                     }
+                    annotate::apply_selection(&mut r, &selections);
+                    annotate::draw_markers(&mut r, &markers);
                     if let Err(e) = rusd_render::capture::write_png(
                         &format!("{prefix}_beauty.png"),
                         r.width,
@@ -176,11 +191,13 @@ fn main() {
                     write_metadata(&prefix, &r);
                     let fg = r.ids.iter().filter(|&&id| id != 0).count();
                     println!(
-                        "render: {}x{} items={} foreground={} -> {prefix}_beauty.png / {prefix}_ids.png / {prefix}.json",
+                        "render: {}x{} items={} foreground={} selected={} marked={} -> {prefix}_beauty.png / {prefix}_ids.png / {prefix}.json",
                         r.width,
                         r.height,
                         r.paths.len(),
-                        fg
+                        fg,
+                        selections.len(),
+                        markers.len()
                     );
                 }
                 Err(diags) => print_diags(&diags),
@@ -188,29 +205,87 @@ fn main() {
         }
         Some("pick") => {
             let Some(path) = args.get(1) else {
-                eprintln!("usage: rusd pick <file.rusd> --x X --y Y [--width W] [--height H]");
+                eprintln!(
+                    "usage: rusd pick <file.rusd> --x X --y Y | --point x,y... [--visual] [--out PREFIX] [--width W] [--height H]"
+                );
                 std::process::exit(2);
             };
-            let Some(x) = flag_val(&args, "--x").and_then(|v| v.parse::<u32>().ok()) else {
-                eprintln!("rusd pick: --x <pixel> required");
+            let visual = args.iter().any(|a| a == "--visual");
+            let mut points: Vec<(u32, u32)> = flag_vals(&args, "--point")
+                .iter()
+                .filter_map(|s| parse_point(s))
+                .collect();
+            if points.is_empty()
+                && let (Some(x), Some(y)) = (
+                    flag_val(&args, "--x").and_then(|v| v.parse().ok()),
+                    flag_val(&args, "--y").and_then(|v| v.parse().ok()),
+                )
+            {
+                points.push((x, y));
+            }
+            if points.is_empty() {
+                eprintln!("rusd pick: --x/--y or --point x,y required");
                 std::process::exit(2);
-            };
-            let Some(y) = flag_val(&args, "--y").and_then(|v| v.parse::<u32>().ok()) else {
-                eprintln!("rusd pick: --y <pixel> required");
-                std::process::exit(2);
-            };
+            }
             let width = flag_val(&args, "--width")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(800u32);
             let height = flag_val(&args, "--height")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(600u32);
+            let prefix = flag_val(&args, "--out").unwrap_or_else(|| default_prefix(path));
             let geo = load_scene(path);
             match rusd_render::render(&geo, width, height) {
-                Ok(r) => match r.pick(x, y) {
-                    Some(p) => println!("{p}"),
-                    None => println!("background"),
-                },
+                Ok(mut r) => {
+                    if visual {
+                        let mut sels: Vec<Selection> = Vec::new();
+                        let mut marks: Vec<Marker> = Vec::new();
+                        for (i, &(x, y)) in points.iter().enumerate() {
+                            let c = annotate::palette(i);
+                            marks.push(Marker { x, y, color: c });
+                            if let Some(p) = r.pick(x, y) {
+                                sels.push(Selection {
+                                    path: p.to_owned(),
+                                    color: c,
+                                    mode: SelectMode::Outline,
+                                });
+                            }
+                        }
+                        annotate::apply_selection(&mut r, &sels);
+                        annotate::draw_markers(&mut r, &marks);
+                        if let Err(e) = rusd_render::capture::write_png(
+                            &format!("{prefix}_beauty.png"),
+                            r.width,
+                            r.height,
+                            &r.beauty,
+                        ) {
+                            eprintln!("rusd: {e}");
+                            std::process::exit(1);
+                        }
+                        if let Err(e) = rusd_render::capture::write_png(
+                            &format!("{prefix}_ids.png"),
+                            r.width,
+                            r.height,
+                            &rusd_render::capture::ids_to_rgba(&r.ids),
+                        ) {
+                            eprintln!("rusd: {e}");
+                            std::process::exit(1);
+                        }
+                        write_metadata(&prefix, &r);
+                    }
+                    for &(x, y) in &points {
+                        match r.pick(x, y) {
+                            Some(p) => println!("{p}"),
+                            None => println!("background"),
+                        }
+                    }
+                    if visual {
+                        println!(
+                            "visual: {prefix}_beauty.png ({} point(s) marked)",
+                            points.len()
+                        );
+                    }
+                }
                 Err(diags) => print_diags(&diags),
             }
         }
@@ -254,6 +329,72 @@ fn flag_val(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// All values of a repeatable flag (`--select a --select b` → [a, b]).
+fn flag_vals(args: &[String], flag: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a == flag
+            && let Some(v) = args.get(i + 1)
+        {
+            out.push(v.clone());
+        }
+    }
+    out
+}
+
+fn parse_point(s: &str) -> Option<(u32, u32)> {
+    let (x, y) = s.split_once(',')?;
+    Some((x.parse().ok()?, y.parse().ok()?))
+}
+
+/// `path[=color][:mode]` — color defaults red, mode defaults outline.
+fn parse_select(s: &str) -> Option<Selection> {
+    let (path, value) = match s.split_once('=') {
+        Some((p, v)) => (p, Some(v)),
+        None => (s, None),
+    };
+    let mut color = [255, 60, 60];
+    let mut mode = SelectMode::Outline;
+    if let Some(v) = value {
+        let (c, m) = match v.split_once(':') {
+            Some((c, m)) => (c, Some(m)),
+            None => (v, None),
+        };
+        if !c.is_empty() {
+            color = annotate::parse_color(c)?;
+        }
+        if let Some(m) = m {
+            mode = match m {
+                "recolor" => SelectMode::Recolor,
+                "both" => SelectMode::Both,
+                "outline" => SelectMode::Outline,
+                _ => return None,
+            };
+        }
+    }
+    Some(Selection {
+        path: path.to_owned(),
+        color,
+        mode,
+    })
+}
+
+/// `x,y[,color]` — color defaults to the auto palette by index.
+fn parse_mark(s: &str, idx: usize) -> Option<Marker> {
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    let x = parts[0].parse().ok()?;
+    let y = parts[1].parse().ok()?;
+    let color = if parts.len() >= 3 {
+        annotate::parse_color(parts[2])?
+    } else {
+        annotate::palette(idx)
+    };
+    Some(Marker { x, y, color })
 }
 
 fn default_prefix(path: &str) -> String {
