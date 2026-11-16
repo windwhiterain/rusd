@@ -42,9 +42,9 @@
 - [x] 值 coerce：标量/向量/数组 → USD 类型；generator 参数 author 为 custom 属性
 - [x] 诊断映射：`CompositionDiagnostic` → Rusd JSON（E_ARC_CYCLE / E_UNRESOLVED_LAYER / …）
 - [x] `rusd query`：合成 prim + USD 类型名 + 属性值（forest/city 实测，adapter 4 测试）
-- [ ] cook 引擎通用化（cook_graph spike → 拓扑排序 + 内容哈希 memo + 脏传播）
+- [x] cook 引擎通用化（rusd-proc：隐式路径依赖 DAG + 拓扑 + 内容哈希 memo + 下游脏传播 + insert/mute；6 测试）
 - [ ] session overlay（edit_target_session）+ provenance（StageSink/Diff）
-- [ ] `rusd expand` 雏形
+- [x] `rusd expand`（RusdGrid 端到端：grid.rusd → 27 合成 prim；城市 generator M3 注册）
 - 验收：forest.rusd 下沉为合规 Stage；非法场景给可定位诊断；overlay 覆盖 base 可演示；
       单属性编辑走 openusd 定向失效（复用 spike 基准）
 
