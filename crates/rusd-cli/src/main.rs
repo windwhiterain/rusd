@@ -285,6 +285,9 @@ fn main() {
                 Err(diags) => print_diags(&diags),
             }
         }
+        Some("serve") => {
+            rusd_agent::serve();
+        }
         Some(other) => {
             eprintln!("rusd: '{other}' is not implemented yet — see docs/ROADMAP.md");
             std::process::exit(2);
