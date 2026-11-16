@@ -60,8 +60,9 @@
 
 ## M4 — 渲染 MVP（2026-11-16 启动，headless 优先）
 
-- [ ] wgpu device/headless 出图 spike（先验证 DX12 离屏渲染 + readback）
-- wgpu headless：从 openusd Stage 提取几何、内建几何、camera、beauty + prim-id pass
+- [x] wgpu device/headless 出图 spike（DX12 + RTX 3060 Ti，离屏渲染 + readback + PNG，2026-11-16）
+- [x] 几何提取层 rusd-scene::geometry：Stage→网格/世界变换/相机（xformOpOrder 复合、内建细分、Mesh 三角化、容错占位）；city/forest 验收（2026-11-16）
+- [ ] wgpu headless：beauty + prim-id pass、camera、确定性截图
 - 容错占位 + 诊断叠加；确定性截图
 - 热重载交互 viewer（winit + egui），走 SPEC §6 增量管线
 - `rusd render` / `rusd pick`
