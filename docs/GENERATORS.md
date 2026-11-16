@@ -6,9 +6,9 @@
 
 ## 设计原则（继承 SPEC §5）
 
-- 纯函数 `(params, seed, inputs) → 子树`；路径键控 ChaCha8 RNG；确定性实例命名。
+- 纯函数 `G(params, seed, input_layers) → output_layer`（layer-op 节点，D5，见 docs/PIPELINE.md）；路径键控 ChaCha8 RNG；确定性实例命名。
 - 预算硬约束（城市极易爆炸）；递归组合；session overlay 可覆盖/pin 任意生成实例。
-- 展开结果经 openusd 作者 API 写入 Stage（D3）；`.rusd` 只存参数，不存烘焙几何。
+- 输出匿名 layer 经 insert_layer 接入合成（D3/D5）；`.rusd` 只存参数，不存烘焙几何。
 
 ## 组合骨架
 

@@ -97,19 +97,24 @@ Rusd 专注 agent 优先的表层语法、过程化展开、增量前端与渲�
   带 provenance；base 层对 agent 只读。undo = 弹层；审计 = 读层。非破坏、可撤销、可追溯。
   openusd 的 `StageSink` 编辑事件 + 可回放 `Diff` 直接支撑 provenance/diff/undo。
 
-## 5. 过程化语义（核心差异，Rusd 独有）
+## 5. 过程化语义：PCG = 合成图里的 layer-op（核心差异，Rusd 独有）
 
-首批 generator 域 = 城市（D4）；suite 设计见 `docs/GENERATORS.md`。
+**决策 D5（2026-11-16，采纳用户建议，Solaris/LOP 模型）**：generator 不是展开成子 prim 的特殊 prim，
+而是**嵌在 USD 合成图里的 layer-op 节点**：读只读输入 layer，产出新输出 layer，经标准 USD arc
+（sublayer/reference）接入合成。**展开即合成**，没有 bespoke 展开 pass。详见 `docs/PIPELINE.md`。
+首批域 = 城市（D4），suite 见 `docs/GENERATORS.md`。
 
-- Generator = **纯函数**：`(params, seed, inputs) → 子树`。禁止隐式全局状态、时钟、外部随机源。
-- **RNG**：ChaCha8；流键 = `hash(stage.seed, prim_path, local_seed)`。
-  路径键控 ⇒ 增删兄弟节点不会 reshuffle 既有实例。
-- **展开**：惰性、增量、按内容哈希缓存。展开结果通过 openusd 作者 API 写入 Stage
-  （生成 prim 名确定：`i000000` 起，schema 可指定命名规则）。
-- **覆盖**：生成实例可被 session overlay 覆盖 / pin；身份稳定则重展开后覆盖仍生效。
-- **预算**：`max_prims`、`max_triangles`；`rusd expand --dry-run` 返回成本估计而不展开。
-- **递归**：prototype 内可含 generator；环检测 + 深度上限（默认 8，可配）。
-- `.rusd` 永远存 generator 参数；烘焙只发生在导出 USD 或渲染缓存里。
+- Generator = **纯函数** `G(params, seed, input_layers) → output_layer`。禁止隐式全局状态/时钟/外部随机源。
+- **输出 layer**：`sdf::Layer::new_anonymous` 作者的内存 layer，经 `Stage::insert_layer` 按强度接入合成图。
+- **RNG**：ChaCha8；流键 = hash(stage.seed, prim_path, local_seed)。路径键控 ⇒ 改一个节点不 reshuffle 其它。
+- **增量**：节点输出按内容哈希 memo（键 = generator id+version, params, seed, 输入 layer 哈希）；
+  输入/参数变才重跑节点，openusd pcp 定向重合成（§6）。
+- **覆盖**：agent 编辑 = 在图某点插入 edit-layer（session overlay）；可 pin 生成实例，身份稳定则保留。
+- **预算**：max_prims/max_triangles；超预算确定性截断 + W_BUDGET。
+- **递归**：prototype 节点可实例化（每实例读自己的输入上下文）；环检测 + 深度上限。
+- `.rusd` 只存节点参数；输出 layer 是缓存产物，导出 USD 时才 bake。
+- **实证**（cargo run -p spike-openusd --bin layer_graph）：generator 产匿名 layer → insert_layer →
+  合成值反映输出（radius 1→5）；重跑+mute 旧 layer 增量重合成 ~389µs，indexed_count 不变。
 
 ## 6. 增量管线（决策 D2，采纳用户建议）
 
@@ -132,7 +137,7 @@ parse (CST) → compose → validate → expand → render
   - **区块级增量解析**：扁平 TOML table 相互独立。文件变更 → 按 header 切块 → 块文本哈希 →
     只重解析变化的块（toml_edit），未变块复用 CST 与语义节点。
   - **TOML → Stage 下沉**：只把变化的 prim 区块下沉为 openusd 作者操作，触发其定向失效。
-  - **generator 展开缓存**：展开键 = (自身 resolved hash, prototype 子树 hash, seed)。
+  - **generator 节点 memo**：输出 layer 键 = (generator id+version, params, seed, 输入 layer 哈希)；只重跑变化节点（§5）。
   - **GPU 资源缓存**：网格/实例内容哈希键，只重建受影响资源。
 - **两个入口，同一管线**：agent patch 用 toml_edit 原位改 CST（保注释/空白）后最小化序列化；
   人类编辑器改文件走 watch。两者汇入同一增量管线。
@@ -207,6 +212,7 @@ parse (CST) → compose → validate → expand → render
 - **D3**（2026-11-16）：依赖 openusd 0.8 作为场景/合成/互操作后端（§6/§9，源码 + 实证）。
   原 O6 关闭。workspace MSRV 提升至 1.96。
 - **D4**（2026-11-16）：首批 generator 域 = 城市（§3/§5，docs/GENERATORS.md）。原 O3 关闭。
+- **D5**（2026-11-16）：PCG = 合成图里的 layer-op（Solaris 模型，§5，docs/PIPELINE.md，已实证）。
 
 开放：
 
