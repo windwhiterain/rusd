@@ -1,0 +1,10 @@
+[package]
+name = "rusd-core"
+description = "Rusd shared vocabulary: prim paths, typed values, machine-readable diagnostics"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]

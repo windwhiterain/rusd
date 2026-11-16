@@ -1,0 +1,11 @@
+[package]
+name = "rusd-scene"
+description = "Rusd stage, layer stack, composition subset, schema registry and validation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rusd-core.workspace = true

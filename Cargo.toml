@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rusd-core",
+    "crates/rusd-scene",
+    "crates/rusd-proc",
+    "crates/rusd-render",
+    "crates/rusd-cli",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0"
+authors = ["Rusd contributors"]
+
+[workspace.dependencies]
+rusd-core = { path = "crates/rusd-core" }
+rusd-scene = { path = "crates/rusd-scene" }
+rusd-proc = { path = "crates/rusd-proc" }
+rusd-render = { path = "crates/rusd-render" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

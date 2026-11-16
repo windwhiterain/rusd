@@ -1,0 +1,12 @@
+[package]
+name = "rusd-proc"
+description = "Rusd generator runtime: path-keyed RNG, deterministic expansion, budgets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rusd-core.workspace = true
+rusd-scene.workspace = true
