@@ -6,12 +6,21 @@ members = [
     "crates/rusd-proc",
     "crates/rusd-render",
     "crates/rusd-cli",
+    "crates/spike-openusd",
+]
+# Routine builds/tests skip the openusd spike (heavy dep); run it with -p spike-openusd.
+default-members = [
+    "crates/rusd-core",
+    "crates/rusd-scene",
+    "crates/rusd-proc",
+    "crates/rusd-render",
+    "crates/rusd-cli",
 ]
 
 [workspace.package]
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.96"
 license = "Apache-2.0"
 authors = ["Rusd contributors"]
 
@@ -20,6 +29,8 @@ rusd-core = { path = "crates/rusd-core" }
 rusd-scene = { path = "crates/rusd-scene" }
 rusd-proc = { path = "crates/rusd-proc" }
 rusd-render = { path = "crates/rusd-render" }
+# Scene/composition/interop backend (SPEC D3). Pinned; upgrades go through the spike.
+openusd = "0.8"
 
 [profile.release]
 lto = "thin"
