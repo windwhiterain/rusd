@@ -1,9 +1,11 @@
 //! Typed property values and their canonical literal rendering (SPEC §2–3).
 //!
-//! `Display` produces the canonical `.rusd` literal: floats always carry a
-//! decimal point, strings are escaped, vectors render as `[a, b, c]`. The M1
-//! parser must round-trip every value this module can print.
+//! `Display` produces the canonical `.rusd` (TOML profile) literal: floats always
+//! carry a decimal point, strings are escaped, vectors render as `[a, b, c]`,
+//! dicts as sorted inline tables. The M1 parser must round-trip every value this
+//! module can print.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::path::PrimPath;
@@ -22,6 +24,7 @@ pub enum Value {
     Vec3([f64; 3]),
     Vec4([f64; 4]),
     Array(Vec<Value>),
+    Dict(BTreeMap<String, Value>),
 }
 
 impl Value {
@@ -39,6 +42,7 @@ impl Value {
             Self::Vec3(_) => "vec3",
             Self::Vec4(_) => "vec4",
             Self::Array(_) => "array",
+            Self::Dict(_) => "dict",
         }
     }
 }
@@ -65,6 +69,19 @@ impl fmt::Display for Value {
                     write!(f, "{item}")?;
                 }
                 write!(f, "]")
+            }
+            Self::Dict(entries) => {
+                if entries.is_empty() {
+                    return write!(f, "{{}}");
+                }
+                write!(f, "{{ ")?;
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{k} = {v}")?;
+                }
+                write!(f, " }}")
             }
         }
     }
@@ -119,6 +136,7 @@ mod tests {
         assert_eq!(Value::Int(1).type_name(), "i64");
         assert_eq!(Value::Float(1.0).type_name(), "f64");
         assert_eq!(Value::Vec3([0.0; 3]).type_name(), "vec3");
+        assert_eq!(Value::Dict(BTreeMap::new()).type_name(), "dict");
     }
 
     #[test]
@@ -153,5 +171,18 @@ mod tests {
         let arr = Value::Array(vec![Value::Int(1), Value::Int(2)]);
         assert_eq!(arr.to_string(), "[1, 2]");
         assert_eq!(Value::Array(vec![]).to_string(), "[]");
+    }
+
+    #[test]
+    fn dict_inline_table() {
+        let mut m = BTreeMap::new();
+        m.insert("min".to_owned(), Value::Float(0.8));
+        m.insert("dist".to_owned(), Value::String("uniform".into()));
+        // keys render sorted: dist before min
+        assert_eq!(
+            Value::Dict(m).to_string(),
+            "{ dist = \"uniform\", min = 0.8 }"
+        );
+        assert_eq!(Value::Dict(BTreeMap::new()).to_string(), "{}");
     }
 }

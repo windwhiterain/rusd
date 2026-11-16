@@ -8,3 +8,4 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+toml_edit = "0.25.19"

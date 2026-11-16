@@ -1,0 +1,335 @@
+//! Structural parser for the `.rusd` TOML profile (SPEC §2).
+//!
+//! M1 spike: parse a document into a stage table plus a flat, path-sorted list
+//! of prim blocks. It uses `toml_edit`'s CST so a later `fmt`/`patch` pass can
+//! preserve comments and whitespace. Semantic typing (string → path/token/asset
+//! coercion, schema validation) lands in M2; here every scalar keeps its TOML
+//! type and `schema` is read as a plain string.
+
+use std::collections::BTreeMap;
+
+use toml_edit::{DocumentMut, Item, Table, Value as TomlValue};
+
+use crate::diag::Diagnostic;
+use crate::path::PrimPath;
+use crate::value::Value;
+
+/// One prim block: its path, declared schema, and raw properties.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrimBlock {
+    pub path: PrimPath,
+    pub schema: String,
+    pub props: BTreeMap<String, Value>,
+}
+
+/// A parsed `.rusd` document: the `[stage]` table and all prim blocks.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParsedDocument {
+    pub stage: BTreeMap<String, Value>,
+    pub prims: Vec<PrimBlock>,
+}
+
+/// Parse a `.rusd` document. Returns all error diagnostics on failure.
+pub fn parse(text: &str) -> Result<ParsedDocument, Vec<Diagnostic>> {
+    let doc = match text.parse::<DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            return Err(vec![Diagnostic::error("E_PARSE", e.to_string())]);
+        }
+    };
+
+    let mut diags = Vec::new();
+    let mut stage = BTreeMap::new();
+    let mut prims = Vec::new();
+
+    for (key, item) in doc.as_table().iter() {
+        if key == "stage" {
+            if let Some(t) = item.as_table() {
+                collect_props(t, "", &mut stage, &mut diags, "/stage");
+            } else {
+                diags.push(
+                    Diagnostic::error("E_STAGE", "[stage] must be a table").at_prim("/stage"),
+                );
+            }
+            continue;
+        }
+        match item {
+            Item::Table(t) if !t.is_dotted() => {
+                let path = PrimPath::root().join(key);
+                match path {
+                    Ok(p) => walk_prim(t, p, &mut prims, &mut diags),
+                    Err(e) => diags.push(
+                        Diagnostic::error("E_NAME", e.to_string()).at_prim(format!("/{key}")),
+                    ),
+                }
+            }
+            Item::ArrayOfTables(_) => {
+                diags.push(
+                    Diagnostic::error(
+                        "E_AOT",
+                        "array of tables is not allowed; multiplicity belongs to generators",
+                    )
+                    .at_prim(format!("/{key}")),
+                );
+            }
+            _ => {
+                diags.push(
+                    Diagnostic::error(
+                        "E_TOPLEVEL",
+                        "bare top-level keys are not allowed; only [stage] and prim tables",
+                    )
+                    .at_prim(format!("/{key}")),
+                );
+            }
+        }
+    }
+
+    if !diags.is_empty() {
+        return Err(diags);
+    }
+    prims.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(ParsedDocument { stage, prims })
+}
+
+/// Recursively walk a prim table: `schema` is special, dotted keys become
+/// namespaced properties, non-dotted sub-tables are child prims.
+fn walk_prim(
+    table: &Table,
+    path: PrimPath,
+    prims: &mut Vec<PrimBlock>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let mut props = BTreeMap::new();
+    let mut schema: Option<String> = None;
+
+    for (key, item) in table.iter() {
+        match item {
+            Item::Value(v) if key == "schema" => match v.as_str() {
+                Some(s) => schema = Some(s.to_owned()),
+                None => diags.push(
+                    Diagnostic::error("E_SCHEMA", "schema must be a string")
+                        .at_prim(path.as_str())
+                        .at_property("schema"),
+                ),
+            },
+            Item::Value(v) => match convert(v) {
+                Ok(val) => {
+                    props.insert(key.to_owned(), val);
+                }
+                Err(d) => diags.push(d.at_prim(path.as_str()).at_property(key)),
+            },
+            Item::Table(t) if t.is_dotted() => {
+                collect_props(t, key, &mut props, diags, path.as_str());
+            }
+            Item::Table(t) => {
+                let child = path.join(key);
+                match child {
+                    Ok(p) => walk_prim(t, p, prims, diags),
+                    Err(e) => diags.push(
+                        Diagnostic::error("E_NAME", e.to_string())
+                            .at_prim(format!("{}/{key}", path.as_str())),
+                    ),
+                }
+            }
+            Item::ArrayOfTables(_) => diags.push(
+                Diagnostic::error(
+                    "E_AOT",
+                    "array of tables is not allowed; multiplicity belongs to generators",
+                )
+                .at_prim(format!("{}/{key}", path.as_str())),
+            ),
+            Item::None => {}
+        }
+    }
+
+    // Auto-vivified / implicit prim tables default to Xform (SPEC §2).
+    let schema = schema.unwrap_or_else(|| "Xform".to_owned());
+    prims.push(PrimBlock {
+        path,
+        schema,
+        props,
+    });
+}
+
+/// Flatten a dotted-key table into namespaced property names (`budget.max_prims`).
+fn collect_props(
+    table: &Table,
+    prefix: &str,
+    out: &mut BTreeMap<String, Value>,
+    diags: &mut Vec<Diagnostic>,
+    prim: &str,
+) {
+    for (key, item) in table.iter() {
+        let name = if prefix.is_empty() {
+            key.to_owned()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match item {
+            Item::Value(v) => match convert(v) {
+                Ok(val) => {
+                    out.insert(name, val);
+                }
+                Err(d) => diags.push(d.at_prim(prim).at_property(&name)),
+            },
+            Item::Table(t) if t.is_dotted() => collect_props(t, &name, out, diags, prim),
+            _ => diags.push(
+                Diagnostic::error("E_PROP", "unsupported property shape")
+                    .at_prim(prim)
+                    .at_property(&name),
+            ),
+        }
+    }
+}
+
+/// Convert a TOML value to a Rusd value, keeping the TOML type (coercion is M2).
+fn convert(v: &TomlValue) -> Result<Value, Diagnostic> {
+    if let Some(s) = v.as_str() {
+        return Ok(Value::String(s.to_owned()));
+    }
+    if let Some(i) = v.as_integer() {
+        return Ok(Value::Int(i));
+    }
+    if let Some(f) = v.as_float() {
+        return Ok(Value::Float(f));
+    }
+    if let Some(b) = v.as_bool() {
+        return Ok(Value::Bool(b));
+    }
+    if let Some(arr) = v.as_array() {
+        let mut items = Vec::new();
+        for el in arr.iter() {
+            items.push(convert(el)?);
+        }
+        return Ok(Value::Array(items));
+    }
+    if let Some(it) = v.as_inline_table() {
+        let mut map = BTreeMap::new();
+        for (k, v) in it.iter() {
+            map.insert(k.to_owned(), convert(v)?);
+        }
+        return Ok(Value::Dict(map));
+    }
+    if v.as_datetime().is_some() {
+        return Err(Diagnostic::error(
+            "E_DATETIME",
+            "datetime literals are not part of the Rusd profile",
+        ));
+    }
+    Err(Diagnostic::error("E_VALUE", "unsupported TOML value"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FOREST: &str = include_str!("../../../examples/forest.rusd");
+
+    #[test]
+    fn parse_forest() {
+        let doc = parse(FOREST).expect("forest.rusd should parse");
+        assert_eq!(doc.stage.get("seed"), Some(&Value::Int(20261116)));
+        assert_eq!(doc.stage.get("up_axis"), Some(&Value::String("Z".into())));
+        let paths: Vec<&str> = doc.prims.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/World",
+                "/World/Camera",
+                "/World/Forest",
+                "/World/Prototypes",
+                "/World/Prototypes/Pine"
+            ]
+        );
+        let forest = doc
+            .prims
+            .iter()
+            .find(|p| p.path.as_str() == "/World/Forest")
+            .unwrap();
+        assert_eq!(forest.schema, "RusdScatter");
+        assert_eq!(forest.props.get("count"), Some(&Value::Int(500)));
+        assert_eq!(
+            forest.props.get("prototype"),
+            Some(&Value::String("/World/Prototypes/Pine".into()))
+        );
+    }
+
+    #[test]
+    fn distribution_is_dict() {
+        let doc = parse(FOREST).unwrap();
+        let forest = doc
+            .prims
+            .iter()
+            .find(|p| p.path.as_str() == "/World/Forest")
+            .unwrap();
+        let scale = forest.props.get("scale").unwrap();
+        match scale {
+            Value::Dict(m) => {
+                assert_eq!(m.get("dist"), Some(&Value::String("uniform".into())));
+                assert_eq!(m.get("min"), Some(&Value::Float(0.8)));
+                assert_eq!(m.get("max"), Some(&Value::Float(1.4)));
+            }
+            other => panic!("scale should be a dict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn implicit_parent_defaults_to_xform() {
+        let doc = parse("[World.Child]\nschema = \"Sphere\"\nradius = 1.0\n").unwrap();
+        let world = doc
+            .prims
+            .iter()
+            .find(|p| p.path.as_str() == "/World")
+            .unwrap();
+        assert_eq!(world.schema, "Xform");
+        assert_eq!(doc.prims.len(), 2);
+    }
+
+    #[test]
+    fn dotted_key_is_namespaced_property() {
+        let doc = parse("[World.G]\nschema = \"RusdGrid\"\nbudget.max_prims = 10\n").unwrap();
+        let g = doc
+            .prims
+            .iter()
+            .find(|p| p.path.as_str() == "/World/G")
+            .unwrap();
+        assert_eq!(g.props.get("budget.max_prims"), Some(&Value::Int(10)));
+        // no child prim named budget
+        assert!(
+            doc.prims
+                .iter()
+                .all(|p| p.path.as_str() != "/World/G/budget")
+        );
+    }
+
+    #[test]
+    fn rejects_array_of_tables() {
+        let diags = parse("[[World.X]]\nschema = \"Xform\"\n").unwrap_err();
+        assert!(diags.iter().any(|d| d.code == "E_AOT"));
+    }
+
+    #[test]
+    fn rejects_datetime() {
+        let diags =
+            parse("[World.T]\nschema = \"Xform\"\nwhen = 1979-05-27T07:32:00Z\n").unwrap_err();
+        assert!(diags.iter().any(|d| d.code == "E_DATETIME"));
+    }
+
+    #[test]
+    fn rejects_bare_toplevel() {
+        let diags = parse("stray = 1\n").unwrap_err();
+        assert!(diags.iter().any(|d| d.code == "E_TOPLEVEL"));
+    }
+
+    #[test]
+    fn rejects_bad_prim_name() {
+        let diags = parse("[World.bad-name]\nschema = \"Xform\"\n").unwrap_err();
+        assert!(diags.iter().any(|d| d.code == "E_NAME"));
+    }
+
+    #[test]
+    fn syntax_error_is_diagnostic() {
+        let diags = parse("[World\n").unwrap_err();
+        assert!(diags.iter().any(|d| d.code == "E_PARSE"));
+    }
+}

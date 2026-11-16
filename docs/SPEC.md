@@ -9,13 +9,15 @@ Rusd = 面向 Agentic PCG 的 USD 方言 + 配套渲染器，纯 Rust 实现。
 
 四个第一公民：
 
-1. **可编辑性**：agent 用最小 diff 精确编辑。每个 prim 一个块，绝对路径寻址，规范化排序。
+1. **可编辑性**：agent 用最小 diff 精确编辑。每个 prim 一个区块，绝对路径寻址，规范化排序。
 2. **确定性**：同 seed + 同输入 ⇒ 同场景 ⇒ 同像素。RNG 流按路径键控，编辑别处不 reshuffle。
 3. **可反馈**：校验诊断、渲染结果（含 prim-id 分割 pass）全部机器可读，支撑自我纠正循环。
 4. **过程化第一公民**：generator 是 schema，展开是解释器行为；文件里永远存参数，不存烘焙结果。
 
+贯穿性需求：**增量**（§6）。快速迭代是 agentic 编辑的生命线，管线每一层都必须可增量。
+
 **非目标（v0）**：完整 OpenUSD 兼容（LIVERPS 全集、时间采样/动画、Hydra、crate 二进制）、
-C++ USD 依赖、DCC 插件。互操作走 USDA 导出/导入桥（§8）。
+C++ USD 依赖、DCC 插件。互操作走 USDA 导出/导入桥（§9）。
 
 ## 1. 数据模型（对齐 USD）
 
@@ -23,31 +25,49 @@ C++ USD 依赖、DCC 插件。互操作走 USDA 导出/导入桥（§8）。
 
 - **Prim 路径**：绝对路径，如 `/World/Forest/i000042`。v0 组件语法 `[A-Za-z_][A-Za-z0-9_]*`，
   比 USD 严格，换取可预测的 diff 与稳定的哈希键；导出 USDA 时按需转义。
-- **属性寻址**：v0 用 `<prim>.<property>`（如 `/World/Forest.seed`）。USD 的 `primvars:` 等
+- **属性寻址**：内部用 `<prim>.<property>`（如 `/World/Forest.seed`）。USD 的 `primvars:` 等
   命名空间在导出层映射，不进表面语法。
 - **属性**：有类型、默认值、可选范围与单位；schema 注册表是校验和文档的唯一来源。
 - **Prim 元数据**：`kind`、`active`、`instanceable`、provenance（author / turn / intent）。
 
-## 2. 表面语法（`.rusd`）
+## 2. 表面语法：`.rusd` = TOML 1.0 的 Rusd profile
 
-- UTF-8，LF，`#` 行注释。
-- **规范形式 = 扁平块**：每个 prim 一个 `def <Schema> <绝对路径> { ... }` 块；
-  块按路径字节序排序，块内属性按名字排序。v0 没有嵌套语法——路径即结构。
-  - 理由：一次编辑 = 一个块的最小 diff；块可独立增删；合并 overlay 不需要理解括号深度；
-    LLM 不会犯缩进/括号配对错误。
-- **字面量**：`true` / `42`（i64）/ `3.14`（f64，规范形式恒带小数点）/ `"string"` /
-  `token` / `/Prim/Path` / `@asset.png@` / `[1.0, 2.0, 3.0]`（schema 定长时解释为 vecN）/ 数组。
-- **分布字面量**：`uniform(a, b)`、`normal(mu, sigma)`、`rect(w, h)`、`disc(r)` 等，
-  只能出现在 generator 的属性位置，类型由 schema 决定。
-- **stage 头**：`stage { up_axis, meters_per_unit, default_prim, seed }`。
-- `rusd fmt`：幂等、确定性；解析 → AST → 规范写出，语义无损、空白归一。
+**决策 D1（2026-11-16，采纳用户建议）**：表面语法直接采用 TOML 1.0 的受限 profile，不自造语法。
+
+理由：
+
+- 扁平 table header `[World.Forest]` 与"一 prim 一区块"天然同构；区块相互独立，
+  使区块级增量解析（§6）几乎免费——嵌套语法做不到这一点。
+- LLM 对 TOML 极其熟悉，生成/编辑错误率低。
+- 现成 CST 解析器 `toml_edit`：保留注释与空白，支持原位修改，agent patch 无格式化噪声。
+- TOML 的整数/浮点区分（`1` vs `1.0`）、`inf`/`nan`、`#` 注释、多行数组与规范形几乎重合。
+
+映射规则：
+
+- `[stage]` 为保留 table：`up_axis`、`meters_per_unit`、`default_prim`、`seed`。
+- 其余每个 table = 一个 prim：`[World.Forest]` ↔ `/World/Forest`（点号 ↔ 斜杠）。
+  组件必须匹配 §1 语法；TOML bare key 允许的 `-` 在 profile 里禁止（`E_NAME`）。
+- 每个显式 prim table 必须有 `schema = "RusdScatter"` 键（`E_MISSING_SCHEMA`）。
+  header 隐含的祖先 prim 自动生成为 `Xform`；`rusd fmt` 会把它们显式写出。
+- 属性 = table 内键值。dotted key（`budget.max_prims`）作为命名空间属性名整体保留，
+  不解释为子 prim。
+- **字面量**：TOML 原生。`token` / `path` / `asset` 表面都是字符串，由 schema 声明的类型
+  coerce（§3）；`vecN` = 定长浮点数组；**分布 = inline table**：
+  `scale = { dist = "uniform", min = 0.8, max = 1.4 }`，参数由 schema 校验。
+- **profile 禁止**：`[[array of tables]]`（多重性交给 generator，`E_AOT`）、
+  datetime（`E_DATETIME`）、`[stage]` 之外的顶层裸键（`E_TOPLEVEL`）。
+- **规范形（`rusd fmt`）**：table 按路径字节序排序（`[stage]` 恒首）；键按名字排序；
+  数字去下划线、非十进制归一为十进制；浮点恒带小数点；字符串归一为 basic string 最小转义；
+  注释随 item 保留（toml_edit CST）。
+- 文件 UTF-8、LF（`.gitattributes` 强制）。
 - 示例见 `examples/forest.rusd`。
-- 开放问题 O1：是否提供 USDA 风格嵌套语法作为糖（默认不做）。
 
 ## 3. 类型与 Schema
 
 - 标量：`bool, i64, u64, f64, string, token, path, asset`；
-  向量：`vec2/vec3/vec4`（f64）、`color3f`、`matrix4d`；数组：`T[]`。
+  向量：`vec2/vec3/vec4`（f64）、`color3f`、`matrix4d`；数组：`T[]`；
+  结构化值：`dict`（分布、预算等，表面为 inline table）。
+- 表面字符串 → `token/path/asset` 的 coerce 由 schema 属性类型驱动；coerce 失败给 `E_TYPE`。
 - 内建 schema（首批）：`Xform, Cube, Sphere, Cylinder, Mesh, Camera, Material,
   DirectionalLight, PointLight`。
 - Generator schema（`Rusd` 命名空间，按里程碑引入）：`RusdScatter, RusdGrid, RusdInstance,
@@ -65,7 +85,7 @@ C++ USD 依赖、DCC 插件。互操作走 USDA 导出/导入桥（§8）。
 - **v0 支持**：Layer stack（root + sublayers + session overlay）、References（内部路径 / 外部文件）、
   VariantSets、Payloads（延迟加载）。
 - **v0 不支持**：Inherits、Specializes、关系属性、时间采样。遇到即诊断，不静默。
-- **Opinion 强度**（强 → 弱）：session overlay → ���地层 → sublayers（按声明顺序，后者弱）。
+- **Opinion 强度**（强 → 弱）：session overlay → 本地层 → sublayers（按声明顺序，后者弱）。
   规则简单可预测，刻意不搬 USD 的 arc 强度表。
 - **Agent 编辑只写 session overlay**，带 provenance；base 层对 agent 只读。
   undo = 弹层；审计 = 读层。非破坏、可撤销、可追溯。
@@ -81,7 +101,31 @@ C++ USD 依赖、DCC 插件。互操作走 USDA 导出/导入桥（§8）。
 - **递归**：prototype 内可含 generator；环检测 + 深度上限（默认 8，可配）。
 - `.rusd` 永远存 generator 参数；烘焙只发生在导出 USDA 或渲染缓存里。
 
-## 6. 渲染器（agent 的眼睛和手）
+## 6. 增量管线（决策 D2，采纳用户建议）
+
+快速迭代是 agentic 编辑的生命线。管线：
+
+```
+parse (CST) → compose → validate → expand → render
+```
+
+每层 memoize + revision 戳，失效沿依赖图传播，绝不全局重来。
+
+- **区块级增量解析**：扁平 TOML table 相互独立。文件变更 → 按 header 切块 → 块文本哈希 →
+  只重解析变化的块（toml_edit），未变块复用 CST 与语义节点。
+- **语义失效**：每 prim 内容哈希 = schema + 排序属性 + 元数据；合成解析 opinion 后得
+  resolved hash。generator 展开键 = (自身 resolved hash, prototype 子树 hash, seed)；
+  GPU 资源键 = 网格/实例内容哈希。单属性变更只失效受影响节点。
+- **两个入口，同一管线**：agent patch 用 toml_edit 原位改 CST（保注释/空白）后最小化序列化；
+  人类编辑器改文件走 watch。两者汇入同一增量管线。
+- **诊断也增量**：只重校验受影响 prim，输出按 (path, code) 稳定排序。
+- **正确性不变量**：增量结果 ≡ 冷重建结果——场景与诊断逐字节一致，渲染像素一致
+  （modulo §7 的 GPU 容差）。测试策略：随机编辑序列，增量 vs 全量对照（property test）。
+- **延迟目标**：10k prim 场景单属性编辑，重解析+重合成+重校验 < 5ms；
+  热重载端到端 < 100ms（不含渲染）。
+- 实现：v0 手写 revision + hash 失效；查询图复杂化后迁移 salsa（rust-analyzer 同款）。
+
+## 7. 渲染器（agent 的眼睛和手）
 
 - **wgpu** 后端（本机 DX12；Linux Vulkan / macOS Metal 可移植），自研轻量 forward PBR（GGX），
   GPU instancing，内容哈希网格缓存。
@@ -90,10 +134,10 @@ C++ USD 依赖、DCC 插件。互操作走 USDA 导出/导入桥（§8）。
 - **容错渲染**：非法 / 缺失资源 → 品红占位几何 + 诊断叠加；渲染调用永远返回
   （image + diagnostics），不 panic 打断 agent 循环。
 - **确定性截图**：同 scene + camera + seed ⇒ 同像素；GPU / 驱动间浮点容差记录在 docs。
-- **热重载**：监听 `.rusd` → 增量重合成 → 只重建受影响的 GPU 资源。
+- **热重载**：走 §6 增量管线，只重建受影响的 GPU 资源。
 - `pick(x, y)`：读 prim-id pass ⇒ prim path。agent 用"指一个像素"来选中对象。
 
-## 7. Agent 工具协议
+## 8. Agent 工具协议
 
 - 工具集（JSON 进 / 出）：`open, query, patch, validate, expand, render, pick, diff, undo,
   export_usda`。
@@ -103,18 +147,29 @@ C++ USD 依赖、DCC 插件。互操作走 USDA 导出/导入桥（§8）。
 - 传输：`rusd serve`（stdio JSON-RPC）先行；MCP adapter 随后，让任意 MCP agent 直接编辑场景。
 - 编辑循环：`query → patch → validate → expand → render →（看 id pass）→ 再 patch`。
 
-## 8. USD 互操作
+## 9. USD 互操作与先行技术（2026-11-16 联网核查）
 
-- `rusd-usd` crate：USDA 导出（generator 保留为自定义 schema prim，或 `--bake` 展开）；
-  USDA 子集导入（映射到 Rusd schema，未识别的保留为通用 prim + 警告）。
-- 纯 Rust，无 C++ 依赖。全保真 OpenUSD 桥（C API，vcpkg 构建；本机已有 vcpkg + CMake + MSVC）
-  列为远期可选。
+纯 Rust 的 USD 实现已经存在，互操作不必从零造：
 
-## 9. Crate 布局
+- **openusd**（LunCoSim，MIT，crates.io 0.5，活跃开发、1.0 前不保证 API 稳定）：
+  读写 usda/usdc/usdz；完整 LIVRPS 合成；通过 AOUSD Core Spec 1.0 合规基线
+  （文本/二进制解析、138 资产合成套件）；EditTarget 分层编辑、可回放 Diff、
+  undo/replay、细粒度缓存失效；feature-gated schema readers（geom/lux/shade/...）。
+- **rust-usd + hydra-rs**：USD 核心 + Hydra 渲染管线（sidecar layer 编辑）。
+- **polysmelt**：纯 Rust 资产互换（glTF 为枢纽，含 USD 读写），2026-11 仍在更新。
+
+决策待定（O6）：Rusd 的场景/合成层自建，还是构建在 openusd 之上？
+- 倾向：M2 做 spike——forest.rusd → 写入 openusd Stage → 导出 USDA → usdview 打开。
+  若成立，Rusd 专注 agent 优先的表层语法、过程化展开、增量管线与渲染器，
+  合成/互操作复用 openusd（其 Diff/undo/失效管线与 §6 天然契合）。
+- `rusd-usd` 定位：Rusd ↔ openusd 的桥（generator → 自定义 schema prim 或 --bake）。
+- 渲染器仍自研 wgpu（agent 优先：prim-id pass、容错、确定性截图）；hydra-rs 列为全保真远期备选。
+
+## 10. Crate 布局
 
 | crate | 职责 | 里程碑 |
 | --- | --- | --- |
-| `rusd-core` | 路径、类型化值、AST、parser、规范 writer、诊断 | M0–M1 |
+| `rusd-core` | 路径、类型化值、TOML profile 解析（toml_edit CST）、规范 writer、诊断 | M0–M1 |
 | `rusd-scene` | stage、layer stack、合成子集、schema 注册表、校验 | M2 |
 | `rusd-proc` | generator 运行时、路径键控 RNG、展开缓存、预算 | M3 |
 | `rusd-render` | wgpu 渲染核心、passes、headless + viewport | M4 |
@@ -122,11 +177,18 @@ C++ USD 依赖、DCC 插件。互操作走 USDA 导出/导入桥（§8）。
 | `rusd-usd` | USDA 导出 / 导入桥 | M6 |
 | `rusd-agent` | JSON-RPC / MCP 协议适配 | M5 |
 
-## 10. 开放问题
+## 11. 决策记录与开放问题
 
-- **O1** 嵌套语法糖要不要？（默认：不要，扁平块即规范形式。）
+已决：
+
+- **D1**（2026-11-16）：表面语法 = TOML 1.0 的 Rusd profile（§2）。原 O1（嵌套语法糖）关闭：不做。
+- **D2**（2026-11-16）：增量管线为一等需求（§6），含"增量 ≡ 全量"不变量与延迟目标。
+
+开放：
+
 - **O2** 互操作是否硬约束——必须能被 Blender / Omniverse 直接打开？
   （默认：不是；走导出桥，语法为 agent 优化。）
 - **O3** 首批 generator 的内容域：自然（森林 / 地形）、城市 / 建筑，还是通用？
 - **O4** 默认 `up_axis`：建议 Z-up 右手系（PCG 数学习惯）；USD 默认 Y-up，导出时转换。
 - **O5** MCP adapter 的优先级（M5 内做，还是提前）。
+- **O6** 场景/合成后端：自建 vs 构建在 openusd 之上（§9，M2 spike 定案）。

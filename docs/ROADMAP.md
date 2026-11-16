@@ -9,16 +9,21 @@
 - [x] `rusd-core`：PrimPath / Value / Diagnostic + 单元测试
 - [x] `cargo test --workspace` 全绿（2026-11-16）
 
-## M1 — 语法核心
+## M1 — 语法核心（进行中）
 
-- lexer / parser / AST：stage 头、def 块、字面量、分布字面量
-- 规范 writer：排序、浮点规范形、幂等
-- `rusd fmt` / `rusd parse`
-- 验收：examples/forest.rusd 往返无损；fmt 幂等；每个语法规则有测试
+表面语法 = TOML 1.0 的 Rusd profile（SPEC §2，决策 D1）；增量见 SPEC §6（D2）。
+
+- [x] toml_edit 结构解析 spike：`rusd parse`，forest.rusd → prim 树（2026-11-16）
+- [ ] profile 规则完整化：显式 table 缺 `schema` → E_MISSING_SCHEMA（spike 暂默认 Xform）；
+      命名 / 禁用构造诊断齐全
+- [ ] 规范 writer：排序、数字/字符串归一、保注释；`rusd fmt`
+- [ ] 区块级增量解析 + "增量 ≡ 全量" property test
+- 验收：forest.rusd 往返无损；fmt 幂等；单块变更只重解析该块
 
 ## M2 — 场景与校验
 
-- schema 注册表（内建几何 + 属性约束）
+- [ ] openusd 后端 spike（O6）：forest.rusd → openusd Stage → USDA → usdview；定案自建 vs 复用
+- schema 注册表（内建几何 + 属性约束 + 字符串 coerce）
 - stage、layer stack、references、variant sets、payloads
 - JSON 诊断（稳定 code）
 - `rusd validate` / `rusd query`
@@ -36,13 +41,13 @@
 
 - wgpu headless：内建几何、camera、beauty + prim-id pass
 - 容错占位 + 诊断叠加；确定性截图
-- 热重载交互 viewer（winit + egui）
+- 热重载交互 viewer（winit + egui），走 SPEC §6 增量管线
 - `rusd render` / `rusd pick`
 - 验收：forest.rusd 出图；id pass 像素 → prim path 往返正确
 
 ## M5 — Agent 协议
 
-- `rusd serve`：stdio JSON-RPC 工具集（SPEC §7）
+- `rusd serve`：stdio JSON-RPC 工具集（SPEC §8）
 - MCP adapter
 - 验收：一个 agent 从一句 prompt 出发，经 query→patch→validate→render 循环建出森林场景
 

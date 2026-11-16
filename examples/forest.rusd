@@ -1,34 +1,35 @@
-# rusd 0.1 — 示例：一片确定性松林（M1 后可解析；语法见 docs/SPEC.md §2）
-# 规范形式：扁平块，绝对路径寻址，块按路径字节序排序。
+# rusd 0.1 — 示例：一片确定性松林
+# 表面语法 = TOML 1.0 的 Rusd profile（docs/SPEC.md §2）。
+# 规范形：table 按路径字节序排序，键按名字排序；一 prim 一区块。
 
-stage {
-    up_axis = "Z"
-    meters_per_unit = 1.0
-    default_prim = "/World"
-    seed = 20261116
-}
+[stage]
+default_prim = "/World"
+meters_per_unit = 1.0
+seed = 20261116
+up_axis = "Z"
 
-def Camera /World/Camera {
-    fov = 45.0
-    look_at = [0.0, 0.0, 0.0]
-    position = [60.0, -60.0, 40.0]
-}
+[World]
+schema = "Xform"
 
-def RusdScatter /World/Forest {
-    count = 500
-    domain = rect(100.0, 100.0)
-    max_prims = 2000
-    prototype = /World/Prototypes/Pine
-    scale = uniform(0.8, 1.4)
-    seed = 42
-    yaw = uniform(0.0, 360.0)
-}
+[World.Camera]
+fov = 45.0
+look_at = [0.0, 0.0, 0.0]
+position = [60.0, -60.0, 40.0]
+schema = "Camera"
 
-def Xform /World/Prototypes
+[World.Forest]
+count = 500
+domain = { dist = "rect", w = 100.0, h = 100.0 }
+max_prims = 2000
+prototype = "/World/Prototypes/Pine"
+scale = { dist = "uniform", min = 0.8, max = 1.4 }
+schema = "RusdScatter"
+seed = 42
+yaw = { dist = "uniform", min = 0.0, max = 360.0 }
 
-def Sphere /World/Prototypes/Pine {
-    radius = 0.5
-}
+[World.Prototypes]
+schema = "Xform"
 
-def Xform /World {
-}
+[World.Prototypes.Pine]
+radius = 0.5
+schema = "Sphere"
