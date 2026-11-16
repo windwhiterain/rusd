@@ -1,7 +1,13 @@
 //! `rusd` command line entry point. Subcommands land per docs/ROADMAP.md:
 //! fmt/parse (M1), validate/query (M2), expand (M3), render/pick (M4),
 //! serve (M5), export (M6).
+//!
+//! render/pick accept a full set of visual flags (all optional, sensible defaults):
+//!   --width --height --background COLOR --fov DEG --light x,y,z --ambient F
+//!   --diffuse F --outline-width N --marker-radius N --recolor-shading F
+//! plus selection/annotation: --select path[=color][:mode]... --mark x,y[,color]...
 
+use rusd_render::RenderConfig;
 use rusd_render::annotate::{self, Marker, SelectMode, Selection};
 
 fn main() {
@@ -142,16 +148,11 @@ fn main() {
         Some("render") => {
             let Some(path) = args.get(1) else {
                 eprintln!(
-                    "usage: rusd render <file.rusd> [--out PREFIX] [--width W] [--height H] [--select path[=color][:mode]]... [--mark x,y[,color]]..."
+                    "usage: rusd render <file.rusd> [--out PREFIX] [render flags] [--select path[=color][:mode]]... [--mark x,y[,color]]..."
                 );
                 std::process::exit(2);
             };
-            let width = flag_val(&args, "--width")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(800u32);
-            let height = flag_val(&args, "--height")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(600u32);
+            let cfg = render_config(&args);
             let prefix = flag_val(&args, "--out").unwrap_or_else(|| default_prefix(path));
             let selections: Vec<Selection> = flag_vals(&args, "--select")
                 .iter()
@@ -163,13 +164,13 @@ fn main() {
                 .filter_map(|(i, s)| parse_mark(s, i))
                 .collect();
             let geo = load_scene(path);
-            match rusd_render::render(&geo, width, height) {
+            match rusd_render::render_with(&geo, &cfg) {
                 Ok(mut r) => {
                     for d in &r.diags {
                         println!("{}", d.to_json());
                     }
-                    annotate::apply_selection(&mut r, &selections);
-                    annotate::draw_markers(&mut r, &markers);
+                    annotate::apply_selection(&mut r, &selections, &cfg.style);
+                    annotate::draw_markers(&mut r, &markers, &cfg.style);
                     if let Err(e) = rusd_render::capture::write_png(
                         &format!("{prefix}_beauty.png"),
                         r.width,
@@ -206,7 +207,7 @@ fn main() {
         Some("pick") => {
             let Some(path) = args.get(1) else {
                 eprintln!(
-                    "usage: rusd pick <file.rusd> --x X --y Y | --point x,y... [--visual] [--out PREFIX] [--width W] [--height H]"
+                    "usage: rusd pick <file.rusd> --x X --y Y | --point x,y... [--visual] [--out PREFIX] [render flags]"
                 );
                 std::process::exit(2);
             };
@@ -227,15 +228,10 @@ fn main() {
                 eprintln!("rusd pick: --x/--y or --point x,y required");
                 std::process::exit(2);
             }
-            let width = flag_val(&args, "--width")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(800u32);
-            let height = flag_val(&args, "--height")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(600u32);
+            let cfg = render_config(&args);
             let prefix = flag_val(&args, "--out").unwrap_or_else(|| default_prefix(path));
             let geo = load_scene(path);
-            match rusd_render::render(&geo, width, height) {
+            match rusd_render::render_with(&geo, &cfg) {
                 Ok(mut r) => {
                     if visual {
                         let mut sels: Vec<Selection> = Vec::new();
@@ -251,8 +247,8 @@ fn main() {
                                 });
                             }
                         }
-                        annotate::apply_selection(&mut r, &sels);
-                        annotate::draw_markers(&mut r, &marks);
+                        annotate::apply_selection(&mut r, &sels, &cfg.style);
+                        annotate::draw_markers(&mut r, &marks, &cfg.style);
                         if let Err(e) = rusd_render::capture::write_png(
                             &format!("{prefix}_beauty.png"),
                             r.width,
@@ -322,6 +318,62 @@ fn load_scene(path: &str) -> rusd_scene::geometry::SceneGeometry {
         println!("{}", d.to_json());
     }
     rusd_scene::geometry::extract(&out.stage)
+}
+
+/// Build a RenderConfig from CLI flags; every visual parameter is overridable.
+fn render_config(args: &[String]) -> RenderConfig {
+    let mut cfg = RenderConfig::default();
+    if let Some(v) = flag_val(args, "--width").and_then(|v| v.parse().ok()) {
+        cfg.width = v;
+    }
+    if let Some(v) = flag_val(args, "--height").and_then(|v| v.parse().ok()) {
+        cfg.height = v;
+    }
+    if let Some(v) = flag_val(args, "--background").and_then(|s| annotate::parse_color(&s)) {
+        cfg.background = srgb_to_linear(v);
+    }
+    if let Some(v) = flag_val(args, "--fov").and_then(|v| v.parse().ok()) {
+        cfg.fov_deg = Some(v);
+    }
+    if let Some(v) = flag_val(args, "--light").and_then(|s| parse_vec3(&s)) {
+        cfg.light_dir = v;
+    }
+    if let Some(v) = flag_val(args, "--ambient").and_then(|v| v.parse().ok()) {
+        cfg.ambient = v;
+    }
+    if let Some(v) = flag_val(args, "--diffuse").and_then(|v| v.parse().ok()) {
+        cfg.diffuse = v;
+    }
+    if let Some(v) = flag_val(args, "--outline-width").and_then(|v| v.parse().ok()) {
+        cfg.style.outline_width = v;
+    }
+    if let Some(v) = flag_val(args, "--marker-radius").and_then(|v| v.parse().ok()) {
+        cfg.style.marker_radius = v;
+    }
+    if let Some(v) = flag_val(args, "--recolor-shading").and_then(|v| v.parse().ok()) {
+        cfg.style.recolor_shading = v;
+    }
+    cfg
+}
+
+fn parse_vec3(s: &str) -> Option<[f32; 3]> {
+    let p: Vec<&str> = s.split(',').collect();
+    if p.len() != 3 {
+        return None;
+    }
+    Some([p[0].parse().ok()?, p[1].parse().ok()?, p[2].parse().ok()?])
+}
+
+fn srgb_to_linear(c: [u8; 3]) -> [f32; 3] {
+    fn ch(v: u8) -> f32 {
+        let c = v as f32 / 255.0;
+        if c <= 0.04045 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    [ch(c[0]), ch(c[1]), ch(c[2])]
 }
 
 fn flag_val(args: &[String], flag: &str) -> Option<String> {
