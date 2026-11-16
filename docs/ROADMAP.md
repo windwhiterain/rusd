@@ -30,11 +30,20 @@
 
 ## M2 — 场景适配层（openusd 后端，D3）
 
-- [ ] `rusd-scene`：openusd Stage 薄适配层；TOML prim 树 → Stage 作者操作下沉
-- [ ] schema 注册表（内建几何映射 UsdGeom/UsdShade/UsdLux + 属性约束 + 字符串 coerce）
+**Step 1（2026-11-16，完成）**：schema 注册表 + 校验
+
+- [x] schema 注册表：内建几何 + 城市 generator schema，属性类型 / required 约束
+- [x] `rusd validate`：E_TYPE / E_REQUIRED / E_PATH / W_UNKNOWN_SCHEMA / W_UNKNOWN_PROP
+      （forest/city 干净，rusd-scene 12 测试）
+
+**Step 2（进行中）**：openusd Stage 适配 + cook 引擎通用化
+
+- [ ] `rusd-scene`：TOML prim 树 → openusd Stage 下沉（匿名 root + LayerRegistry，Z-up）
+- [ ] 字符串 coerce + 内建几何映射 UsdGeom / UsdShade / UsdLux
+- [ ] cook 引擎通用化（cook_graph spike → 拓扑排序 + 内容哈希 memo + 脏传播）
 - [ ] session overlay（edit_target_session）+ provenance（StageSink/Diff）
-- [ ] 诊断映射：openusd CompositionDiagnostic → Rusd JSON（稳定 code）
-- [ ] `rusd validate` / `rusd query`
+- [ ] 诊断映射：openusd CompositionDiagnostic → Rusd JSON
+- [ ] `rusd query` / `rusd expand` 雏形
 - 验收：forest.rusd 下沉为合规 Stage；非法场景给可定位诊断；overlay 覆盖 base 可演示；
       单属性编辑走 openusd 定向失效（复用 spike 基准）
 

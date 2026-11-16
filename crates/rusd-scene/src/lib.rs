@@ -1,12 +1,11 @@
 //! # rusd-scene
 //!
-//! The composed scene (SPEC §1, §3–4). Lands in M2:
-//!
-//! - `stage`: stage metadata, prim index, property resolution.
-//! - `layer`: layer stack and opinions; session overlay with provenance.
-//! - `compose`: the documented LIVERPS subset — sublayers, references,
-//!   variant sets, payloads. No inherits/specializes in v0.
-//! - `schema`: schema registry, typed property constraints, validation
-//!   producing [`rusd_core::Diagnostic`]s.
+//! The scene layer (SPEC §3–4). M2 step 1: schema registry + validation.
+//! M2 step 2 adds the openusd Stage adapter (TOML → Stage lowering, cook engine,
+//! session overlay, diagnostics mapping).
 
-pub use rusd_core as core;
+pub mod schema;
+pub mod validate;
+
+pub use schema::{PropType, SchemaDef, SchemaKind};
+pub use validate::validate;

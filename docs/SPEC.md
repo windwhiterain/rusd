@@ -215,9 +215,9 @@ parse (CST) → compose → validate → expand → render
 - **D4**（2026-11-16）：首批 generator 域 = 城市（§3/§5，docs/GENERATORS.md）。原 O3 关闭。
 - **D5**（2026-11-16）：PCG = 合成图里的 layer-op（Solaris 模型，§5，docs/PIPELINE.md，已实证）。
 - **D6**（2026-11-16）：generator 触发 = openusd 之上的 cook 引擎（图求值 + memo），非合成回调、不改 composer（docs/PIPELINE.md §9，cook_graph 实证）。
+- **D7**（2026-11-16）：默认坐标系 Z-up 右手系；USD 默认 Y-up，导出时转换。原 O4 关闭。
 
 开放：
 
 - **O2** 互操作硬约束——D3 后基本满足（openusd 原生 usdc/usdz 导出）；待确认目标 DCC 清单。
-- **O4** 默认 `up_axis`：建议 Z-up 右手系（PCG 数学习惯）；USD 默认 Y-up，导出时转换。
 - **O5** MCP adapter 的优先级（M5 内做，还是提前）。

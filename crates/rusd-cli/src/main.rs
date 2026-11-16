@@ -7,7 +7,7 @@ fn main() {
     match args.first().map(String::as_str) {
         None | Some("version") => {
             println!("rusd {}", env!("CARGO_PKG_VERSION"));
-            println!("M1 in progress — see docs/ROADMAP.md for what lands when");
+            println!("M2 in progress — see docs/ROADMAP.md for what lands when");
         }
         Some("parse") => {
             let Some(path) = args.get(1) else {
@@ -47,6 +47,32 @@ fn main() {
                         }
                     } else {
                         print!("{out}");
+                    }
+                }
+                Err(diags) => print_diags(&diags),
+            }
+        }
+        Some("validate") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: rusd validate <file.rusd>");
+                std::process::exit(2);
+            };
+            let text = read(path);
+            match rusd_core::syntax::parse(&text) {
+                Ok(doc) => {
+                    let diags = rusd_scene::validate(&doc);
+                    let mut has_error = false;
+                    for d in &diags {
+                        println!("{}", d.to_json());
+                        if d.severity == rusd_core::Severity::Error {
+                            has_error = true;
+                        }
+                    }
+                    if diags.is_empty() {
+                        println!("ok: {} prims, no diagnostics", doc.prims.len());
+                    }
+                    if has_error {
+                        std::process::exit(1);
                     }
                 }
                 Err(diags) => print_diags(&diags),

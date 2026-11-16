@@ -1,6 +1,6 @@
 [package]
 name = "rusd-scene"
-description = "Rusd stage, layer stack, composition subset, schema registry and validation"
+description = "Rusd scene layer: schema registry, validation, and (M2 step 2) openusd Stage adapter"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
