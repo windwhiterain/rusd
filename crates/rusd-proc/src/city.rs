@@ -327,7 +327,6 @@ impl Generator for RusdScatter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::cook::nodes_from_doc;
     use crate::generator::read_attr_f64;
     use crate::generators::default_registry;
