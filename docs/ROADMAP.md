@@ -28,7 +28,7 @@
       2001→2001（零失效），编辑+重查询 320µs，~472× 于冷合成；结构删除只掉被删 prim
 - [x] 结论：openusd 支持增量合成 ⇒ 依赖它（D3）。MSRV 提至 1.96，pin openusd 0.8
 
-## M2 — 场景适配层（openusd 后端，D3）
+## M2 — 场景适配层（openusd 后端，D3，2026-11-16 完成）
 
 **Step 1（2026-11-16，完成）**：schema 注册表 + 校验
 
@@ -36,14 +36,14 @@
 - [x] `rusd validate`：E_TYPE / E_REQUIRED / E_PATH / W_UNKNOWN_SCHEMA / W_UNKNOWN_PROP
       （forest/city 干净，rusd-scene 12 测试）
 
-**Step 2（进行中）**：openusd Stage 适配 + cook 引擎通用化
+**Step 2（2026-11-16，完成）**：openusd Stage 适配 + cook 引擎通用化
 
 - [x] `rusd-scene`：TOML prim 树 → openusd Stage 下沉（`in_memory` 匿名 root，Z-up 元数据）
 - [x] 值 coerce：标量/向量/数组 → USD 类型；generator 参数 author 为 custom 属性
 - [x] 诊断映射：`CompositionDiagnostic` → Rusd JSON（E_ARC_CYCLE / E_UNRESOLVED_LAYER / …）
 - [x] `rusd query`：合成 prim + USD 类型名 + 属性值（forest/city 实测，adapter 4 测试）
 - [x] cook 引擎通用化（rusd-proc：隐式路径依赖 DAG + 拓扑 + 内容哈希 memo + 下游脏传播 + insert/mute；6 测试）
-- [ ] session overlay（edit_target_session）+ provenance（StageSink/Diff）
+- [x] session overlay（Overlay：会话层作者 + provenance 日志 + undo/redo；4 测试。StageSink/Diff 为富回放备选）
 - [x] `rusd expand`（RusdGrid 端到端：grid.rusd → 27 合成 prim；城市 generator M3 注册）
 - 验收：forest.rusd 下沉为合规 Stage；非法场景给可定位诊断；overlay 覆盖 base 可演示；
       单属性编辑走 openusd 定向失效（复用 spike 基准）
