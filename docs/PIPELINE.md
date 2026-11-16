@@ -99,9 +99,43 @@ seed = 7
 - Scatter 读街道 layer → 输出街道家具 layer。
 组合链 = layer 依赖图，增量沿图传播。
 
-## 9. 开放问题
+## 9. 触发与求值（决策 D6）
+
+**问题**：generator 怎么被触发？要不要自定义合成回调 / 魔改 composer？
+
+**答案**：都不需要。USD/openusd 的合成（pcp）是"现有 layer 的纯函数"，**没有"合成到某 arc 时跑过程化代码"的回调**
+（pcp 里仅有的 Fn 是时间采样插值与内部遍历谓词，已核查）。这是设计如此，不是缺憾。
+Solaris 也不靠合成回调：Houdini 的 **LOP cook 引擎在 USD 之上**，先 cook 出 layer，USD 再合成。
+Omniverse 的 OmniGraph 同理。Rusd 照此分层：
+
+```
+.rusd 节点图
+   │  Rusd cook 引擎（触发器，图求值 + 内容哈希 memo）   ← 过程化在这里跑
+   ▼  产出匿名输出 layer，insert_layer 接入
+openusd pcp（合成既有 layer，增量）                      ← 纯合成，不改
+   ▼
+ composed Stage → 渲染 / 查询
+```
+
+- **触发器 = cook 引擎**，不是 pcp 回调。它按依赖序求值节点：读上游已合成的只读输入 → 跑 G →
+  产匿名 layer → insert_layer。sublayer 是 generator 的**输出产物**（数据），generator 是生产它的节点，
+  cook 引擎是触发器——不是"pcp 读到 sublayer 时跑代码"。
+- **两层增量**：cook 图（哪些节点重跑，内容键 memo）+ pcp（哪些 prim 重合成，依赖追踪）。
+- **触发时机**：open 时 eager cook 全图（v0）；edit/patch 标脏下游重 cook；query 可 lazy cook 所需子图（后续）。
+- **现有勾子够用，无需改 composer**：读输入=Stage query；产 layer=new_anonymous+edit；
+  接入=insert_layer/add_sublayer；增量=pcp；脏追踪=StageSink/LayerSink 编辑事件。
+- **唯一的合成期勾子备选**：`ar::Resolver`（自定义资产解析器）可把 generator 输出建模成 payload 资产，
+  解析时跑 generator → pull-based 懒生成。但 resolver 在合成中途被调，读不到"正在合成的场景"作输入，
+  有重入/环风险；只适合纯参数 generator，不适合读场景的 generator（如 BlockFill 读 parcel）。v0 不用。
+
+**实证**（`cargo run -p spike-openusd --bin cook_graph`）：3 节点 A(parcel.width)→B(building.height=width*2)、C(独立)。
+初始 cook height=20；no-op pass 计数 A1/B1/C1（全 memo 命中，零重 cook）；改 A=30 后 A2/B2/C1
+（下游 B 重 cook、独立 C 不动），height=60，重 cook A+B ~616µs。触发=cook 引擎，无回调、无魔改。
+
+## 10. 开放问题
 
 - **P1** 节点标记 prim 是否在最终场景保留（vs 仅输出 prim 保留）？倾向保留轻量 group 便于 agent 寻址。
 - **P2** 显式 `inputs` 元数据 vs 纯 reference 表达跨节点数据流？v0 先用 reference + 隐式上下文。
 - **P3** 输出 layer 的持久化/缓存格式（内存匿名 vs 落盘内容哈希缓存）？v0 内存，落盘缓存后续。
 - **P4** layer 合并/GC 策略的触发时机与阈值。
+- **P5** cook 触发粒度：v0 eager 全图；lazy cook（按 query 子图）与 ar::Resolver 备选后续评估。

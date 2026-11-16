@@ -106,6 +106,7 @@ Rusd 专注 agent 优先的表层语法、过程化展开、增量前端与渲�
 
 - Generator = **纯函数** `G(params, seed, input_layers) → output_layer`。禁止隐式全局状态/时钟/外部随机源。
 - **输出 layer**：`sdf::Layer::new_anonymous` 作者的内存 layer，经 `Stage::insert_layer` 按强度接入合成图。
+- **触发**：由 openusd 之上的 cook 引擎按依赖序求值（D6），非合成回调；详见 `docs/PIPELINE.md` §9。
 - **RNG**：ChaCha8；流键 = hash(stage.seed, prim_path, local_seed)。路径键控 ⇒ 改一个节点不 reshuffle 其它。
 - **增量**：节点输出按内容哈希 memo（键 = generator id+version, params, seed, 输入 layer 哈希）；
   输入/参数变才重跑节点，openusd pcp 定向重合成（§6）。
@@ -213,6 +214,7 @@ parse (CST) → compose → validate → expand → render
   原 O6 关闭。workspace MSRV 提升至 1.96。
 - **D4**（2026-11-16）：首批 generator 域 = 城市（§3/§5，docs/GENERATORS.md）。原 O3 关闭。
 - **D5**（2026-11-16）：PCG = 合成图里的 layer-op（Solaris 模型，§5，docs/PIPELINE.md，已实证）。
+- **D6**（2026-11-16）：generator 触发 = openusd 之上的 cook 引擎（图求值 + memo），非合成回调、不改 composer（docs/PIPELINE.md §9，cook_graph 实证）。
 
 开放：
 
