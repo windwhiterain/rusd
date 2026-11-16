@@ -948,6 +948,7 @@ dependencies = [
  "rusd-render",
  "rusd-scene",
  "serde_json",
+ "toml_edit",
 ]
 
 [[package]]

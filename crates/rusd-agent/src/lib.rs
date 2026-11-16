@@ -6,8 +6,8 @@
 //! `patch` edits it (D11), and every tool re-derives the pipeline
 //! (parse → validate → expand → extract → render) from the current source.
 //!
-//! Tools: `open`, `query`, `validate`, `expand`, `render`, `pick`, `state`.
-//! (`patch` / `diff` / `undo` / `redo` land in M5 step 2.)
+//! Tools: `open`, `query`, `validate`, `expand`, `render`, `pick`, `patch`,
+//! `diff`, `undo`, `redo`, `state`.
 //!
 //! Error-tolerant: a tool returns a JSON-RPC error or diagnostics, never panics
 //! the agent loop. Render/pick write PNGs to a session output dir and return their
@@ -25,10 +25,15 @@ use rusd_render::annotate::{self, Marker, SelectMode, Selection};
 use rusd_scene::geometry::{self, SceneGeometry};
 use serde_json::{Value, json};
 
-/// A live editing session: the current document source + render output location.
+mod patch;
+
+/// A live editing session: the current document source + undo history + renders.
 pub struct Agent {
     doc: Option<String>,
     baseline: Option<String>,
+    history: Vec<String>,
+    redo_stack: Vec<String>,
+    provenance: Vec<Value>,
     out_dir: PathBuf,
     seq: u64,
 }
@@ -45,6 +50,9 @@ impl Agent {
         Self {
             doc: None,
             baseline: None,
+            history: Vec::new(),
+            redo_stack: Vec::new(),
+            provenance: Vec::new(),
             out_dir,
             seq: 0,
         }
@@ -91,8 +99,11 @@ impl Agent {
             "expand" => self.expand(),
             "render" => self.render(p),
             "pick" => self.pick(p),
+            "patch" => self.patch(p),
+            "diff" => self.diff(),
+            "undo" => self.undo(),
+            "redo" => self.redo(),
             "state" => Ok(json!({"doc": self.doc, "open": self.doc.is_some()})),
-            "patch" | "diff" | "undo" | "redo" => Err(format!("{method}: lands in M5 step 2")),
             _ => Err(format!("unknown method: {method}")),
         }
     }
@@ -111,6 +122,9 @@ impl Agent {
         let diags = rusd_scene::validate(&doc);
         self.doc = Some(text.clone());
         self.baseline = Some(text);
+        self.history.clear();
+        self.redo_stack.clear();
+        self.provenance.clear();
         self.seq = 0;
         Ok(json!({"prim_count": doc.prims.len(), "diags": diags_json(&diags)}))
     }
@@ -193,6 +207,52 @@ impl Agent {
         let cfg = render_config(p);
         let r = rusd_render::render_with(&s.geo, &cfg).map_err(diags_msg)?;
         Ok(json!({"x": x, "y": y, "path": r.pick(x, y)}))
+    }
+
+    fn patch(&mut self, p: &Value) -> Result<Value, String> {
+        let ops = p
+            .get("ops")
+            .and_then(Value::as_array)
+            .ok_or("patch: `ops` array required")?;
+        let current = self.doc.clone().ok_or("no scene open; call open first")?;
+        let new_text = patch::apply(&current, ops)?;
+        let diags = match rusd_core::syntax::parse(&new_text) {
+            Ok(doc) => rusd_scene::validate(&doc),
+            Err(d) => d,
+        };
+        self.history.push(current);
+        self.redo_stack.clear();
+        self.doc = Some(new_text);
+        self.provenance.extend(ops.iter().cloned());
+        Ok(json!({"applied": ops.len(), "diags": diags_json(&diags)}))
+    }
+
+    fn undo(&mut self) -> Result<Value, String> {
+        let prev = self.history.pop().ok_or("nothing to undo")?;
+        if let Some(cur) = self.doc.take() {
+            self.redo_stack.push(cur);
+        }
+        self.doc = Some(prev);
+        Ok(json!({"ok": true, "undo_depth": self.history.len()}))
+    }
+
+    fn redo(&mut self) -> Result<Value, String> {
+        let next = self.redo_stack.pop().ok_or("nothing to redo")?;
+        if let Some(cur) = self.doc.take() {
+            self.history.push(cur);
+        }
+        self.doc = Some(next);
+        Ok(json!({"ok": true, "redo_depth": self.redo_stack.len()}))
+    }
+
+    fn diff(&self) -> Result<Value, String> {
+        let doc = self.doc.as_ref().ok_or("no scene open; call open first")?;
+        let changed = self.baseline.as_deref() != Some(doc.as_str());
+        Ok(json!({
+            "changed": changed,
+            "ops_applied": self.provenance.len(),
+            "provenance": self.provenance,
+        }))
     }
 }
 
@@ -368,7 +428,6 @@ mod tests {
         assert!(q["prims"].as_array().unwrap().len() > 500);
         let e = a.call("expand", &json!({})).unwrap();
         assert_eq!(e["geo_items"].as_u64().unwrap(), 501);
-        // center pixel hits the prototype Pine (as in the CLI)
         let p = a
             .call(
                 "pick",
@@ -396,5 +455,36 @@ mod tests {
         let mut a = Agent::new();
         assert!(a.call("query", &json!({})).is_err());
         assert!(a.call("render", &json!({})).is_err());
+    }
+
+    #[test]
+    fn patch_builds_forest_then_undo_redo() {
+        let base = "[stage]\ndefault_prim = \"/World\"\nseed = 1\nup_axis = \"Z\"\n\n[World]\nschema = \"Xform\"\n\n[World.Prototypes]\nschema = \"Xform\"\n\n[World.Prototypes.Pine]\nradius = 0.5\nschema = \"Sphere\"\n";
+        let mut a = Agent::new();
+        a.call("open", &json!({"content": base})).unwrap();
+        let e0 = a.call("expand", &json!({})).unwrap();
+        assert_eq!(e0["geo_items"].as_u64().unwrap(), 1); // just the prototype
+        let ops = json!({"ops": [{
+            "op": "define", "prim": "/World/Forest", "schema": "RusdScatter",
+            "props": {
+                "count": 50, "prototype": "/World/Prototypes/Pine", "seed": 42,
+                "max_prims": 2000,
+                "domain": {"dist": "rect", "w": 100.0, "h": 100.0},
+                "scale": {"dist": "uniform", "min": 0.8, "max": 1.4},
+                "yaw": {"dist": "uniform", "min": 0.0, "max": 360.0}
+            }
+        }]});
+        let pr = a.call("patch", &ops).unwrap();
+        assert_eq!(pr["applied"].as_u64().unwrap(), 1);
+        let e1 = a.call("expand", &json!({})).unwrap();
+        assert_eq!(e1["geo_items"].as_u64().unwrap(), 51); // 50 scatter + prototype
+        a.call("undo", &json!({})).unwrap();
+        let e2 = a.call("expand", &json!({})).unwrap();
+        assert_eq!(e2["geo_items"].as_u64().unwrap(), 1);
+        a.call("redo", &json!({})).unwrap();
+        let e3 = a.call("expand", &json!({})).unwrap();
+        assert_eq!(e3["geo_items"].as_u64().unwrap(), 51);
+        let d = a.call("diff", &json!({})).unwrap();
+        assert_eq!(d["changed"].as_bool(), Some(true));
     }
 }
