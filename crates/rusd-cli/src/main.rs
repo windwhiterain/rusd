@@ -14,13 +14,7 @@ fn main() {
                 eprintln!("usage: rusd parse <file.rusd>");
                 std::process::exit(2);
             };
-            let text = match std::fs::read_to_string(path) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("rusd: cannot read {path}: {e}");
-                    std::process::exit(2);
-                }
-            };
+            let text = read(path);
             match rusd_core::syntax::parse(&text) {
                 Ok(doc) => {
                     println!("[stage]");
@@ -34,12 +28,28 @@ fn main() {
                         }
                     }
                 }
-                Err(diags) => {
-                    for d in &diags {
-                        println!("{}", d.to_json());
+                Err(diags) => print_diags(&diags),
+            }
+        }
+        Some("fmt") => {
+            let write = args.iter().any(|a| a == "--write" || a == "-w");
+            let Some(path) = args.iter().skip(1).find(|a| !a.starts_with('-')) else {
+                eprintln!("usage: rusd fmt [--write] <file.rusd>");
+                std::process::exit(2);
+            };
+            let text = read(path);
+            match rusd_core::canonicalize(&text) {
+                Ok(out) => {
+                    if write {
+                        if let Err(e) = std::fs::write(path, &out) {
+                            eprintln!("rusd: cannot write {path}: {e}");
+                            std::process::exit(2);
+                        }
+                    } else {
+                        print!("{out}");
                     }
-                    std::process::exit(1);
                 }
+                Err(diags) => print_diags(&diags),
             }
         }
         Some(other) => {
@@ -47,4 +57,21 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+fn read(path: &str) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("rusd: cannot read {path}: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn print_diags(diags: &[rusd_core::Diagnostic]) -> ! {
+    for d in diags {
+        println!("{}", d.to_json());
+    }
+    std::process::exit(1);
 }

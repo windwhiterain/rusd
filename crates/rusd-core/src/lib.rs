@@ -6,14 +6,20 @@
 //! - [`value`]: typed property values and their canonical literal rendering.
 //! - [`diag`]: machine-readable diagnostics, the feedback half of the agent loop.
 //! - [`syntax`]: structural parser for the `.rusd` TOML profile (toml_edit CST).
+//! - [`fmt`]: canonical writer (`rusd fmt`), idempotent and comment-preserving.
+//! - [`incremental`]: block-level incremental parser (SPEC §6, "incremental ≡ full").
 //!
-//! Path/value/diag are dependency-free; syntax pulls `toml_edit` only.
+//! Path/value/diag are dependency-free; syntax/fmt/incremental pull `toml_edit` only.
 
 pub mod diag;
+pub mod fmt;
+pub mod incremental;
 pub mod path;
 pub mod syntax;
 pub mod value;
 
 pub use diag::{Diagnostic, Severity};
+pub use fmt::canonicalize;
+pub use incremental::{IncrementalParser, Stats};
 pub use path::{PathError, PrimPath};
 pub use value::Value;

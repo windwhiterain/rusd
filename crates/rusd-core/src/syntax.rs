@@ -142,8 +142,20 @@ fn walk_prim(
         }
     }
 
-    // Auto-vivified / implicit prim tables default to Xform (SPEC §2).
-    let schema = schema.unwrap_or_else(|| "Xform".to_owned());
+    let schema = match schema {
+        Some(s) => s,
+        None if table.is_implicit() => "Xform".to_owned(),
+        None => {
+            diags.push(
+                Diagnostic::error(
+                    "E_MISSING_SCHEMA",
+                    "explicit prim table must declare schema",
+                )
+                .at_prim(path.as_str()),
+            );
+            "Xform".to_owned()
+        }
+    };
     prims.push(PrimBlock {
         path,
         schema,

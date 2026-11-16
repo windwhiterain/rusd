@@ -9,15 +9,15 @@
 - [x] `rusd-core`：PrimPath / Value / Diagnostic + 单元测试
 - [x] `cargo test --workspace` 全绿（2026-11-16）
 
-## M1 — 语法核心（进行中）
+## M1 — 语法核心（2026-11-16，完成）
 
 表面语法 = TOML 1.0 的 Rusd profile（SPEC §2，决策 D1）；增量见 SPEC §6（D2）。
 
 - [x] toml_edit 结构解析 spike：`rusd parse`，forest.rusd → prim 树（2026-11-16）
-- [ ] profile 规则完整化：显式 table 缺 `schema` → E_MISSING_SCHEMA（spike 暂默认 Xform）；
+- [x] profile 规则完整化：显式 table 缺 `schema` → E_MISSING_SCHEMA（spike 暂默认 Xform）；
       命名 / 禁用构造诊断齐全
-- [ ] 规范 writer：排序、数字/字符串归一、保注释；`rusd fmt`
-- [ ] 区块级增量解析 + "增量 ≡ 全量" property test
+- [x] 规范 writer：排序、数字/字符串归一、保注释；`rusd fmt`
+- [x] 区块级增量解析 + "增量 ≡ 全量" property test
 - 验收：forest.rusd 往返无损；fmt 幂等；单块变更只重解析该块
 
 ## O6 实证 — openusd 增量合成（2026-11-16，完成 → 决策 D3）
