@@ -70,12 +70,12 @@
 - [x] 渲染/标注全参数可配置（RenderConfig + Style：尺寸/背景/fov/光照/描边宽/准星半径/换色保明度；CLI flag，2026-11-16）
 - [x] 验收：forest/city 出图；id pass 像素 → prim path 往返正确（2000/2000，确定性，2026-11-16）
 
-## M5 — Agent 协议
+## M5 — Agent 协议（2026-11-16 完成）
 
 - [x] `rusd serve`：stdio JSON-RPC（NDJSON）有状态 session + open/query/validate/expand/render/pick（2026-11-16）
 - [x] patch（编辑文档 CST，D11）+ diff/undo/redo（文档快照，2026-11-16）
-- Python 操作脚本套件（D10，替代 MCP）：subprocess 驱动 `rusd` CLI / JSON-RPC，机器可读 JSON
-- 验收：一个 agent 从一句 prompt 出发，经 query→patch→validate→render 循环建出森林场景
+- [x] Python 操作脚本套件（D10，替代 MCP）：rusd_client.py + example_build_forest.py，subprocess 驱动 rusd serve（2026-11-16）
+- [x] 验收：example_build_forest.py 从最小场景经 patch 建出 501 几何森林，render/pick/undo/redo 全通（2026-11-16）
 
 ## M6 — 互操作与扩展
 
