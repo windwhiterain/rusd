@@ -11,3 +11,6 @@ authors.workspace = true
 rusd-core.workspace = true
 rusd-scene.workspace = true
 rusd-proc.workspace = true
+wgpu = "30.0.2"
+pollster = "1.0.1"
+png = "0.18.1"
