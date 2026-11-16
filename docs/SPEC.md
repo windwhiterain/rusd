@@ -159,6 +159,8 @@ parse (CST) → compose → validate → expand → render
 - **确定性截图**：同 scene + camera + seed ⇒ 同像素；GPU / 驱动间浮点容差记录在 docs。
 - **热重载**：走 §6 增量管线，只重建受影响的 GPU 资源。
 - `pick(x, y)`：读 prim-id pass ⇒ prim path。agent 用"指一个像素"来选中对象。
+- **视觉选择闭环**：`pick --visual` 把 agent 指的点画准星 + 描边被指中 prim；`render --select path=color:mode` 多选多色换色/描边。描边**只向该 prim 自身像素内部扩张**，不同 id 互不覆盖。
+- **全参数可配置**：`RenderConfig`（尺寸/背景/fov/光照方向/ambient/diffuse）+ `annotate::Style`（描边宽/准星半径/换色保明度），CLI flag 暴露，默认复现参考观感。
 - 全保真 USD 渲染（Hydra）列为远期备选（rust-usd 的 hydra-rs）；v0 不做。
 
 ## 8. Agent 工具协议

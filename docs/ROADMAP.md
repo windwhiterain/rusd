@@ -66,7 +66,8 @@
 - [x] 容错品红占位 + 确定性截图；诊断叠加待做
 - [ ] 热重载交互 viewer（winit + egui），走 SPEC §6 增量管线
 - [x] `rusd render` / `rusd pick`（beauty/ids PNG + metadata JSON；pick 像素→path，2026-11-16）
-- [x] 视觉选择闭环：指点准星标注 + 选中换色/描边（多选多色；pick --visual / render --select，2026-11-16）
+- [x] 视觉选择闭环：指点准星标注 + 选中换色/描边（多选多色；描边只向自身内部扩张、不互相覆盖；pick --visual / render --select，2026-11-16）
+- [x] 渲染/标注全参数可配置（RenderConfig + Style：尺寸/背景/fov/光照/描边宽/准星半径/换色保明度；CLI flag，2026-11-16）
 - [x] 验收：forest/city 出图；id pass 像素 → prim path 往返正确（2000/2000，确定性，2026-11-16）
 
 ## M5 — Agent 协议
