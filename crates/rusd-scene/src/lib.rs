@@ -8,11 +8,13 @@
 //!   via the session [`Overlay`] (provenance + undo).
 
 pub mod adapter;
+pub mod geometry;
 pub mod schema;
 pub mod validate;
 
 pub use adapter::{
     EditRecord, Overlay, PrimInfo, composition_diags, lower, lower_with_session, prim_count, query,
 };
+pub use geometry::{Camera, GeoItem, Mat, Mesh, SceneGeometry, extract};
 pub use schema::{PropType, SchemaDef, SchemaKind};
 pub use validate::validate;
