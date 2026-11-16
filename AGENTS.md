@@ -14,7 +14,7 @@ Rusd：面向 Agentic PCG 的 Rust USD 方言 + 渲染器。先读 `docs/SPEC.md
 - 此 shell 的 `python` 受 pdm 的 `PYTHONPATH`（pep582）干扰会启动失败；
   文本处理优先用 bash/sed/perl，非要用 python 先排查环境。
 - Rust stable MSVC（rustup，本机 1.99），**workspace MSRV 1.96**（openusd 0.8 要求）。
-  GPU：RTX 3060 Ti（wgpu 走 DX12）。crates.io 可达。
+  GPU：RTX 3060 Ti（wgpu 走 DX12）。crates.io 可达。`lichen-vm` 只是远端名，**非虚拟机**，GPU 直通。
 - `C:\resource` 下其它目录是别的项目，**不要改动**。
 
 ## 命令

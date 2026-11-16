@@ -168,6 +168,7 @@ parse (CST) → compose → validate → expand → render
 - `patch` = opinion 操作列表（set / add / remove prim / property），可带 expected 前置哈希
   ⇒ 并发 / 过期编辑冲突可检测。下沉为 openusd session-layer 作者操作。
 - `diff` / `undo` 复用 openusd 的可回放 Diff 与 undo/replay 记录器。
+- **agent 绑定（D10）**：对外提供一套 Python 操作脚本（subprocess 驱动 `rusd` CLI / `rusd serve` JSON-RPC），不做 MCP adapter；脚本与 CLI 输出同为机器可读 JSON。
 - `render` 返回 image + metadata（可见 prim 列表、screen bbox、诊断、耗时）。
 - 传输：`rusd serve`（stdio JSON-RPC）先行；MCP adapter 随后，让任意 MCP agent 直接编辑场景。
 - 编辑循环：`query → patch → validate → expand → render →（看 id pass）→ 再 patch`。
@@ -201,7 +202,7 @@ parse (CST) → compose → validate → expand → render
 | `rusd-render` | wgpu 渲染核心、passes、headless + viewport | M4 |
 | `rusd-cli` | `rusd` 二进制：fmt / validate / expand / render / serve / export | M1 起 |
 | `rusd-usd` | Rusd ↔ openusd 导出/导入桥（格式读写由 openusd 承担） | M6 |
-| `rusd-agent` | JSON-RPC / MCP 协议适配 | M5 |
+| `rusd-agent` | JSON-RPC 工具协议 + Python 操作脚本套件（无 MCP，D10） | M5 |
 | `spike-openusd` | O6 实证 spike（增量合成基准），publish=false，默认不构建 | 证据 |
 
 ## 11. 决策记录与开放问题
@@ -218,8 +219,8 @@ parse (CST) → compose → validate → expand → render
 - **D7**（2026-11-16）：默认坐标系 Z-up 右手系；USD 默认 Y-up，导出时转换。原 O4 关闭。
 - **D8**（2026-11-16）：cook 图 = 路径依赖隐式 DAG（read∩write 诱导），cook 包裹 USD 合成；节点输出 layer 非 stage（docs/PIPELINE.md §10，implicit_cook 实证）。
 - **D9**（2026-11-16）：cook 只包过程化生成，不包 USD 合成操作；compose op 全归 openusd pcp（docs/PIPELINE.md §10）。
+- **D10**（2026-11-16）：agent 操作接口 = 一套 Python 脚本（subprocess 驱动 rusd CLI / JSON-RPC），不做 MCP adapter。原 O5 关闭。
 
 开放：
 
 - **O2** 互操作硬约束——D3 后基本满足（openusd 原生 usdc/usdz 导出）；待确认目标 DCC 清单。
-- **O5** MCP adapter 的优先级（M5 内做，还是提前）。

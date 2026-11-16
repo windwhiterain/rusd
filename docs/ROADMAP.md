@@ -58,8 +58,9 @@
 - [ ] 递归 cook 图实例化（每 parcel 独立 BlockFill 节点，P6 动态发现）
 - 验收：同 seed 逐字节一致 ✓；6×6 城市在预算内 ✓；超预算确定性截断 + 诊断 ✓；RNG 路径键控不 reshuffle ✓
 
-## M4 — 渲染 MVP
+## M4 — 渲染 MVP（2026-11-16 启动，headless 优先）
 
+- [ ] wgpu device/headless 出图 spike（先验证 DX12 离屏渲染 + readback）
 - wgpu headless：从 openusd Stage 提取几何、内建几何、camera、beauty + prim-id pass
 - 容错占位 + 诊断叠加；确定性截图
 - 热重载交互 viewer（winit + egui），走 SPEC §6 增量管线
@@ -69,7 +70,7 @@
 ## M5 — Agent 协议
 
 - `rusd serve`：stdio JSON-RPC 工具集（SPEC §8）；diff/undo 复用 openusd
-- MCP adapter
+- Python 操作脚本套件（D10，替代 MCP）：subprocess 驱动 `rusd` CLI / JSON-RPC，机器可读 JSON
 - 验收：一个 agent 从一句 prompt 出发，经 query→patch→validate→render 循环建出森林场景
 
 ## M6 — 互操作与扩展
