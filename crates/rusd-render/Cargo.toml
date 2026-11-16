@@ -14,3 +14,4 @@ rusd-proc.workspace = true
 wgpu = "30.0.2"
 pollster = "1.0.1"
 png = "0.18.1"
+bytemuck = { version = "1.25.2", features = ["derive"] }

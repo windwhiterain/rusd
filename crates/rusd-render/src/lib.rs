@@ -15,6 +15,10 @@
 //! Error-tolerant by contract: invalid prims become magenta placeholders plus
 //! diagnostics; a render call always returns, never panics the agent loop.
 
+pub mod capture;
+pub mod render;
+
+pub use render::{RenderOutput, render};
 pub use rusd_core as core;
 pub use rusd_proc as proc;
 pub use rusd_scene as scene;
@@ -75,6 +79,25 @@ mod tests {
             assert_eq!(x.transform, y.transform);
             assert_eq!(x.color, y.color);
         }
+    }
+
+    #[test]
+    fn render_pick_roundtrip_and_determinism() {
+        let geo = extract(FOREST);
+        let r = crate::render::render(&geo, 320, 240).expect("headless render");
+        assert!(r.ids.iter().any(|&id| id != 0), "foreground present");
+        assert!(r.ids.contains(&0), "background present");
+        for (pos, &id) in r.ids.iter().enumerate() {
+            if id == 0 {
+                continue;
+            }
+            let x = (pos as u32) % r.width;
+            let y = (pos as u32) / r.width;
+            assert_eq!(r.pick(x, y), Some(r.paths[(id - 1) as usize].as_str()));
+        }
+        let r2 = crate::render::render(&geo, 320, 240).expect("re-render");
+        assert_eq!(r.beauty, r2.beauty, "deterministic beauty pixels");
+        assert_eq!(r.ids, r2.ids, "deterministic id pixels");
     }
 
     #[test]

@@ -965,6 +965,7 @@ dependencies = [
 name = "rusd-render"
 version = "0.0.1"
 dependencies = [
+ "bytemuck",
  "png",
  "pollster",
  "rusd-core",
