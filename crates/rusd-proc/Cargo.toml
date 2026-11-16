@@ -1,6 +1,6 @@
 [package]
 name = "rusd-proc"
-description = "Rusd generator runtime: path-keyed RNG, deterministic expansion, budgets"
+description = "Rusd procedural runtime: cook engine (implicit path-dependency DAG) + generators"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,3 +10,4 @@ authors.workspace = true
 [dependencies]
 rusd-core.workspace = true
 rusd-scene.workspace = true
+openusd.workspace = true

@@ -228,6 +228,13 @@ fn array_to_usd(items: &[Value], ty: Option<PropType>) -> Option<(SdfValue, &'st
     None
 }
 
+/// Count composed prims in the stage (all predicates).
+pub fn prim_count(stage: &Stage) -> usize {
+    let mut n = 0;
+    let _ = stage.traverse(openusd::usd::PrimPredicate::ALL, |_| n += 1);
+    n
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

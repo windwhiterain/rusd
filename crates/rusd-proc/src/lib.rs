@@ -1,14 +1,17 @@
 //! # rusd-proc
 //!
-//! Procedural semantics (SPEC §5). Lands in M3:
+//! Procedural runtime (SPEC §5–6):
+//! - [`generator`]: the Generator trait + GenContext (read-tracked composed inputs).
+//! - [`cook`]: the cook engine — an implicit path-dependency DAG (D8) that wraps
+//!   USD composition (D9), memoized by content hash with downstream dirty propagation.
+//! - [`generators`]: built-in generators (M2: RusdGrid), default registry, expand_doc.
 //!
-//! - `rng`: ChaCha8 streams keyed by `hash(stage.seed, prim_path, local_seed)`
-//!   so editing one branch never reshuffles another.
-//! - `expand`: lazy, incremental, content-hash-cached expansion of generator
-//!   prims into deterministic subtrees (`i000000`, ...).
-//! - `generators`: RusdScatter, RusdGrid, RusdInstance first; LSystem, Terrain,
-//!   Wfc later.
-//! - `budget`: max_prims / max_triangles enforcement and dry-run cost estimates.
+//! City generators (StreetGrid/Building/BlockFill/Scatter) register here in M3.
 
-pub use rusd_core as core;
-pub use rusd_scene as scene;
+pub mod cook;
+pub mod generator;
+pub mod generators;
+
+pub use cook::{CookEngine, CookNode, CookResult, CookStats, nodes_from_doc};
+pub use generator::{GenContext, Generator};
+pub use generators::{ExpandOutput, RusdGrid, default_registry, expand_doc};

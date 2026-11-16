@@ -298,6 +298,7 @@ dependencies = [
 name = "rusd-proc"
 version = "0.0.1"
 dependencies = [
+ "openusd",
  "rusd-core",
  "rusd-scene",
 ]

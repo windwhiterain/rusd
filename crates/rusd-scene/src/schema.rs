@@ -163,6 +163,13 @@ static BUILDING: &[PropDef] = &[
 ];
 // Recognized generator names whose detailed params land in later milestones.
 static GENERIC_GENERATOR: &[PropDef] = &[p("seed", U64), p("max_prims", U64)];
+static GRID: &[PropDef] = &[
+    p("count_x", U64),
+    p("count_y", U64),
+    p("spacing", F64),
+    p("radius", F64),
+    p("seed", U64),
+];
 
 /// Look up a schema by name. `None` means unknown (tolerated with a warning).
 pub fn lookup(name: &str) -> Option<SchemaDef> {
@@ -180,7 +187,7 @@ pub fn lookup(name: &str) -> Option<SchemaDef> {
         "RusdStreetGrid" => ("RusdStreetGrid", SchemaKind::Generator, STREET_GRID),
         "RusdBlockFill" => ("RusdBlockFill", SchemaKind::Generator, BLOCK_FILL),
         "RusdBuilding" => ("RusdBuilding", SchemaKind::Generator, BUILDING),
-        "RusdGrid" => ("RusdGrid", SchemaKind::Generator, GENERIC_GENERATOR),
+        "RusdGrid" => ("RusdGrid", SchemaKind::Generator, GRID),
         "RusdInstance" => ("RusdInstance", SchemaKind::Generator, GENERIC_GENERATOR),
         "RusdLSystem" => ("RusdLSystem", SchemaKind::Generator, GENERIC_GENERATOR),
         "RusdTerrain" => ("RusdTerrain", SchemaKind::Generator, GENERIC_GENERATOR),

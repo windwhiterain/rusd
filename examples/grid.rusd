@@ -1,0 +1,18 @@
+# rusd 0.1 — RusdGrid cook 引擎演示（M2）
+# 一个 5×5 的球体网格，由 cook 引擎过程化生成（非手写 prim）。
+
+[stage]
+default_prim = "/World"
+meters_per_unit = 1.0
+seed = 1
+up_axis = "Z"
+
+[World]
+schema = "Xform"
+
+[World.Grid]
+count_x = 5
+count_y = 5
+radius = 0.4
+schema = "RusdGrid"
+spacing = 2.0

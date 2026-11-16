@@ -102,6 +102,41 @@ fn main() {
                 Err(diags) => print_diags(&diags),
             }
         }
+        Some("expand") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: rusd expand <file.rusd>");
+                std::process::exit(2);
+            };
+            let text = read(path);
+            let doc = match rusd_core::syntax::parse(&text) {
+                Ok(d) => d,
+                Err(diags) => print_diags(&diags),
+            };
+            let vdiags = rusd_scene::validate(&doc);
+            let mut has_error = false;
+            for d in &vdiags {
+                println!("{}", d.to_json());
+                if d.severity == rusd_core::Severity::Error {
+                    has_error = true;
+                }
+            }
+            if has_error {
+                std::process::exit(1);
+            }
+            match rusd_proc::expand_doc(&doc) {
+                Ok(out) => {
+                    for d in &out.diags {
+                        println!("{}", d.to_json());
+                    }
+                    println!(
+                        "cook: {} cooked, {} reused, {} skipped ({} generator nodes)",
+                        out.stats.cooked, out.stats.reused, out.stats.skipped, out.node_count
+                    );
+                    println!("composed prims: {}", out.prim_count);
+                }
+                Err(diags) => print_diags(&diags),
+            }
+        }
         Some(other) => {
             eprintln!("rusd: '{other}' is not implemented yet — see docs/ROADMAP.md");
             std::process::exit(2);

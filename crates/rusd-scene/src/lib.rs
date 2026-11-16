@@ -10,6 +10,6 @@ pub mod adapter;
 pub mod schema;
 pub mod validate;
 
-pub use adapter::{PrimInfo, composition_diags, lower, query};
+pub use adapter::{PrimInfo, composition_diags, lower, prim_count, query};
 pub use schema::{PropType, SchemaDef, SchemaKind};
 pub use validate::validate;
