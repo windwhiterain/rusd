@@ -101,7 +101,7 @@ fn cook_pass(stage: &Stage, root_id: &str, a_width: f64, r: &mut Runner) -> Resu
     r.cook(stage, root_id, "B", format!("building:{w}"), || {
         cook_building(stage)
     })?;
-    r.cook(stage, root_id, "C", "tree:1".to_owned(), || cook_tree())?;
+    r.cook(stage, root_id, "C", "tree:1".to_owned(), cook_tree)?;
     Ok(())
 }
 
