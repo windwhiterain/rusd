@@ -73,7 +73,7 @@
 ## M5 — Agent 协议
 
 - [x] `rusd serve`：stdio JSON-RPC（NDJSON）有状态 session + open/query/validate/expand/render/pick（2026-11-16）
-- [ ] patch（编辑文档 CST，D11）+ diff/undo/redo
+- [x] patch（编辑文档 CST，D11）+ diff/undo/redo（文档快照，2026-11-16）
 - Python 操作脚本套件（D10，替代 MCP）：subprocess 驱动 `rusd` CLI / JSON-RPC，机器可读 JSON
 - 验收：一个 agent 从一句 prompt 出发，经 query→patch→validate→render 循环建出森林场景
 
