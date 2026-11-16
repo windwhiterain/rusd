@@ -24,6 +24,7 @@ pub struct CookNode {
     pub path: PrimPath,
     pub params: BTreeMap<String, Value>,
     pub seed: u64,
+    pub stage_seed: u64,
     /// Declared inputs: (prim path, attribute) read from the composed stage.
     pub reads: Vec<(String, String)>,
     /// Declared outputs: prim paths this node's output layer authors.
@@ -93,9 +94,11 @@ impl CookEngine {
                 );
                 continue;
             };
-            let mut ctx = GenContext::new(stage, &node.path, &node.params, node.seed);
+            let mut ctx =
+                GenContext::new(stage, &node.path, &node.params, node.seed, node.stage_seed);
             match g.eval(&mut ctx) {
                 Ok(layer) => {
+                    diags.extend(ctx.take_warnings());
                     let lid = layer.identifier().to_owned();
                     if let Err(e) = stage.insert_layer(root_id, 0, layer, LayerOffset::IDENTITY) {
                         diags.push(
@@ -207,13 +210,30 @@ pub fn nodes_from_doc(doc: &rusd_core::syntax::ParsedDocument) -> Vec<CookNode> 
             Some(Value::Int(i)) if *i >= 0 => *i as u64,
             _ => 0,
         };
+        let reads = match prim.schema.as_str() {
+            "RusdScatter" => prim
+                .props
+                .get("prototype")
+                .and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .map(|p| vec![(p, "radius".to_owned())])
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let stage_seed = match doc.stage.get("seed") {
+            Some(Value::Int(i)) if *i >= 0 => *i as u64,
+            _ => 0,
+        };
         nodes.push(CookNode {
             id: prim.path.as_str().to_owned(),
             generator: prim.schema.clone(),
             path: prim.path.clone(),
             params: prim.props.clone(),
             seed,
-            reads: Vec::new(),
+            stage_seed,
+            reads,
             writes: vec![prim.path.as_str().to_owned()],
         });
     }
@@ -307,6 +327,7 @@ mod tests {
                 .map(|(k, v)| (k.to_owned(), Value::Float(v)))
                 .collect(),
             seed: 0,
+            stage_seed: 0,
             reads: reads
                 .into_iter()
                 .map(|(p, a)| (p.to_owned(), a.to_owned()))

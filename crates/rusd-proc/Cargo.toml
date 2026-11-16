@@ -11,3 +11,6 @@ authors.workspace = true
 rusd-core.workspace = true
 rusd-scene.workspace = true
 openusd.workspace = true
+rand = "0.10.4"
+rand_chacha = "0.10.0"
+rand_core = "0.10.1"

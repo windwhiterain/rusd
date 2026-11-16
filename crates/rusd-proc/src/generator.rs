@@ -27,16 +27,19 @@ pub fn read_attr_value(stage: &Stage, prim: &str, attr: &str) -> Option<SdfValue
 }
 
 /// The context handed to a generator evaluation: read-only composed inputs
-/// (with read tracking), the node's params and path-keyed seed.
+/// (with read tracking), the node's params, path-keyed seed, and a warning sink.
 pub struct GenContext<'a> {
     stage: &'a Stage,
     /// The generator node's anchor prim path.
     pub path: &'a PrimPath,
     /// The generator's parameters (from the `.rusd` prim table).
     pub params: &'a BTreeMap<String, Value>,
-    /// Path-keyed seed: hash(stage.seed, prim_path, local_seed).
+    /// The node's local seed (the `seed` property).
     pub seed: u64,
+    /// The stage-wide seed (for path-keyed RNG streams).
+    pub stage_seed: u64,
     reads: Vec<(String, String)>,
+    warnings: Vec<Diagnostic>,
 }
 
 impl<'a> GenContext<'a> {
@@ -45,13 +48,16 @@ impl<'a> GenContext<'a> {
         path: &'a PrimPath,
         params: &'a BTreeMap<String, Value>,
         seed: u64,
+        stage_seed: u64,
     ) -> Self {
         Self {
             stage,
             path,
             params,
             seed,
+            stage_seed,
             reads: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 
@@ -69,6 +75,16 @@ impl<'a> GenContext<'a> {
     /// The actual reads performed during this evaluation (for precise memo keys).
     pub fn tracked_reads(&self) -> &[(String, String)] {
         &self.reads
+    }
+
+    /// Emit a non-fatal warning (e.g. budget truncation) alongside a successful eval.
+    pub fn warn(&mut self, diag: Diagnostic) {
+        self.warnings.push(diag);
+    }
+
+    /// Drain accumulated warnings (called by the engine after eval).
+    pub fn take_warnings(&mut self) -> Vec<Diagnostic> {
+        std::mem::take(&mut self.warnings)
     }
 
     pub fn param_f64(&self, name: &str, default: f64) -> f64 {
@@ -91,6 +107,25 @@ impl<'a> GenContext<'a> {
             Some(Value::String(s)) => Some(s.as_str()),
             _ => None,
         }
+    }
+
+    pub fn param_vec2(&self, name: &str, default: [f64; 2]) -> [f64; 2] {
+        match self.params.get(name) {
+            Some(Value::Array(items)) if items.len() == 2 => {
+                let a = num(&items[0]).unwrap_or(default[0]);
+                let b = num(&items[1]).unwrap_or(default[1]);
+                [a, b]
+            }
+            _ => default,
+        }
+    }
+}
+
+fn num(v: &Value) -> Option<f64> {
+    match v {
+        Value::Float(f) => Some(*f),
+        Value::Int(i) => Some(*i as f64),
+        _ => None,
     }
 }
 

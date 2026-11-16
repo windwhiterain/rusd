@@ -1,7 +1,6 @@
-# rusd 0.1 — 示例：一个 6×6 街区的确定性城市
-# 表面语法 = TOML profile（SPEC §2）；generator 设计见 docs/GENERATORS.md（M3 实现）。
-# 组合：RusdStreetGrid → 街区 parcel → RusdBlockFill → RusdBuilding 实例。
-# 本文件为示意（M3 后可展开）；parcel:extent 由 StreetGrid 注入 BlockFill。
+# rusd 0.1 — 城市 generator 演示（M3）
+# RusdStreetGrid 生成街区 + 建筑（高度按分区分布采样）；
+# RusdScatter 撒布行道树（读 Tree 原型 radius，形成 cook 依赖）。
 
 [stage]
 default_prim = "/World"
@@ -19,48 +18,22 @@ position = [420.0, -260.0, 220.0]
 schema = "Camera"
 
 [World.City]
-avenue_every = 3
-avenue_width = 20.0
-block_prototype = "/World/Prototypes/Block"
 block_size = [60.0, 60.0]
 blocks_x = 6
 blocks_y = 6
-max_prims = 20000
-schema = "RusdStreetGrid"
-seed = 7
-street_width = 12.0
-
-[World.Materials]
-schema = "Xform"
-
-[World.Materials.Facade]
-diffuse = [0.72, 0.7, 0.66]
-schema = "Material"
-
-[World.Prototypes]
-schema = "Xform"
-
-[World.Prototypes.Block]
-schema = "Xform"
-
-[World.Prototypes.Block.Fill]
-building_prototype = "/World/Prototypes/Building"
+floor_height = 3.2
 height = { dist = "normal", mu = 24.0, sigma = 10.0 }
 lot_width = 18.0
 margin = 4.0
-max_prims = 400
+max_prims = 20000
 occupancy = 0.9
-schema = "RusdBlockFill"
-seed = 11
+schema = "RusdStreetGrid"
+seed = 7
+street_width = 12.0
 zone = "commercial"
 
-[World.Prototypes.Building]
-facade = "/World/Materials/Facade"
-floor_height = 3.2
-roof = "flat"
-schema = "RusdBuilding"
-setback_depth = 1.5
-setback_every = 6
+[World.Prototypes]
+schema = "Xform"
 
 [World.Prototypes.Tree]
 radius = 2.0
@@ -69,6 +42,7 @@ schema = "Sphere"
 [World.StreetProps]
 count = 300
 domain = { dist = "rect", w = 420.0, h = 420.0 }
+max_prims = 300
 prototype = "/World/Prototypes/Tree"
 scale = { dist = "uniform", min = 0.8, max = 1.3 }
 schema = "RusdScatter"

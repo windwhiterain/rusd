@@ -85,6 +85,9 @@ impl Generator for RusdGrid {
 pub fn default_registry() -> CookEngine {
     let mut e = CookEngine::new();
     e.register(Box::new(RusdGrid));
+    e.register(Box::new(crate::city::RusdStreetGrid));
+    e.register(Box::new(crate::city::RusdBuilding));
+    e.register(Box::new(crate::city::RusdScatter));
     e
 }
 
