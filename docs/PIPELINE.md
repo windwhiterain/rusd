@@ -166,6 +166,27 @@ openusd pcp（合成既有 layer，增量）                      ← 纯合成�
 **与 D5/D6 一致**：generator 是合成图里的 layer-op（D5），触发靠 cook 引擎（D6）；
 本节明确 cook 图本身是路径依赖隐式图，cook 包裹 USD 合成。
 
+### cook 只包过程化，不包合成操作（D9）
+
+**不需要**给每个 USD compose 操作包 cook 层。分工是：
+
+- **cook = 计算**：只有 generator（纯函数产生新 layer 内容）才是 cook 节点。
+- **pcp = 合成**：sublayer / reference / payload / variant / inherits / specializes / relocates /
+  list edit / opinion 强度——全部由 openusd pcp 直接增量求值，**不需要 cook 包装**。
+
+cook 节点稀疏（对应 handful generator schema），坐在稠密的 USD 合成图里；合成操作是 pcp 的本职，
+包一层就等于在 cook 里重写 pcp，违反 D3（复用合规增量合成），冗余且丢增量。
+
+证据：forest/city 的 lower+compose+query 全走 pcp，零 cook 节点——合成操作本就不需要 cook。
+
+城市里的交织：StreetGrid(cook) → block 静态 reference 外部资产(pcp，不包) → BlockFill(cook) 读合成结果
+→ building 静态 variant(pcp，不包) → Scatter(cook)。
+
+agent 编辑同理：纯 author opinion（set attr / add reference / select variant）→ 直接写 layer + pcp 重合成（不包）；
+改 generator 参数 → 脏化已有 cook 节点（非新增包装）。
+
+**边界原则**：需要 cook 节点 ⟺ 存在产生新 layer 内容的纯函数计算（generator）；其余皆 pcp。
+
 ## 11. 开放问题
 
 - **P1** 节点标记 prim 是否在最终场景保留（vs 仅输出 prim 保留）？倾向保留轻量 group 便于 agent 寻址。
