@@ -24,7 +24,8 @@ pub fn canonicalize(text: &str) -> Result<String, Vec<Diagnostic>> {
 fn canonicalize_table(t: &mut Table) {
     let value_keys: Vec<String> = t
         .iter()
-        .filter_map(|(k, item)| matches!(item, Item::Value(_)).then(|| k.to_owned()))
+        .filter(|(_, item)| matches!(item, Item::Value(_)))
+        .map(|(k, _)| k.to_owned())
         .collect();
     for (_k, item) in t.iter_mut() {
         match item {
@@ -80,7 +81,7 @@ fn canonicalize_value(v: &mut Value) {
 fn order_tables(doc: &mut DocumentMut) {
     let mut paths: Vec<Vec<String>> = Vec::new();
     collect_paths(doc.as_table(), &mut Vec::new(), &mut paths);
-    paths.sort_by(|a, b| path_key(a).cmp(&path_key(b)));
+    paths.sort_by_key(|a| path_key(a));
     for (i, comps) in paths.iter().enumerate() {
         if let Some(t) = table_at_mut(doc.as_table_mut(), comps) {
             t.set_position(Some(i as isize));

@@ -195,6 +195,7 @@ fn collect_props(
 }
 
 /// Convert a TOML value to a Rusd value, keeping the TOML type (coercion is M2).
+#[allow(clippy::result_large_err)]
 fn convert(v: &TomlValue) -> Result<Value, Diagnostic> {
     if let Some(s) = v.as_str() {
         return Ok(Value::String(s.to_owned()));
