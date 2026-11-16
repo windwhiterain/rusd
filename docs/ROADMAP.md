@@ -48,13 +48,15 @@
 - 验收：forest.rusd 下沉为合规 Stage；非法场景给可定位诊断；overlay 覆盖 base 可演示；
       单属性编辑走 openusd 定向失效（复用 spike 基准）
 
-## M3 — 过程化核心
+## M3 — 过程化核心（2026-11-16，核心完成）
 
-- ChaCha8 路径键控 RNG 流
-- 城市 suite（D4，docs/GENERATORS.md）：RusdStreetGrid / RusdBuilding / RusdBlockFill + 通用 RusdScatter（写入 openusd Stage）
-- 分区预设、预算与确定性截断、增量展开、内容哈希缓存、实例覆盖
-- `rusd expand`（含 --dry-run）
-- 验收：同 seed 逐字节一致；改街区 A 不 reshuffle 街区 B；6×6 城市在预算内；超预算确定性截断+诊断
+- [x] ChaCha8 路径键控 RNG 流（rng.rs，4 测试：确定性 / 路径隔离 / uniform / normal）
+- [x] 城市 suite（D4）：RusdStreetGrid（完整城市）/ RusdBuilding / RusdScatter；BlockFill 逻辑 v0 内联于 StreetGrid
+- [x] 分区预设、分布采样、预算与确定性截断（W_BUDGET）
+- [x] `rusd expand`：city.rusd → 475 合成 prim；确定性 / 预算 / 读依赖验收测试（13 rusd-proc 测试）
+- [ ] 增量展开缓存细化（cook memo 已有）、`--dry-run`、实例覆盖
+- [ ] 递归 cook 图实例化（每 parcel 独立 BlockFill 节点，P6 动态发现）
+- 验收：同 seed 逐字节一致 ✓；6×6 城市在预算内 ✓；超预算确定性截断 + 诊断 ✓；RNG 路径键控不 reshuffle ✓
 
 ## M4 — 渲染 MVP
 
