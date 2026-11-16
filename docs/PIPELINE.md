@@ -132,10 +132,45 @@ openusd pcp（合成既有 layer，增量）                      ← 纯合成�
 初始 cook height=20；no-op pass 计数 A1/B1/C1（全 memo 命中，零重 cook）；改 A=30 后 A2/B2/C1
 （下游 B 重 cook、独立 C 不动），height=60，重 cook A+B ~616µs。触发=cook 引擎，无回调、无魔改。
 
-## 10. 开放问题
+## 10. cook 图与 USD 图的关系（决策 D8）
+
+两个图，同一基底（layer + prim 路径）：
+
+| | USD 合成图（pcp） | cook 图（Rusd） |
+|---|---|---|
+| 节点 | prim / layer-site | generator 求值 |
+| 边 | 合成 arc（sublayer/reference/payload/variant） | 路径读依赖（read∩write） |
+| 性质 | 静态、声明式 | 动态、过程式 |
+| 求值 | openusd pcp（增量、依赖追踪） | Rusd cook 引擎（拓扑 + memo + 脏传播） |
+| 产物 | 合成 prim | 输出 layer |
+
+**三个选项的判定**：
+
+- 选项2（每个 stage 一个 cook 节点）**错**：cook 节点输出的是 **layer**，不是 stage。
+  stage 是多个 cook 输出 layer 合成的*结果*，一个 stage 由多个节点贡献。
+- 正确 = **选项1 + 选项3**：cook **包裹** USD 合成（求值一个节点 = 合成上游 → 按路径读输入 →
+  计算 → author 输出 layer → insert_layer）；cook 图是**路径依赖隐式成图**（节点读合成 prim 路径，
+  依赖由 read/write 路径集合的交集诱导，经 USD 合成中介）。
+
+**机制**：
+
+- 节点声明/记录 read-set（读的 prim.attr）与 write-set（author 的 prim）。
+- 依赖边：B 依赖 A ⟺ B.reads ∩ A.writes ≠ ∅；拓扑排序求值序。
+- memo 键 = hash(params, seed, 实际读到的合成值)。读值不变 ⇒ 跳过；上游变 ⇒ 读值变 ⇒ 下游重 cook。
+- **动态发现**：generator 输出决定下游读哪些路径（StreetGrid 生成哪些 block，BlockFill 才读哪些 parcel），
+  图在求值中逐步发现（dynamic dataflow，类 salsa），不是纯静态拓扑。
+
+**实证**（`cargo run -p spike-openusd --bin implicit_cook`）：依赖自动推导 B<-A（read/write 交集），
+自动拓扑序 [A,C,B]（无硬编码）；改 A=30 → A2/B2/C1（下游 B 重 cook、独立 C 不动），height 20→60。
+
+**与 D5/D6 一致**：generator 是合成图里的 layer-op（D5），触发靠 cook 引擎（D6）；
+本节明确 cook 图本身是路径依赖隐式图，cook 包裹 USD 合成。
+
+## 11. 开放问题
 
 - **P1** 节点标记 prim 是否在最终场景保留（vs 仅输出 prim 保留）？倾向保留轻量 group 便于 agent 寻址。
 - **P2** 显式 `inputs` 元数据 vs 纯 reference 表达跨节点数据流？v0 先用 reference + 隐式上下文。
 - **P3** 输出 layer 的持久化/缓存格式（内存匿名 vs 落盘内容哈希缓存）？v0 内存，落盘缓存后续。
 - **P4** layer 合并/GC 策略的触发时机与阈值。
 - **P5** cook 触发粒度：v0 eager 全图；lazy cook（按 query 子图）与 ar::Resolver 备选后续评估。
+- **P6** read-set 粒度（prim 级 vs attr 级）与动态依赖的精确追踪（runtime read tracking vs 声明式输入）。

@@ -216,6 +216,7 @@ parse (CST) → compose → validate → expand → render
 - **D5**（2026-11-16）：PCG = 合成图里的 layer-op（Solaris 模型，§5，docs/PIPELINE.md，已实证）。
 - **D6**（2026-11-16）：generator 触发 = openusd 之上的 cook 引擎（图求值 + memo），非合成回调、不改 composer（docs/PIPELINE.md §9，cook_graph 实证）。
 - **D7**（2026-11-16）：默认坐标系 Z-up 右手系；USD 默认 Y-up，导出时转换。原 O4 关闭。
+- **D8**（2026-11-16）：cook 图 = 路径依赖隐式 DAG（read∩write 诱导），cook 包裹 USD 合成；节点输出 layer 非 stage（docs/PIPELINE.md §10，implicit_cook 实证）。
 
 开放：
 
