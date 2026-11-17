@@ -17,6 +17,21 @@
 //! subscriber gets the snapshot plus a `state_changed`, one monotonic `version`
 //! at a time.
 //!
+//! ## Beyond the D12 surface
+//!
+//! Three groups of methods live alongside that one, each in its own module and
+//! described by its own section of `docs/PROTOCOL.md`:
+//!
+//! - [`crate::capture`] — `capture` / `capture_get` / `capture_list`, the
+//!   visual references a human hands an agent (PROTOCOL v1.1). A capture is
+//!   **not** a scene mutation: it does not advance `version` and broadcasts
+//!   nothing.
+//! - [`crate::composition`] — `composition_tree` / `comp_node`, the composition
+//!   tree the viewer's panel draws (PROTOCOL v1.2). It is read off the authority
+//!   stack's `sdf` layer specs, not off the flattened snapshot, which has already
+//!   dropped every arc. The tree is cached for the `version` it describes and
+//!   dropped whenever the stage is rebuilt.
+//!
 //! Which mutations rebuild, and which edit in place:
 //!
 //! - `open` / `patch` / `undo` / `redo` / a hot **reload**: the document
@@ -78,6 +93,8 @@ use rusd_proc::{CookEngine, ExpandOutput};
 use serde_json::{Value, json};
 
 use crate::Agent;
+use crate::capture::CaptureStore;
+use crate::composition::CompositionTree;
 
 /// The wire protocol version this server speaks (`hello`).
 pub const PROTOCOL_VERSION: u64 = 1;
@@ -120,7 +137,18 @@ pub struct Server {
 impl Server {
     /// Bind `addr` and start serving. `port 0` binds an ephemeral port, which
     /// [`local_addr`](Self::local_addr) then reports.
+    ///
+    /// Visual-reference captures go to `<cwd>/target/captures` (PROTOCOL v1.1),
+    /// the build directory of whatever project the server was started in.
     pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Server> {
+        let root = std::env::current_dir()?.join("target").join("captures");
+        Server::bind_with_captures(addr, root)
+    }
+
+    /// [`bind`](Self::bind), with the capture directory named outright — which
+    /// is what a test wants, so its captures land somewhere it can delete.
+    pub fn bind_with_captures(addr: impl ToSocketAddrs, captures: PathBuf) -> io::Result<Server> {
+        let captures = CaptureStore::open(captures)?;
         let listener = TcpListener::bind(addr)?;
         let addr = listener.local_addr()?;
         listener.set_nonblocking(true)?;
@@ -131,7 +159,7 @@ impl Server {
         thread::Builder::new()
             .name("rusd-sync".to_owned())
             .spawn(move || {
-                let mut session = Session::new(name, sync_tx);
+                let mut session = Session::new(name, sync_tx, captures);
                 loop {
                     // A pending file-watch debounce turns the blocking receive
                     // into a timed one: the loop wakes on the deadline when no
@@ -383,6 +411,13 @@ struct Session {
     /// When the debounce of the last file event expires; `None` when no file
     /// event is pending.
     reload_due: Option<Instant>,
+    /// Visual-reference captures (PROTOCOL v1.1): the directory they are written
+    /// to and the numbering they carry on from.
+    captures: CaptureStore,
+    /// The composition tree (PROTOCOL v1.2), built from the authority stack's
+    /// `sdf` layer specs and kept for the version it describes: `comp_node` is
+    /// asked for one node at a time, after the tree that named it.
+    tree: Option<(u64, CompositionTree)>,
 }
 
 /// The hot-reload watch on one document path (PROTOCOL `reason:"reload"`).
@@ -395,7 +430,7 @@ struct Watch {
 }
 
 impl Session {
-    fn new(session_name: String, wake: mpsc::Sender<Msg>) -> Self {
+    fn new(session_name: String, wake: mpsc::Sender<Msg>, captures: CaptureStore) -> Self {
         Session {
             agent: Agent::new(),
             session_name,
@@ -411,6 +446,8 @@ impl Session {
             wake,
             watch: None,
             reload_due: None,
+            captures,
+            tree: None,
         }
     }
 
@@ -527,6 +564,11 @@ impl Session {
             }
             "unsubscribe" => self.unsubscribe(conn, &params),
             "opinion" => self.opinion(&params),
+            "composition_tree" => self.composition_tree(&params),
+            "comp_node" => self.comp_node(&params),
+            "capture" => self.captures.capture(&params),
+            "capture_get" => self.captures.get(&params),
+            "capture_list" => self.captures.list(&params),
             "open" => self.open(&params),
             "patch" => self.patch(&params),
             "undo" => self.undo(),
@@ -552,6 +594,43 @@ impl Session {
     }
 
     // --- viewer methods ---------------------------------------------------
+
+    /// `composition_tree{}` (PROTOCOL v1.2): the composition tree of the
+    /// authority stack. Built on demand and kept until the stage changes — a
+    /// `comp_node` for a node the client just read must see the same tree, and
+    /// the build walks every layer, so it is not something to repeat per node.
+    fn composition_tree(&mut self, _p: &Value) -> Result<Value, (i64, String)> {
+        let Some(stage) = self.stage.clone() else {
+            return Err(server_error("no scene open; call open first".into()));
+        };
+        let tree = CompositionTree::build(&stage);
+        let value = tree.to_json();
+        self.tree = Some((self.version, tree));
+        Ok(value)
+    }
+
+    /// `comp_node{id}`: one node's detail, out of the tree last built. A stage
+    /// that moved since is rebuilt first, so a node id the client is still
+    /// holding cannot address the tree of a scene that no longer exists.
+    fn comp_node(&mut self, p: &Value) -> Result<Value, (i64, String)> {
+        let Some(id) = p.get("id").and_then(Value::as_str) else {
+            return Err((INVALID_PARAMS, "comp_node: `id` (string) required".into()));
+        };
+        let Some(stage) = self.stage.clone() else {
+            return Err(server_error("no scene open; call open first".into()));
+        };
+        if self.tree.as_ref().map(|(v, _)| *v) != Some(self.version) {
+            let tree = CompositionTree::build(&stage);
+            self.tree = Some((self.version, tree));
+        }
+        let (_, tree) = self.tree.as_ref().expect("the tree was just built");
+        tree.node(&stage, id).ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                format!("comp_node: no node has the id {id:?}"),
+            )
+        })
+    }
 
     fn hello(&self, p: &Value) -> Result<Value, (i64, String)> {
         match p.get("protocol").and_then(Value::as_u64) {
@@ -712,6 +791,9 @@ impl Session {
         self.agent.set_live(None);
         self.stage = None;
         self.session_id = None;
+        // The tree describes the stage that was just dropped: a later
+        // `comp_node` must not answer out of it.
+        self.tree = None;
         // A different root layer means the memoized cook layers are not in this
         // stage: a memo hit would skip the insert and leave a hole, so the
         // content-hash cache starts over with the stage.
