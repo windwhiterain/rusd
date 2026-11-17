@@ -188,8 +188,12 @@ impl Generator for RusdStreetGrid {
                                 let _ = zsigma;
                                 let fw = lot_width - 2.0;
                                 let fd = lot_width - 2.0;
-                                let bx = cx + margin + (li as f64 + 0.5) * lot_width;
-                                let by = cy + margin + (lj as f64 + 0.5) * lot_width;
+                                // Block-local: the block prim's Xform already carries
+                                // (cx, cy), so adding it again here would count the
+                                // block origin twice and push the lots out past the
+                                // street grid -- off the ground plane.
+                                let bx = margin + (li as f64 + 0.5) * lot_width;
+                                let by = margin + (lj as f64 + 0.5) * lot_width;
                                 let shade = rng.uniform(0.55, 0.8) as f32;
                                 let bp = format!("{block}/lot{li}_{lj}");
                                 author_building(
@@ -343,6 +347,116 @@ mod tests {
         let mut e = default_registry();
         let r = e.cook(&stage, &root, &nodes);
         (stage, r)
+    }
+
+    /// World-space bounds of one extracted prim: (min, max) over its vertices.
+    fn world_bounds(it: &rusd_scene::GeoItem) -> ([f64; 3], [f64; 3]) {
+        let mut lo = [f64::INFINITY; 3];
+        let mut hi = [f64::NEG_INFINITY; 3];
+        for p in &it.mesh.positions {
+            let w = rusd_scene::geometry::mat_transform_point(
+                it.transform,
+                [p[0] as f64, p[1] as f64, p[2] as f64],
+            );
+            for k in 0..3 {
+                lo[k] = lo[k].min(w[k]);
+                hi[k] = hi[k].max(w[k]);
+            }
+        }
+        (lo, hi)
+    }
+
+    /// The ground plane spans the whole street grid, and every building lot stands
+    /// on it. Both derive their extent from the same grid formula
+    /// `blocks * block_size + (blocks + 1) * street_width`, so the ground is exactly
+    /// the grid -- no invented margin on top of it.
+    #[test]
+    fn ground_covers_the_whole_street_grid() {
+        let doc = syntax::parse(CITY).unwrap();
+        let (stage, r) = expand(&doc);
+        assert!(r.diags.iter().all(|d| d.code != "E_GEN"));
+
+        let geo = rusd_scene::extract(&stage);
+        let ground = geo
+            .items
+            .iter()
+            .find(|it| it.path == "/World/City/Ground")
+            .expect("ground exists");
+        let (glo, ghi) = world_bounds(ground);
+
+        // The grid extent, recomputed here from examples/city.rusd's own params --
+        // independently of the formula inside `RusdStreetGrid::eval`.
+        let city = doc
+            .prims
+            .iter()
+            .find(|p| p.path.as_str() == "/World/City")
+            .expect("/World/City exists");
+        let param_f64 = |k: &str| match city.props.get(k) {
+            Some(Value::Float(f)) => *f,
+            Some(Value::Int(i)) => *i as f64,
+            _ => panic!("{k} missing from /World/City"),
+        };
+        let param_vec2 = |k: &str| match city.props.get(k) {
+            Some(Value::Array(items)) if items.len() == 2 => {
+                let comp = |v: &Value| match v {
+                    Value::Float(f) => *f,
+                    Value::Int(i) => *i as f64,
+                    _ => panic!("{k} component is not a number"),
+                };
+                (comp(&items[0]), comp(&items[1]))
+            }
+            _ => panic!("{k} missing from /World/City"),
+        };
+        let (nx, ny) = (param_f64("blocks_x"), param_f64("blocks_y"));
+        let (bw, bh) = param_vec2("block_size");
+        let street = param_f64("street_width");
+        let grid_w = nx * bw + (nx + 1.0) * street;
+        let grid_h = ny * bh + (ny + 1.0) * street;
+
+        assert!(
+            glo[0].abs() < 1e-6 && glo[1].abs() < 1e-6,
+            "ground starts at the grid origin: {:?}",
+            [glo[0], glo[1]]
+        );
+        assert!(
+            (ghi[0] - grid_w).abs() < 1e-6,
+            "ground width {} != grid width {grid_w}",
+            ghi[0]
+        );
+        assert!(
+            (ghi[1] - grid_h).abs() < 1e-6,
+            "ground depth {} != grid depth {grid_h}",
+            ghi[1]
+        );
+        assert!(
+            (glo[2] - 0.0).abs() < 1e-6 && (ghi[2] - 0.5).abs() < 1e-6,
+            "ground slab sits at z in [0, 0.5]: {:?}",
+            [glo[2], ghi[2]]
+        );
+
+        // Every building lot must lie within the ground footprint.
+        let mut lots = 0;
+        for it in geo
+            .items
+            .iter()
+            .filter(|it| it.path.starts_with("/World/City/b") && it.path.contains("/lot"))
+        {
+            let (lo, hi) = world_bounds(it);
+            for k in 0..2 {
+                assert!(
+                    lo[k] >= glo[k] - 1e-6 && hi[k] <= ghi[k] + 1e-6,
+                    "{} escapes the ground on axis {k}: [{}, {}] not within [{}, {}]",
+                    it.path,
+                    lo[k],
+                    hi[k],
+                    glo[k],
+                    ghi[k]
+                );
+            }
+            assert!(lo[2] >= -1e-6, "{} sits below the ground", it.path);
+            lots += 1;
+        }
+        assert!(lots > 100, "expected a full city, got {lots} lots");
     }
 
     #[test]
