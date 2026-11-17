@@ -1,0 +1,11 @@
+[project]
+name = "rusd-scripts"
+version = "0.0.1"
+description = "Rusd agent operation scripts (D10): drive rusd serve over stdio JSON-RPC"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+# Stdlib-only client; no third-party packages. uv supplies a standalone CPython
+# (the machine's embedded Python 3.13 is broken — missing stdlib).
+package = false

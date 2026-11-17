@@ -10,23 +10,27 @@ agent 操作 Rusd 的 Python 接口（替代 MCP，决策 D10）。纯标准库�
   patch / set / define / remove / undo / redo / diff / state`。上下文管理器自动收尾。
 - `example_build_forest.py` — 完整 agent 循环示例：从最小场景经 `patch` 建出森林，
   `render` / `pick` / `undo` / `redo`。即 M5 验收。
+- `pyproject.toml` / `.python-version` — uv 项目（stdlib-only，pin Python 3.12）。
 
-## 运行
+## 运行（uv）
+
+本机用 **uv** 提供 Python（见下「环境」）。在 `python/` 目录：
 
 ```bash
-python example_build_forest.py          # 需要可用的 Python 3 + rusd 二进制
-RUSD_BIN=/path/to/rusd python example_build_forest.py
+uv run example_build_forest.py        # uv 自动用 .python-version 的 3.12 建 .venv
+uv run rusd_client.py                 # 客户端冒烟测试
 ```
 
 `rusd` 二进制查找顺序：`RUSD_BIN` 环境变量 → `PATH` → 从脚本向上找 `target/{debug,release}/rusd`。
-渲染（`render`/`pick`）需要本机 GPU；编辑步骤（open/patch/expand/undo）不需要。
+先 `cargo build -p rusd-cli` 出二进制。渲染（`render`/`pick`）需本机 GPU；编辑步骤不需要。
 
-## 环境注意（本机实测）
+## 环境（本机实测）
 
-- **peer `lichen-vm`（用户 Admin）的 Python 是坏的嵌入式包**（只有 python.exe + dll，
-  缺 `Lib/` stdlib），`PYTHONPATH` 还指向不存在的 pdm pep582 路径 —— 不能直接跑脚本。
-- **服务器（用户 17124）有 Python 3.12 + GPU**，脚本开箱即用（已端到端验证）。
-- 要在 peer 跑，需先装一个完整 Python（或修复嵌入式包的 stdlib）。
+- **peer `lichen-vm`（Admin）自带的 Python 3.13 是坏的嵌入式包**（缺 `Lib/` stdlib），
+  `PYTHONPATH` 还指向不存在的 pdm pep582 路径 —— 不要用它。
+- **uv 已装**（`~/.local/bin/uv`），并管理一个自包含 CPython 3.12
+  （`uv python install 3.12`，`uv run` 自动选用）。脚本已在 peer 用 uv 端到端验证。
+- 若 `uv` 不在 PATH：`export PATH="$HOME/.local/bin:$PATH"`。
 
 ## 典型循环
 
