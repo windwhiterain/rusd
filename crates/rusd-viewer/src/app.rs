@@ -360,6 +360,7 @@ impl Shell {
                 scale_factor: scale,
                 screen_points: window_points,
                 presented_physical: (size.width, size.height),
+                os: None,
             },
             bars: (0.0, 0.0, 0.0),
             frames_received: 0,
@@ -1270,10 +1271,12 @@ impl Shell {
         }
         lines.extend(
             crate::viewport::Partition {
-                // The window in the same point space the layout used — the *expected*
-                // size, so a broken screen rect cannot make the identity pass by
-                // agreeing with itself.
-                window: self.screen.expected_points(),
+                // The **authority**: the OS's `GetClientRect / dpi`, falling back to
+                // winit's division only where no probe exists. Round 10 built this
+                // from `expected_points()` — winit's own numbers — so the identity held
+                // between two agreeing conspirators while the viewport reached past the
+                // screen edge.
+                window: self.screen.authoritative_points(),
                 left: self.bars.0,
                 top: self.bars.1,
                 bottom: self.bars.2,
@@ -1384,17 +1387,43 @@ impl Shell {
         let screen_points = raw.screen_rect.map_or(egui::Vec2::ZERO, |r| r.size());
         // Built with the size the pass **inherited**; `sync_presenter` below may
         // change `self.presented`, which leaves this record as the defect to report.
+        //
+        // `os` is the second opinion: `inner_size()` **is** `GetClientRect`, so a
+        // comparison among winit's own numbers proves only that winit agrees with
+        // itself, which is exactly what round 10's overlay did while the viewport was
+        // wider than the screen.
         self.screen = crate::viewport::ScreenSpace {
             inner_physical: (inner.width, inner.height),
             scale_factor: scale,
             screen_points,
             presented_physical: self.presented,
+            os: crate::platform_metrics::probe(&self.window).and_then(|m| {
+                Some(crate::viewport::OsView {
+                    client_px: m.client_px?,
+                    scale: m.os_scale()?,
+                    window_px: m.window_px?,
+                    awareness: m.awareness.unwrap_or("n/a"),
+                    monitor_px: m.monitor_px.map(|(_, _, w, h)| (w, h)),
+                })
+            }),
         };
         if let Some(want) = self.screen.correction() {
             // The rect egui lays out in, replaced by the size the window's own
             // numbers imply. `raw.screen_rect` is the whole input: no offset, no
             // clip rect, so this is the one field a correction may touch.
             raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, want));
+        }
+        // The scale has to be corrected **with** the rect, not after it: egui derives
+        // `pixels_per_point = zoom_factor * native_pixels_per_point`, and the presenter
+        // is handed that same product. Correcting the point space against the OS while
+        // leaving the scale at winit's would make the layout agree with the OS and the
+        // rendering disagree with the layout — a `texels != rect x ppp` mismatch, which
+        // is the class of defect round 9 already had to unpick. One authority for both.
+        if let Some(os) = self.screen.os {
+            raw.viewports
+                .entry(egui::ViewportId::ROOT)
+                .or_default()
+                .native_pixels_per_point = Some(os.scale);
         }
         self.sync_presenter(inner);
         raw
