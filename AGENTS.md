@@ -83,3 +83,7 @@ cargo run -p spike-openusd    # O6 增量合成实证基准（SPEC §6）
 - 损坏集中在 flash 子 agent 的 write/edit 调用（父会话 write 多轮实测干净）：疑似
   模型侧 tool-call 多字节序列化缺陷，而非写盘逻辑。故子 agent 交付的中文文档必须
   过 FFFD + 生僻码点两步扫描才验收。
+- 时序实验的 harness 纪律：批内多个 exec 调用**可能被串行执行**（观测 client 的
+  wait 会先把批次占住，改写调用排在它后面）——曾因此把「改写落在观测窗口外」误判为
+  「server 延迟 10–20s」。观测 client 一律走**后台通道**（wait 0）再单独发改写调用；
+  跨进程时间轴用 epoch ms 对齐，别信单侧 dt。
