@@ -63,3 +63,14 @@ cargo run -p spike-openusd    # O6 增量合成实证基准（SPEC §6）
 - readback 行距须对齐 `COPY_BYTES_PER_ROW_ALIGNMENT`(256)，读回按行去 padding。
 - prim-id pass 用 `R32Uint` 渲染目标 + `@interpolate(flat)` u32，pick 读精确整数 id。
 - 相机：Z-up look-at + 透视，wgpu clip z 在 [0,1]（near→0, far→1），depth_compare Less。
+
+## 会话工具坑（已踩平）
+
+- write/edit 偶发丢字节：中文落盘可现 U+FFFD（docs-m6 第一/三轮实测）。写后兜底：
+  `perl -CSD -ne 'print "$ARGV:$.\n" if /\x{FFFD}/' <files>`
+  （peer locale 非 UTF-8，`grep -P` 拒绝跑）；按字节定位修回。
+- perl 双引号串里写 `\x{...}` 转义要小心：单反斜杠会被插值成宽字符，触发
+  "Wide character in print" 并把整串中文按 Latin-1 升级双重编码成 mojibake。
+  追加中文段落用 write 产字节 + `cat >>` 拼接，别让 perl 插值层碰中文。
+- edit 工具在本类会话曾报参数编码错误：整文件 write 或 perl 替代；跨行替换用 `perl -0777`。
+- 子 agent turn_end 通知正文偶发乱码：验收以磁盘文件与实测为准，通知只作线索。
