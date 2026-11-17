@@ -286,7 +286,17 @@ fn main() {
             }
         }
         Some("serve") => {
-            rusd_agent::serve();
+            // `--listen <addr:port>` switches the same tool server to TCP NDJSON
+            // JSON-RPC (D12, docs/PROTOCOL.md); without it, stdio is unchanged.
+            match flag_val(&args, "--listen") {
+                Some(addr) => {
+                    if let Err(e) = rusd_agent::transport::serve_tcp(&addr) {
+                        eprintln!("rusd: {e}");
+                        std::process::exit(2);
+                    }
+                }
+                None => rusd_agent::serve(),
+            }
         }
         Some("export") => {
             let Some(path) = args.get(1) else {
