@@ -34,6 +34,7 @@ use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
+use crate::anchor::Anchor;
 use crate::camera::{Orbit, plane_hit};
 use crate::net::{NetCommand, NetEvent, NetWorker, RenderCommand, RenderWorker};
 use crate::protocol::{self, Notification, OpinionOp};
@@ -116,6 +117,15 @@ pub struct Shell {
     render: RenderWorker,
     orbit: Option<Orbit>,
     bounds: ([f64; 3], [f64; 3]),
+    /// The last scene's composed stage, kept on this thread (`!Send`) for the
+    /// gizmo's anchor reads. `None` before the first snapshot, or for a scene that
+    /// carried none (the `.usdc` fallback still composes one, so in practice only
+    /// an empty start).
+    stage: Option<openusd::usd::Stage>,
+    /// The last scene's geometry, here as well as on the render thread: the gizmo
+    /// needs a prim's mesh to find its world centre, and the render thread's copy
+    /// lives in a struct this thread cannot reach.
+    geometry: rusd_scene::geometry::SceneGeometry,
 
     /// The frame on screen, with its texture.
     frame: Option<(crate::net::Frame, egui::TextureHandle)>,
@@ -123,16 +133,20 @@ pub struct Shell {
     tex_size: (u32, u32),
 
     drag: Option<DragState>,
-    /// The selected prim's world center when the drag began.
-    gizmo_origin: Option<([f64; 3], [f64; 3])>,
-    /// The drag's newest unsent translation: flushed on the throttle or at the end.
+    /// The prim a gizmo drag is moving, with the anchor it started from (world
+    /// centre, authored local translate, parent world matrix). `None` outside a
+    /// gizmo drag, or when the selection has no anchor in this scene.
+    gizmo: Option<(String, Anchor)>,
+    /// The drag's newest unsent local translation: flushed on the throttle or at
+    /// the end.
     pending: Option<[f64; 3]>,
     throttle: protocol::Throttle,
-    /// The last translation this client actually sent, so a drag that stops
+    /// The last local translation this client actually sent, so a drag that stops
     /// moving sends nothing.
     sent: Option<[f64; 3]>,
-    /// What the prim was drawn at locally, so an unchanged drag re-bakes nothing.
-    preview: Option<([f64; 3], [f64; 3])>,
+    /// The local translation the dragged prim is currently drawn at, so an
+    /// unchanged drag re-bakes nothing.
+    preview: Option<[f64; 3]>,
 
     status: String,
     fps: f64,
@@ -201,10 +215,17 @@ impl Shell {
             render,
             orbit: None,
             bounds: ([0.0; 3], [0.0; 3]),
+            stage: None,
+            geometry: rusd_scene::geometry::SceneGeometry {
+                items: Vec::new(),
+                camera: None,
+                bounds: ([0.0; 3], [0.0; 3]),
+                diags: Vec::new(),
+            },
             frame: None,
             tex_size: (0, 0),
             drag: None,
-            gizmo_origin: None,
+            gizmo: None,
             pending: None,
             throttle: protocol::Throttle::hz(GIZMO_HZ),
             sent: None,
@@ -269,9 +290,9 @@ impl Shell {
         }
     }
 
-    /// A new scene: the first one frames the camera, the render thread gets the
-    /// geometry, and a drag's local preview is dropped (the server's answer
-    /// replaces it).
+    /// A new scene: the first one frames the camera, the render thread receives
+    /// the geometry alone (the stage stays here, `!Send`), and a drag's local
+    /// preview is dropped (the server's answer replaces it).
     fn adopt_scene(&mut self, made: MadeScene) {
         self.bounds = made.bounds;
         if let Some(cam) = made.geometry.camera {
@@ -287,8 +308,28 @@ impl Shell {
         self.model.adopt(&made);
         self.status = self.model.status_line();
         self.preview = None;
-        self.render.send(RenderCommand::Scene(Box::new(made)));
+        self.gizmo = None;
+        // The stage is kept for the gizmo's anchor reads and never leaves this
+        // thread; the render thread gets the geometry.
+        self.stage = made.stage;
+        self.geometry = made.geometry.clone();
+        self.render.send(RenderCommand::Scene {
+            geometry: Box::new(made.geometry),
+            bounds: made.bounds,
+        });
         self.window.request_redraw();
+    }
+
+    /// The selected prim's drag anchor: its world centre, its authored local
+    /// `xformOp:translate`, and the parent matrix a world delta is undone by.
+    ///
+    /// Read from the retained stage at full precision (`crate::anchor`), falling
+    /// back to a rootless anchor when the scene has none (the `.usdc` fallback).
+    fn anchor_for(&self, path: &str) -> Option<Anchor> {
+        match &self.stage {
+            Some(stage) => crate::anchor::anchor_of_stage(stage, &self.geometry, path),
+            None => crate::anchor::fallback_anchor(&self.geometry, path),
+        }
     }
 
     /// No server: show the `.usdc` the user named so the window is not empty.
@@ -465,14 +506,14 @@ impl Shell {
             };
             if kind == Drag::Gizmo {
                 if let Some(sel) = self.model.selection.clone()
-                    && let Some(c) = self.model.prim_center(&sel)
+                    && let Some(anchor) = self.anchor_for(&sel)
                 {
-                    self.gizmo_origin = Some((c, c));
+                    self.gizmo = Some((sel, anchor));
                     self.throttle.reset();
                     self.preview = None;
                     self.pending = None;
                 } else {
-                    self.gizmo_origin = None;
+                    self.gizmo = None;
                 }
             }
             self.drag = Some(DragState {
@@ -513,7 +554,7 @@ impl Shell {
                     self.flush_opinion(true);
                 }
                 self.drag = None;
-                self.gizmo_origin = None;
+                self.gizmo = None;
                 self.preview = None;
                 self.pending = None;
             }
@@ -580,17 +621,22 @@ impl Shell {
         id != 0 && frame.paths.get((id - 1) as usize) == Some(&sel)
     }
 
-    /// One gizmo tick: the pointer's hit on the plane through the prim's center
-    /// becomes a translation, drawn locally at once and sent at ≤30 Hz.
+    /// One gizmo tick: the pointer's hit on the plane through the prim's centre
+    /// becomes a **world** delta, which is converted to the prim's **local**
+    /// `xformOp:translate` (`crate::gizmo`) before it is drawn or sent.
+    ///
+    /// The conversion is what the ruling puts on this side: the server writes an
+    /// opinion's value as the field's op, so a world value would double-apply a
+    /// translated (or rotated, or scaled) parent. Both the local preview and the
+    /// wire carry the **local** number, so what the user sees and what the server
+    /// authors are the same value.
     fn drag_gizmo(&mut self, start: egui::Pos2, pos: egui::Pos2, rect: egui::Rect) {
-        let (Some((origin, _)), Some(orbit)) = (self.gizmo_origin, self.orbit) else {
-            return;
-        };
-        let Some(sel) = self.model.selection.clone() else {
+        let (Some((sel, anchor)), Some(orbit)) = (self.gizmo.clone(), self.orbit) else {
             return;
         };
         let (w, h) = (f64::from(rect.width()), f64::from(rect.height()));
         let plane_normal = [0.0, 0.0, 1.0];
+        let origin = anchor.world_center;
 
         let ray_at = |p: egui::Pos2| {
             orbit.ray(
@@ -607,17 +653,21 @@ impl Shell {
         let Some(hit) = plane_hit(ray_at(pos), origin, plane_normal) else {
             return;
         };
-        let new_translate = [
-            origin[0] + (hit[0] - press_hit[0]),
-            origin[1] + (hit[1] - press_hit[1]),
-            origin[2],
-        ];
+        let delta_world = [hit[0] - press_hit[0], hit[1] - press_hit[1], 0.0];
+        // World target → the prim's own local op value. The delta form keeps a
+        // prim whose visual centre is not its local origin from jumping at press.
+        let Some(new_local) =
+            crate::gizmo::drag_translate(anchor.parent_world, anchor.local_translate, delta_world)
+        else {
+            self.status = format!("drag {sel}: the parent transform is not invertible");
+            return;
+        };
 
         // Preview: one prim, one re-bake, so the pointer never outruns the image.
-        if self.preview.map(|(_, t)| t) != Some(new_translate) {
-            self.preview = Some((origin, new_translate));
+        if self.preview != Some(new_local) {
+            self.preview = Some(new_local);
             let mut overrides = BTreeMap::new();
-            overrides.insert(sel.clone(), new_translate);
+            overrides.insert(sel.clone(), new_local);
             self.render.send(RenderCommand::Preview {
                 overrides,
                 selection: Some(sel.clone()),
@@ -625,29 +675,31 @@ impl Shell {
             self.window.request_redraw();
         }
 
-        self.pending = Some(new_translate);
+        self.pending = Some(new_local);
         self.status = format!(
-            "drag {sel} → ({:.2}, {:.2}, {:.2})",
-            new_translate[0], new_translate[1], new_translate[2]
+            "drag {sel} → local ({:.2}, {:.2}, {:.2})",
+            new_local[0], new_local[1], new_local[2]
         );
         if self.throttle.ready(Instant::now()) {
             self.flush_opinion(false);
         }
     }
 
-    /// Send the drag's newest translation (throttled samples, and the final one
-    /// which is never throttled away).
+    /// Send the drag's newest **local** translation (throttled samples, and the
+    /// final one which is never throttled away).
     fn flush_opinion(&mut self, final_sample: bool) {
         let Some(t) = self.pending else { return };
         if !final_sample && t == self.last_sent() {
             return;
         }
-        let Some(sel) = self.model.selection.clone() else {
+        let Some((sel, _)) = self.gizmo.clone() else {
             return;
         };
         self.pending = None;
         self.record_sent(t);
-        self.send_net(NetCommand::Opinion(vec![OpinionOp::set_translate(sel, t)]));
+        self.send_net(NetCommand::Opinion(vec![OpinionOp::set_translate_local(
+            sel, t,
+        )]));
     }
 
     fn last_sent(&self) -> [f64; 3] {

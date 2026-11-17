@@ -20,15 +20,21 @@
 //!   parser, the monotonic-version discard rule, and the gizmo throttle.
 //! - [`camera`]: the client's own orbit / pan / zoom and the screen↔world
 //!   mapping a pick needs.
+//! - [`gizmo`]: the client's world→local conversion for a drag — an opinion's
+//!   `value` is the field's own op, so a local translation is what a move means.
+//! - [`anchor`]: the drag anchor read from the composed stage (authored local
+//!   translate, parent world matrix, world centre).
 //! - [`session`]: the snapshot pipeline — bytes → base64 → single-layer stack
 //!   → fitted geometry — plus the pure [`session::ClientModel`] the view drives.
 //! - [`net`]: the TCP client thread (owner of `hello`/`subscribe`/outgoing
 //!   edits) and the render thread that owns the GPU.
 //! - [`app`]: the winit + egui shell that ties them together (`view`).
 
+pub mod anchor;
 pub mod app;
 pub mod camera;
 pub mod compose;
+pub mod gizmo;
 pub mod gpu;
 pub mod memresolver;
 pub mod net;

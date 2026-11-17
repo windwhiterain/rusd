@@ -80,10 +80,18 @@ impl Op {
 /// One entry of `opinion{ops:[…]}`: where an opinion lands, on which field,
 /// with which value.
 ///
-/// `value` is JSON, and the protocol does not fix a shape for it: it is
-/// whatever the field's Sdf type serializes to. The one shape this client
-/// sends is [`OpinionOp::set_translate`]'s — a three-element array of numbers
-/// for `xformOp:translate`, which is how the gizmo's drag reaches the server.
+/// `value` is the **field's Sdf value, written as-is** into the overrides session
+/// layer (`docs/PROTOCOL.md` "v1 实现语义补记", ruling of 2026-11-17): the server
+/// reads the composed attribute's declared type and converts the JSON into that
+/// type, then authors it as the prim's own opinion. It is *not* a world-space
+/// convenience the server interprets — so for an `xformOp:translate` it is the
+/// **prim's local** op value, which is what keeps a prim under a transformed
+/// parent inside its parent (a world value would double-apply the parent's
+/// translate: the "原点加两遍" bug pattern).
+///
+/// The one shape this client sends is [`OpinionOp::set_translate_local`]'s — three
+/// numbers for `xformOp:translate` — and turning a gizmo's world-space target into
+/// that local value is this client's job (`crate::gizmo`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpinionOp {
     pub path: String,
@@ -93,8 +101,13 @@ pub struct OpinionOp {
 }
 
 impl OpinionOp {
-    /// Move `path` to the world translation `translate`.
-    pub fn set_translate(path: impl Into<String>, translate: [f64; 3]) -> Self {
+    /// Author `path`'s `xformOp:translate` as `translate` — the op value in the
+    /// prim's **local** space (its parent's coordinate system), not world space.
+    ///
+    /// A caller holding a world position must convert first
+    /// (`crate::gizmo::world_to_local`), because the server writes this value as
+    /// the op itself.
+    pub fn set_translate_local(path: impl Into<String>, translate: [f64; 3]) -> Self {
         Self {
             path: path.into(),
             field: "xformOp:translate".to_owned(),
@@ -464,7 +477,10 @@ mod tests {
 
     #[test]
     fn opinion_translate_is_an_ops_array_of_path_field_value_op() {
-        let line = opinion_line(7, &[OpinionOp::set_translate("/World/a", [1.5, -2.0, 3.0])]);
+        let line = opinion_line(
+            7,
+            &[OpinionOp::set_translate_local("/World/a", [1.5, -2.0, 3.0])],
+        );
         assert!(line.ends_with('\n'));
         let v: Value = serde_json::from_str(line.trim_end()).expect("one JSON object");
         assert_eq!(v["id"], 7);

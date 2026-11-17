@@ -28,6 +28,11 @@ pub struct MadeScene {
     pub bounds: ([f64; 3], [f64; 3]),
     /// Every diagnostic from decoding, composition and extraction.
     pub diags: Vec<Diagnostic>,
+    /// The composed stage this scene was extracted from, kept for the one reader
+    /// that needs authored values rather than geometry: the gizmo's drag anchor
+    /// (`crate::anchor`). `Stage` is `Rc` and `!Send`, so this scene must stay on
+    /// the thread it was made on; the render thread is handed the geometry alone.
+    pub stage: Option<openusd::usd::Stage>,
 }
 
 impl MadeScene {
@@ -70,6 +75,7 @@ impl MadeScene {
             geometry,
             bounds,
             diags,
+            stage: Some(stack.stage),
         })
     }
 

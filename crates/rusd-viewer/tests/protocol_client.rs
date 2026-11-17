@@ -44,6 +44,13 @@ fn cooked_city() -> Vec<u8> {
         .to_vec()
 }
 
+/// The cooked city's composed stage, for the anchor tests.
+fn cooked_stage() -> openusd::usd::Stage {
+    let doc =
+        rusd_core::syntax::parse(include_str!("../../../examples/city.rusd")).expect("city parses");
+    rusd_proc::expand_doc(&doc).expect("city cooks").stage
+}
+
 /// One request the mock server received.
 #[derive(Clone, Debug)]
 struct Received {
@@ -101,8 +108,10 @@ impl Mock {
     }
 
     fn next_seen(&self) -> Received {
+        // Generous: this mock runs under a whole-workspace test run, where dozens
+        // of other test binaries compete for the machine.
         self.seen
-            .recv_timeout(std::time::Duration::from_secs(5))
+            .recv_timeout(std::time::Duration::from_secs(30))
             .expect("the server received a request")
     }
 
@@ -156,10 +165,19 @@ fn serve(
         let mut reader = reader;
         loop {
             line.clear();
+            // 0 bytes read is end of stream. A non-zero read may be a line whose
+            // trailing newline never came (EOF mid-line); it still parses, so it
+            // is forwarded rather than dropped.
             if reader.read_line(&mut line).unwrap_or(0) == 0 {
                 return;
             }
-            let Ok(v) = serde_json::from_str::<Value>(line.trim_end()) else {
+            // A blank line (a stray keep-alive or a torn write) is skipped, not
+            // treated as the end of the connection.
+            let trimmed = line.trim_end().to_owned();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<Value>(&trimmed) else {
                 return;
             };
             let id = v["id"].as_u64().unwrap_or(0);
@@ -465,7 +483,7 @@ fn a_gizmo_opinion_reaches_the_server_as_a_translate_set() {
     let _ = mock.next_seen(); // subscribe
 
     let reply = client
-        .opinion(&[OpinionOp::set_translate(
+        .opinion(&[OpinionOp::set_translate_local(
             "/World/City/b0_0/lot0_0",
             [15.0, 12.0, 7.0],
         )])
@@ -481,6 +499,74 @@ fn a_gizmo_opinion_reaches_the_server_as_a_translate_set() {
 
     let answered = reply.result.expect("opinion answered with a result");
     assert_eq!(answered["version"], 3, "the reply carries the new version");
+}
+
+/// End to end: a gizmo drag on a prim whose parent is translated puts the
+/// **local** number on the wire.
+///
+/// The prim is a real cooked city lot under a real block (`/World/City/b0_0`),
+/// which itself carries a translate. Dragging it by a world delta of +X turns into
+/// the lot's own op value (`lot_local + Δlocal`), **not** the world target — the
+/// assertion that separates a correct client from one that would double-apply the
+/// block's offset on the server.
+#[test]
+fn a_world_drag_under_a_translated_parent_puts_the_local_value_on_the_wire() {
+    use rusd_viewer::anchor::anchor_of_stage;
+    use rusd_viewer::gizmo::drag_translate;
+
+    let stage = cooked_stage();
+    let geo = rusd_scene::geometry::extract(&stage);
+    let path = "/World/City/b0_0/lot0_0";
+    let anchor = anchor_of_stage(&stage, &geo, path).expect("the lot has an anchor");
+
+    // The block really is translated, or this test would prove nothing.
+    let parent_offset = [anchor.parent_world[12], anchor.parent_world[13]];
+    assert!(
+        parent_offset != [0.0, 0.0],
+        "the parent must carry a translate for this case to matter: {parent_offset:?}"
+    );
+
+    let delta_world = [7.0, -3.0, 0.0];
+    let local = drag_translate(anchor.parent_world, anchor.local_translate, delta_world)
+        .expect("the parent is invertible");
+    // No rotation or scale on this block, so the delta arrives unchanged; what
+    // matters is that it is added to the lot's *own* value, not substituted by a
+    // world position.
+    let want = [
+        anchor.local_translate[0] + 7.0,
+        anchor.local_translate[1] - 3.0,
+        anchor.local_translate[2],
+    ];
+    for k in 0..3 {
+        assert!(
+            (local[k] - want[k]).abs() < 1e-9,
+            "local {k}: {} vs {}",
+            local[k],
+            want[k]
+        );
+    }
+    assert!(
+        local != delta_world,
+        "the local value is not the world delta: {local:?}"
+    );
+
+    // And the value that reaches the server is exactly that local one.
+    let mock = Mock::start(PROTOCOL, vec![]);
+    let (mut client, _early) = ProtocolClient::open(&mock.addr).expect("greeting");
+    let _ = mock.next_seen();
+    let _ = mock.next_seen();
+    client
+        .opinion(&[OpinionOp::set_translate_local(path, local)])
+        .expect("opinion accepted");
+    let received = mock.next_seen();
+    assert_eq!(received.method, "opinion");
+    assert_eq!(received.params["ops"][0]["path"], path);
+    assert_eq!(received.params["ops"][0]["field"], "xformOp:translate");
+    assert_eq!(
+        received.params["ops"][0]["value"],
+        json!([local[0], local[1], local[2]]),
+        "the wire carries the local op value the client computed"
+    );
 }
 
 #[test]
@@ -504,10 +590,10 @@ fn the_worker_sends_an_opinion_and_reports_the_servers_version() {
     let _ = mock.next_seen();
 
     worker.send(rusd_viewer::net::NetCommand::Opinion(vec![
-        OpinionOp::set_translate("/World/a", [1.0, 2.0, 3.0]),
+        OpinionOp::set_translate_local("/World/a", [1.0, 2.0, 3.0]),
     ]));
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut applied = None;
     let mut seen_opinion = None;
     while std::time::Instant::now() < deadline && applied.is_none() {

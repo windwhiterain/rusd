@@ -32,7 +32,6 @@ use crate::camera::Orbit;
 use crate::diag;
 use crate::gpu::Viewport;
 use crate::protocol::{self, Notification, OpinionOp, Response, Wire};
-use crate::session::MadeScene;
 use rusd_scene::geometry::SceneGeometry;
 
 /// The synchronous wire client: one connection, one request id counter.
@@ -393,7 +392,14 @@ impl Drop for NetWorker {
 /// What the UI asks the render thread to do.
 pub enum RenderCommand {
     /// A new scene: bake and upload (the camera is not part of it).
-    Scene(Box<MadeScene>),
+    ///
+    /// Only the geometry crosses: a `MadeScene` also holds its composed `Stage`,
+    /// which is `Rc` and `!Send` — it stays on the thread that made it, for the
+    /// gizmo's anchor reads (`crate::anchor`), and the render thread never sees it.
+    Scene {
+        geometry: Box<SceneGeometry>,
+        bounds: ([f64; 3], [f64; 3]),
+    },
     /// A camera move: re-render only (no upload).
     View {
         orbit: Orbit,
@@ -481,13 +487,16 @@ impl RenderWorker {
                     };
                     got = true;
                     match cmd {
-                        RenderCommand::Scene(made) => {
-                            viewport.set_scene(&made.geometry);
-                            bounds = made.bounds;
-                            if let Some(cam) = made.geometry.camera {
+                        RenderCommand::Scene {
+                            geometry,
+                            bounds: b,
+                        } => {
+                            viewport.set_scene(&geometry);
+                            bounds = b;
+                            if let Some(cam) = geometry.camera {
                                 orbit = Some(Orbit::from_camera(&cam));
                             }
-                            scene = Some(made.geometry);
+                            scene = Some(*geometry);
                             dirty = true;
                         }
                         RenderCommand::View {
