@@ -334,6 +334,7 @@ fn a_window_resized_the_way_the_round_did_keeps_its_point_space() {
             scale_factor: scale,
             screen_points: egui::Vec2::ZERO,
             presented_physical: inner,
+            os: None,
         };
         let points = space.expected_points();
         assert!(
@@ -374,6 +375,7 @@ fn the_scale_counted_twice_would_push_the_viewport_out_of_the_window() {
         scale_factor: scale,
         screen_points: egui::vec2(right / scale, inner.1 as f32 / scale / scale),
         presented_physical: inner,
+        os: None,
     };
     assert_eq!(space.agreement(), ScreenAgreement::ScaledTwice);
     let want = space

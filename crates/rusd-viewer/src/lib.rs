@@ -59,6 +59,7 @@ pub mod gpu;
 pub mod memresolver;
 pub mod net;
 pub mod panel;
+pub mod platform_metrics;
 pub mod protocol;
 pub mod scene;
 pub mod session;

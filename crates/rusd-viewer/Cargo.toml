@@ -29,6 +29,21 @@ egui-winit = { version = "0.37", default-features = false, features = ["wayland"
 winit = "0.30"
 pollster = "1.0.1"
 
+# The OS's own view of the window (`crate::platform_metrics`): `GetClientRect`,
+# `GetWindowRect`, `GetDpiForWindow` and the thread's DPI awareness. The point of the
+# module is a **second opinion** on the same window, so the probe must not travel
+# through winit — which is why these are called directly here.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# `Window::window_handle()`: the HWND the probe reads. Already in the lock (winit and
+# wgpu both take it), so this adds no crate to the build.
+raw-window-handle = "0.6"
+
 [dev-dependencies]
 rusd-proc.workspace = true
 rusd-usd.workspace = true

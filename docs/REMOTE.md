@@ -135,7 +135,11 @@ egui-winit 自己的集成的做法。
 
 ```
 screen <w>x<h> pt · inner <w>x<h> px · scale <s> · expect <w>x<h> pt
-scale count <r>x (1.000 = ok) · <ok | NO pixels as points | NO scaled twice | NO not a whole scale>
+winit scale count <r>x (1.000 = ok) · <ok | NO pixels as points | NO scaled twice | NO not a whole scale | NO winit agrees with itself; its scale is stale (see the os row)>
+os client <w>x<h> px · os scale <s> · window <w>x<h> px · <agrees with winit | NO winit disagrees>      (仅 Windows；否则 `os probe n/a`)
+os expect <w>x<h> pt · layout is <r>x<r> of it · <point space fits the os window | NO point space overflows the os window>
+dpi awareness <per-monitor-aware | ...>
+monitor <W>x<H> px · client <w>x<h> px · <fits the screen | NO the window is bigger than its screen>
 layout used <w>x<h> pt: the screen rect was corrected this pass | layout used the platform's own screen rect (no correction)
 back buffer <w>x<h> px · window inner <w>x<h> px · matches <yes|NO>
 present stretch <sx>x<sy> (1.000x1.000 = ok) · <blit | NO magnified | NO anisotropic ...>
@@ -144,6 +148,11 @@ partition OK|NO
 width <left> + <rect> = <sum> vs window <w> (Δ <d>) · fits <yes|NO>
 height <top> + <bottom> + <rect> = <sum> vs window <h> (Δ <d>) · fits <yes|NO> · bars <yes|NO>
 ```
+
+`winit scale count` 只能检查 winit **自己**是否自洽（`screen_rect == inner / scale`，两边都是
+winit 的数字），因此 winit 的 scale 陈旧时它照样读 `ok`——而那正是陈旧 scale 唯一的症状。
+所以 OS 行说"不一致"时，这一行也改说 `NO ... its scale is stale`：读者不必越过后面的行
+才看见缺陷，`NO` 的红字也和其它失败一视同仁。
 
 `back buffer` 报的是**这一趟继承到的**尺寸，不是这一趟装上去的：否则修好的那一帧会永远
 读成 `matches yes`，唯一能看见"UI 被拉伸"的仪表就自己闭眼了。修复本身由 `swapchain
@@ -162,6 +171,58 @@ resized this pass` 单独一行说明。
 
 窗口缩放**不重新 fit 相机**（§6：相机是 client 的）；这条约束与前两条无关——DPR 只决定
 "一个 point 有几个像素"，不决定"看多远"。
+
+### 7.2 为什么上表还不够：一个库不能作自己的第二意见
+
+7.1 的三条约束都由 **winit 自己的输出**构成：`inner_size()` 的实现就是 `GetClientRect`
+（winit-0.30.13 `platform_impl/windows/window.rs:214`），`scale_factor()` 是它缓存的
+`WindowState` 字段，而 7.1 的应有值又是这两个数相除。于是「比值 1.000」只证明**winit 与
+自己一致**——第九轮的真机就出现了这种情形：当时的叠加层（那一版把第一行叫 `scale count`，
+现在叫 `winit scale count`）报 `1.000x · ok`、
+`present stretch 1.000x1.000 · blit`、`partition OK` 全绿，而城市仍在窗外。仪表当时把
+自洽当成了健康。
+
+**第十轮把窗口外扩到 outer 1440×800 后的实测数字**，值得逐个看清：
+
+| 项 | 值 | 来源 |
+| --- | --- | --- |
+| winit `inner_size()` | 2496×1336 px | `GetClientRect` |
+| `scale_factor()` | 1.75 | `WindowState` 缓存 |
+| `screen_rect` | 1426.3×763.4 pt | 上两者相除 |
+| 「实际物理 inner」 | ~1424×761 | **未观测**（外部工具，未说明 instrument） |
+
+`2496 / 1424 = 1.7528`，`1336 / 761 = 1.7556`，而 `1424 × 1.75 = 2492`：所谓「实际物理」
+恰好是 winit 的报值**除以 scale**。这正是「又一次 logical↔physical 混淆」的签名——
+一个 `1440×800` 的**逻辑**窗口在 1.75 下是 `2520×1400` 物理，其 client area 正是
+`2496×1336`，也就是 winit 报的那个数。**故：winit 并未把 inner_size 报大 1.75 倍。**
+
+`inner_size()` 是同一个进程、同一个 HWND 上的 `GetClientRect`，它不可能与 OS 同一次调用
+的结果不一致；把线源「改用 GetClientRect」因此无法改变任何一个数字。能不一致的只有
+**scale**：winit 只在 `WM_DPICHANGED`（event_loop.rs:2216）刷新缓存值，窗口被 resize 而
+DPI 不变时它保持原值——这才是「点空间被 1.75 误乘」的唯一可达机制。
+
+于是第十轮引入**独立第二意见**（`crate::platform_metrics`，`windows-sys` 直连 win32）：
+
+- `client rect`——`GetClientRect`，与 winit 的 `inner_size` 同一次调用，用来证明探针接的
+  是同一个窗口（若不一致，是探针的接线 bug，其余各行都不可信）；
+- `window rect`——`GetWindowRect`，其差值是边框/标题栏，用来区分 client-area 报值与
+  整窗报值；
+- `os dpi`——`GetDpiForWindow`，`scale = dpi / 96`；
+- `dpi awareness`——`GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext())`，
+  `per-monitor` 即「进程不被 DPI 虚拟化，`GetClientRect` 返回真实设备像素」；
+- `monitor`——`GetMonitorInfoW`，**决定「窗口本身就比屏幕大」**。这是唯一能在其余全部
+  检查通过时仍然成立的缺陷：client area 2496 物理像素装不进 1920 宽的屏幕，窗口就真的
+  挂在窗外，与任何点空间算术无关。
+
+修正规则随之明确（`ScreenSpace::correction`）：**有探针时 OS 是权威，无论它与 winit 是否
+一致**——布局必须占满 OS 描述的 client area；要求两者一致才修正，恰好会在最需要的时候
+跳过。比例与 rect 一起改（`native_pixels_per_point` 同用 OS 值），否则布局对而渲染错，
+就是 7.1 已经踩过的 `texels != rect × ppp`。无探针时退回 winit 算术并打印
+`os probe n/a`——没有第二意见就不声称一致。
+
+`partition` 的 `window` 项也随之改为**权威值**（`authoritative_points`：优先 OS 的
+`client/scale`）。第九轮它取自 `expected_points()`，那是同一个除法，于是恒等式在两个
+同谋者之间成立——截图报 OK 而视口越过屏边，正是这个错误的直接后果。
 
 ## 8. 确定性约束
 

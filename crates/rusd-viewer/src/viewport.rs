@@ -207,6 +207,44 @@ pub struct ScreenSpace {
     /// the same family of defect as a wrong point space, and it is invisible in every
     /// other number.
     pub presented_physical: (u32, u32),
+    /// What the **operating system** said about the same window, when a platform probe
+    /// exists: `(client area px, os scale, outer px)`.
+    ///
+    /// This is the second opinion round 9 lacked. Every other field here is winit's own
+    /// answer, and `inner_size()` **is** `GetClientRect` — so a comparison among them
+    /// proves only that winit is self-consistent. Round 10's window showed
+    /// `scale count 1.000x · ok`, `present stretch 1.000x1.000 · blit` and
+    /// `partition OK` while the viewport was wider than the screen, because the two
+    /// numbers whose ratio it printed came from the same division. This field, and the
+    /// `os` lines built from it, are the only place a wrong answer can show up.
+    ///
+    /// (Round 9's build printed that first row as `scale count`; it is `winit scale
+    /// count` now, renamed when the second opinion arrived — the row says whose numbers
+    /// it compares.)
+    ///
+    /// `None` on a platform without the probe (and on a failed read): no second
+    /// opinion, so no agreement is claimed — see [`ScreenSpace::os_agrees`].
+    pub os: Option<OsView>,
+}
+
+/// The OS's own view of the window, as [`crate::platform_metrics`] reads it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OsView {
+    /// `GetClientRect`: the client area in physical pixels.
+    pub client_px: (u32, u32),
+    /// `dpi / 96`: the scale the window is really on.
+    pub scale: f32,
+    /// `GetWindowRect`: the whole window in physical pixels.
+    pub window_px: (u32, u32),
+    /// The process/thread DPI awareness word (`unaware` / `system` / `per-monitor`).
+    pub awareness: &'static str,
+    /// The monitor's physical size, when it could be read.
+    ///
+    /// The datum that separates "the layout is bigger than the window" from "the window
+    /// is bigger than the screen". Round 10's client area was `2496` physical pixels,
+    /// which cannot fit a 1920-wide monitor — so if the city hung off the edge with the
+    /// partition identity holding, this is the line that says why.
+    pub monitor_px: Option<(u32, u32)>,
 }
 
 /// Which row of [`ScreenSpace`]'s table the platform's numbers are on.
@@ -228,12 +266,69 @@ impl ScreenSpace {
     /// This is the arithmetic the `screen_rect` correction is made of, kept here so
     /// it is testable without a window. A non-finite or zero scale falls back to
     /// `1.0`, the same rule [`ViewportSize::new`] applies.
+    ///
+    /// **It is not an authority.** It is derived from [`Self::inner_physical`] and
+    /// [`Self::scale_factor`], which are both winit's answers — so a caller that only
+    /// reads this function is checking winit against itself. Use
+    /// [`Self::os_expected_points`] when the OS's numbers are available.
     pub fn expected_points(&self) -> Vec2 {
         let s = self.scale();
         Vec2::new(
             self.inner_physical.0 as f32 / s,
             self.inner_physical.1 as f32 / s,
         )
+    }
+
+    /// The point size the **OS's** numbers imply: `os client px / os scale`.
+    ///
+    /// `None` when there is no probe or it could not read the window. This is the
+    /// authority the layout should be judged against: it comes from `GetClientRect`
+    /// and `GetDpiForWindow`, not from winit's cached `WindowState`.
+    pub fn os_expected_points(&self) -> Option<Vec2> {
+        let os = self.os?;
+        if !os.scale.is_finite() || os.scale <= 0.0 {
+            return None;
+        }
+        Some(Vec2::new(
+            os.client_px.0 as f32 / os.scale,
+            os.client_px.1 as f32 / os.scale,
+        ))
+    }
+
+    /// Whether winit and the OS tell the same story, field by field.
+    ///
+    /// `None` with no probe. `Some(false)` is the round-10 state: winit's number and the
+    /// OS's disagree, and which one is wrong has to be settled by the two lines that
+    /// print both — not by this predicate.
+    pub fn os_agrees(&self) -> Option<bool> {
+        let os = self.os?;
+        let same_size = os.client_px == self.inner_physical;
+        let same_scale = (os.scale - self.scale()).abs() <= 1e-3;
+        Some(same_size && same_scale)
+    }
+
+    /// Whether the two agree about the **window's size**, ignoring the scale.
+    ///
+    /// This is the one that a real window cannot fail: both numbers are the same
+    /// `GetClientRect` on the same handle. It exists to separate the two failures — a
+    /// size disagreement means the probe is reading a different window (a plumbing bug
+    /// here), while a scale disagreement is winit's cached `WindowState` being stale,
+    /// which is the mechanism a fix has to handle.
+    pub fn client_only_agrees(&self) -> Option<bool> {
+        self.os.map(|os| os.client_px == self.inner_physical)
+    }
+
+    /// The fractional error of the layout's point space against the OS's, per axis.
+    ///
+    /// `1.0` means the layout occupies exactly the window the OS describes. `1.75` is
+    /// round 10's symptom — a point space 1.75x too large, so the right and bottom of
+    /// the layout fall outside the window by `1 - 1/1.75` of its width. `None` with no
+    /// probe.
+    pub fn os_point_ratio(&self) -> Option<(f32, f32)> {
+        let want = self.os_expected_points()?;
+        let got = self.screen_points;
+        let per = |g: f32, w: f32| if w > 0.0 { g / w } else { 1.0 };
+        Some((per(got.x, want.x), per(got.y, want.y)))
     }
 
     /// The scale factor, or `1.0` when the platform reported something unusable.
@@ -294,6 +389,17 @@ impl ScreenSpace {
     /// pixels used as points. `expected_points` divides by the scale, so that can
     /// never come back out.
     pub fn correction(&self) -> Option<Vec2> {
+        // With a probe, the OS is the authority **whether or not it agrees with winit**:
+        // the layout must occupy the client area the OS describes, and round 10 is the
+        // case where winit's own numbers are the ones that are wrong. Requiring the two
+        // to agree here would have skipped the correction exactly when it was needed.
+        if let Some(want) = self.os_expected_points() {
+            let off = (self.screen_points.x - want.x).abs() > 1.0
+                || (self.screen_points.y - want.y).abs() > 1.0;
+            return off.then_some(want);
+        }
+        // No probe: no second opinion, so fall back to winit's own arithmetic — the same
+        // rule round 9 applied, with the same limits.
         match self.agreement() {
             ScreenAgreement::Consistent => None,
             // A ratio that is no whole power of the scale is not something this can
@@ -303,6 +409,17 @@ impl ScreenSpace {
                 Some(self.expected_points())
             }
         }
+    }
+
+    /// The point size the layout **should** have used: the OS's, else winit's.
+    ///
+    /// This is what a pass sets `screen_rect` to when the measured one is wrong, and it
+    /// is deliberately one function rather than two call sites choosing — so the
+    /// authority is a property of the data, not of the caller's memory of which round it
+    /// is in.
+    pub fn authoritative_points(&self) -> Vec2 {
+        self.os_expected_points()
+            .unwrap_or_else(|| self.expected_points())
     }
 
     /// Whether the presenter's back buffer is the size of the window it presents.
@@ -336,15 +453,25 @@ impl ScreenSpace {
 
     /// The overlay's lines for this: what the platform said, what the contract
     /// expects, and the ratio that names the row.
+    ///
+    /// The first row's verdict is scoped to what it can actually check. It compares
+    /// `screen_rect` with `inner / scale` — arithmetic that **winit itself performed**,
+    /// so it reads `ok` even when winit's scale is stale, which is the one failure a
+    /// stale scale produces. A reader who stops at the first `ok` would therefore stop
+    /// before the row that matters; so when the OS disagrees, that is said on this row
+    /// too, and the `NO` highlights it the way every other failure is highlighted.
     pub fn lines(&self) -> Vec<String> {
         let e = self.expected_points();
-        let label = match self.agreement() {
-            ScreenAgreement::Consistent => "ok",
-            ScreenAgreement::PixelsAsPoints => "NO pixels as points",
-            ScreenAgreement::ScaledTwice => "NO scaled twice",
-            ScreenAgreement::Odd => "NO not a whole scale",
+        let label = match (self.agreement(), self.os, self.os_agrees()) {
+            (ScreenAgreement::Consistent, Some(_), Some(false)) => {
+                "NO winit agrees with itself; its scale is stale (see the os row)"
+            }
+            (ScreenAgreement::Consistent, _, _) => "ok",
+            (ScreenAgreement::PixelsAsPoints, _, _) => "NO pixels as points",
+            (ScreenAgreement::ScaledTwice, _, _) => "NO scaled twice",
+            (ScreenAgreement::Odd, _, _) => "NO not a whole scale",
         };
-        vec![
+        let mut out = vec![
             format!(
                 "screen {:.1}x{:.1} pt · inner {}x{} px · scale {:.2} · expect {:.1}x{:.1} pt",
                 self.screen_points.x,
@@ -355,7 +482,58 @@ impl ScreenSpace {
                 e.x,
                 e.y
             ),
-            format!("scale count {:.3}x (1.000 = ok) · {label}", self.ratio()),
+            format!(
+                "winit scale count {:.3}x (1.000 = ok) · {label}",
+                self.ratio()
+            ),
+        ];
+        // The **independent** opinion. Without a probe there is nothing to say, and
+        // saying nothing is the point: a build that cannot second-guess winit must not
+        // print a line that reads as if it had.
+        match (self.os, self.os_agrees(), self.os_point_ratio()) {
+            (Some(os), Some(agree), Some((rx, ry))) => {
+                let want = self.authoritative_points();
+                out.push(format!(
+                    "os client {}x{} px · os scale {:.2} · window {}x{} px · {}",
+                    os.client_px.0,
+                    os.client_px.1,
+                    os.scale,
+                    os.window_px.0,
+                    os.window_px.1,
+                    if agree {
+                        "agrees with winit"
+                    } else {
+                        "NO winit disagrees"
+                    }
+                ));
+                out.push(format!(
+                    "os expect {:.1}x{:.1} pt · layout is {:.3}x{:.3} of it · {}",
+                    want.x,
+                    want.y,
+                    rx,
+                    ry,
+                    if (rx - 1.0).abs() <= 0.01 && (ry - 1.0).abs() <= 0.01 {
+                        "point space fits the os window"
+                    } else {
+                        "NO point space overflows the os window"
+                    }
+                ));
+                out.push(format!("dpi awareness {}", os.awareness));
+                if let Some((mw, mh)) = os.monitor_px {
+                    let (cw, ch) = os.client_px;
+                    out.push(format!(
+                        "monitor {mw}x{mh} px · client {cw}x{ch} px · {}",
+                        if cw > mw || ch > mh {
+                            "NO the window is bigger than its screen"
+                        } else {
+                            "fits the screen"
+                        }
+                    ));
+                }
+            }
+            _ => out.push("os probe n/a (no second opinion on this platform)".to_owned()),
+        }
+        out.extend(vec![
             match self.correction() {
                 // The layout on this screen used the corrected size, so a `NO` above is
                 // the *platform's* fault and is already repaired: saying so keeps a
@@ -390,7 +568,8 @@ impl ScreenSpace {
                     "NO magnified"
                 }
             ),
-        ]
+        ]);
+        out
     }
 }
 
@@ -407,6 +586,13 @@ impl ScreenSpace {
 ///   (`top + 0 + rect == window`), so the identity alone cannot catch it, and the
 ///   probe that produced this type reported exactly that: `25 + 702 = 727` with the
 ///   controls bar contributing nothing. `bottom` is therefore printed on its own.
+///
+/// **`window` must be the OS's client area in points, not `inner / scale`.** Round 10
+/// printed `partition OK` for a layout whose viewport reached past the screen: the
+/// window it was checked against was derived from the very numbers being suspected, so
+/// the identity held between two conspirators. The caller passes
+/// [`ScreenSpace::authoritative_points`], which prefers the OS's `GetClientRect` divided
+/// by the OS's DPI and falls back to winit's only when no probe exists.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Partition {
     /// The window's client area in points, `inner / scale` — not the rect's size.
@@ -861,6 +1047,7 @@ mod tests {
             scale_factor: MACHINE_SCALE,
             screen_points: egui::vec2(1280.0, 694.9),
             presented_physical: DEFAULT_INNER,
+            os: None,
         };
         assert_eq!(default.agreement(), ScreenAgreement::Consistent);
         assert!((default.ratio() - 1.0).abs() < 1e-3, "{}", default.ratio());
@@ -871,6 +1058,7 @@ mod tests {
             scale_factor: MACHINE_SCALE,
             screen_points: egui::vec2(1462.9, 726.9),
             presented_physical: (2560, 1272),
+            os: None,
         };
         assert_eq!(maximized.agreement(), ScreenAgreement::Consistent);
         assert!(
@@ -890,6 +1078,7 @@ mod tests {
             scale_factor: MACHINE_SCALE,
             screen_points: egui::vec2(731.4, 397.1),
             presented_physical: DEFAULT_INNER,
+            os: None,
         };
         assert_eq!(twice.agreement(), ScreenAgreement::ScaledTwice);
         assert!((twice.ratio() - 1.0 / MACHINE_SCALE).abs() < 1e-2);
@@ -912,6 +1101,7 @@ mod tests {
             scale_factor: MACHINE_SCALE,
             screen_points: egui::vec2(2240.0, 1216.0),
             presented_physical: DEFAULT_INNER,
+            os: None,
         };
         assert_eq!(leaked.agreement(), ScreenAgreement::PixelsAsPoints);
         assert!((leaked.ratio() - MACHINE_SCALE).abs() < 1e-2);
@@ -927,9 +1117,10 @@ mod tests {
             scale_factor: 1.0,
             screen_points: egui::vec2(1280.0, 720.0),
             presented_physical: (1280, 720),
+            os: None,
         };
         assert_eq!(plain.agreement(), ScreenAgreement::Consistent);
-        assert!(plain.lines().join(" | ").contains("ok"));
+        assert!(plain.lines().join(" | ").contains("· ok"));
         // A correct space is not corrected, and the line says so rather than staying
         // silent about it.
         assert!(
@@ -950,12 +1141,57 @@ mod tests {
             scale_factor: MACHINE_SCALE,
             screen_points: egui::vec2(1462.9, 726.9),
             presented_physical: DEFAULT_INNER,
+            os: None,
         };
         assert_eq!(stale.agreement(), ScreenAgreement::Consistent);
         assert!(!stale.back_buffer_matches());
         let lines = stale.lines().join(" | ");
         assert!(lines.contains("back buffer 2240x1216 px"), "{lines}");
         assert!(lines.contains("matches NO"), "{lines}");
+    }
+
+    #[test]
+    fn a_stale_scale_does_not_get_to_read_ok_on_the_winit_row() {
+        // winit's own check is `screen_rect == inner / scale_factor`, and both sides of
+        // that are winit's — inner_size() from GetClientRect, scale_factor() from its
+        // cached WindowState. A stale scale makes the equation true to 1.000x while the
+        // layout is 1.75x too large. Printed as a bare `ok`, that row is the one a
+        // reader stops at; it must carry the disagreement instead.
+        let stale = ScreenSpace {
+            inner_physical: (2496, 1336),
+            scale_factor: 1.0,
+            screen_points: egui::vec2(2496.0, 1336.0),
+            presented_physical: (2496, 1336),
+            os: Some(crate::viewport::OsView {
+                client_px: (2496, 1336),
+                scale: 1.75,
+                window_px: (2512, 1384),
+                awareness: "per-monitor-aware",
+                monitor_px: Some((2560, 1440)),
+            }),
+        };
+        // The arithmetic winit performed is self-consistent: that is the trap.
+        assert_eq!(stale.agreement(), ScreenAgreement::Consistent);
+        let lines = stale.lines().join(" | ");
+        assert!(
+            lines.contains("NO winit agrees with itself; its scale is stale"),
+            "{lines}"
+        );
+        assert!(
+            "winit scale count 1.000x (1.000 = ok) · ok" != lines,
+            "{lines}"
+        );
+        // And the row that can see it still says what it says.
+        assert!(lines.contains("NO winit disagrees"), "{lines}");
+        assert!(lines.contains("layout is 1.750x1.750"), "{lines}");
+        // With no probe there is no second opinion, so the winit row stays `ok`: the
+        // label must not accuse a build that cannot check.
+        let unprobed = ScreenSpace { os: None, ..stale };
+        assert!(
+            unprobed.lines().join(" | ").contains("· ok"),
+            "{}",
+            unprobed.lines().join(" | ")
+        );
     }
 
     fn partition(window: Vec2, left: f32, top: f32, bottom: f32, rect: Rect) -> Partition {
@@ -1068,6 +1304,7 @@ mod tests {
             scale_factor: MACHINE_SCALE,
             screen_points: Vec2::ZERO,
             presented_physical: (0, 0),
+            os: None,
         };
         assert_eq!(zero.agreement(), ScreenAgreement::Consistent);
         assert_eq!(zero.correction(), None, "a zero window is left alone");
@@ -1086,6 +1323,7 @@ mod tests {
             scale_factor: MACHINE_SCALE,
             screen_points: egui::vec2(1462.9, 726.9),
             presented_physical: DEFAULT_INNER,
+            os: None,
         };
         let (sx, sy) = stale.stretch();
         assert!((sx - 2560.0 / 2240.0).abs() < 1e-4, "{sx}");
@@ -1098,6 +1336,7 @@ mod tests {
         // A synced back buffer is a blit, and prints as one.
         let synced = ScreenSpace {
             presented_physical: (2560, 1272),
+            os: None,
             ..stale
         };
         assert_eq!(synced.stretch(), (1.0, 1.0));
@@ -1119,9 +1358,11 @@ mod tests {
                     scale_factor: scale,
                     screen_points: Vec2::ZERO,
                     presented_physical: inner,
+                    os: None,
                 }
                 .expected_points(),
                 presented_physical: inner,
+                os: None,
             };
             assert_eq!(
                 right.correction(),
@@ -1157,9 +1398,225 @@ mod tests {
             scale_factor: MACHINE_SCALE,
             screen_points: egui::vec2(1000.0, 543.0),
             presented_physical: DEFAULT_INNER,
+            os: None,
         };
         assert_eq!(odd.agreement(), ScreenAgreement::Odd);
         assert_eq!(odd.correction(), None);
         assert!(odd.lines().join(" | ").contains("not a whole scale"));
+    }
+
+    /// The arithmetic round 10 reported as text: `outer 1440×800`, client `1424×761`,
+    /// 175% scaling, winit reporting the client as `2496×1336`.
+    ///
+    /// **Read the numbers before trusting the label on them.** `2496 / 1424 = 1.7528`
+    /// and `1336 / 761 = 1.7556`, and `1424 × 1.75 = 2492`: the "actual physical" figure
+    /// is exactly winit's figure divided by the scale. That is the signature of one more
+    /// logical↔physical confusion — a `1440×800` **logical** window is `2520×1400`
+    /// physical, and its client area is `2496×1336`, which is what winit reported.
+    ///
+    /// This matters for what a fix may believe. `Window::inner_size()` **is**
+    /// `GetClientRect` (winit-0.30.13 `platform_impl/windows/window.rs:214`), on the same
+    /// handle in the same process — so
+    /// winit cannot report a client area that the OS would disagree with, and a
+    /// fixture claiming it does is describing a state no window can be in. The fixture
+    /// is kept because it exercises [`ScreenSpace`]'s arithmetic honestly (which number
+    /// wins when they differ), but the **reachable** divergence is the scale: winit
+    /// caches `scale_factor` in `WindowState` and refreshes it only on `WM_DPICHANGED`.
+    /// `a_stale_scale_factors_the_point_space_and_the_os_repairs_it` is that case.
+    fn round_ten() -> ScreenSpace {
+        ScreenSpace {
+            // winit's answer, which is the one that is wrong.
+            inner_physical: (2496, 1336),
+            scale_factor: 1.75,
+            // …and the point space built from it, so every winit-derived check passes.
+            screen_points: egui::vec2(1426.3, 763.4),
+            presented_physical: (2496, 1336),
+            os: Some(OsView {
+                client_px: (1424, 761),
+                scale: 1.75,
+                window_px: (1440, 800),
+                awareness: "per-monitor",
+                monitor_px: Some((1920, 1080)),
+            }),
+        }
+    }
+
+    #[test]
+    fn a_stale_scale_factors_the_point_space_and_the_os_repairs_it() {
+        // The mechanism that **can** happen, and the one a fix must be built around.
+        // The client area is one number both sides agree on (it is one `GetClientRect`);
+        // the scale is not: winit's is a cached `WindowState` field. Here winit still
+        // says 1.75 after the window landed on a 300% monitor, so egui lays the UI out
+        // over `client / 1.75` points instead of `client / 3.0` — 1.714x too wide, which
+        // puts the right-hand side of the layout outside the window.
+        let stale = ScreenSpace {
+            inner_physical: (2560, 1272),
+            scale_factor: 1.75,
+            // What egui-winit built from that scale.
+            screen_points: egui::vec2(1462.9, 726.9),
+            presented_physical: (2560, 1272),
+            os: Some(OsView {
+                client_px: (2560, 1272),
+                scale: 3.0,
+                window_px: (2560, 1272),
+                awareness: "per-monitor",
+                monitor_px: Some((1920, 1080)),
+            }),
+        };
+        // Winit and the OS agree about the window; only the scale is stale.
+        assert_eq!(stale.client_only_agrees(), Some(true));
+        assert_eq!(stale.os_agrees(), Some(false));
+        assert_eq!(
+            stale.os_expected_points().map(|v| v.x.round() as u32),
+            Some(853)
+        );
+
+        // The correction is the OS's division, and the scale travels with it.
+        let want = stale.correction().expect("a correction is due");
+        assert!((want.x - 853.3).abs() < 0.2, "want {want:?}");
+        assert!(
+            (want.x - 1462.9).abs() > 600.0,
+            "not winit's stale answer: {}",
+            want.x
+        );
+        assert_eq!(stale.authoritative_points(), want);
+
+        let lines = stale.lines().join(" | ");
+        assert!(lines.contains("NO winit disagrees"), "{lines}");
+        assert!(lines.contains("layout is 1.714x"), "{lines}");
+        assert!(
+            lines.contains("NO point space overflows the os window"),
+            "{lines}"
+        );
+    }
+
+    #[test]
+    fn round_ten_passed_every_winit_check_which_is_why_it_needed_a_second_opinion() {
+        // This is the whole reason the round happened: the first row read `1.000x · ok`
+        // (that build called it `scale count`), `matches yes`, `stretch 1.000x1.000 ·
+        // blit` — all true, because they compare winit with winit. If any of these ever
+        // stops being true the reproduction has drifted, and the assertions below are
+        // testing something else.
+        let s = round_ten();
+        assert_eq!(s.agreement(), ScreenAgreement::Consistent);
+        assert!((s.ratio() - 1.0).abs() < 1e-3, "winit's own ratio is 1.000");
+        assert!(s.back_buffer_matches());
+        assert_eq!(s.stretch(), (1.0, 1.0));
+
+        // And the OS says the window is a different size entirely.
+        assert_eq!(s.os_agrees(), Some(false));
+        let want = s.os_expected_points().expect("a probe, so an expectation");
+        assert!((want.x - 813.7).abs() < 0.1, "os expect x {want:?}");
+        assert!((want.y - 434.9).abs() < 0.1, "os expect y {want:?}");
+    }
+
+    #[test]
+    fn the_os_point_ratio_is_the_number_round_nine_could_not_print() {
+        // 1426.3 / 813.7 = 1.753: the layout occupies 1.75x the window the OS
+        // describes, which is exactly "panel + viewport = 2496 > 1424". Round 9's
+        // overlay had no line that could show this, because every number it printed
+        // was divided by the same 1.75.
+        let s = round_ten();
+        let (rx, ry) = s.os_point_ratio().expect("a probe, so a ratio");
+        assert!((rx - 1.7529).abs() < 5e-3, "x ratio {rx}");
+        assert!((ry - 1.7556).abs() < 5e-3, "y ratio {ry}");
+        let lines = s.lines().join(" | ");
+        assert!(lines.contains("NO winit disagrees"), "{lines}");
+        assert!(lines.contains("layout is 1.75"), "{lines}");
+        assert!(
+            lines.contains("NO point space overflows the os window"),
+            "{lines}"
+        );
+        assert!(lines.contains("os client 1424x761 px"), "{lines}");
+        assert!(lines.contains("window 1440x800 px"), "{lines}");
+        assert!(lines.contains("dpi awareness per-monitor"), "{lines}");
+    }
+
+    #[test]
+    fn the_correction_follows_the_os_and_not_winit_when_they_disagree() {
+        // The fix: when the OS and winit disagree about the window, the OS wins. The
+        // correction must be the OS's `client / scale` (813.7x434.9), **not** winit's
+        // 1426.3x763.4 — otherwise the repair would hand the layout back the very
+        // number that is wrong.
+        let s = round_ten();
+        let want = s.correction().expect("a correction is due");
+        assert!((want.x - 813.7).abs() < 0.1, "want {want:?}");
+        assert!((want.y - 434.9).abs() < 0.1, "want {want:?}");
+        assert_ne!(
+            (want.x.round() as u32, want.y.round() as u32),
+            (1426, 763),
+            "the correction is not winit's answer"
+        );
+        assert_eq!(
+            s.authoritative_points(),
+            want,
+            "one authority, one function"
+        );
+    }
+
+    #[test]
+    fn a_layout_already_matching_the_os_is_not_corrected() {
+        // The healthy case must stay silent, or the correction would fight a correct
+        // window every pass. This is round 9's machine: OS and winit agree.
+        let s = ScreenSpace {
+            inner_physical: (2240, 1216),
+            scale_factor: MACHINE_SCALE,
+            screen_points: egui::vec2(1280.0, 694.9),
+            presented_physical: (2240, 1216),
+            os: Some(OsView {
+                client_px: (2240, 1216),
+                scale: MACHINE_SCALE,
+                window_px: (2256, 1255),
+                awareness: "per-monitor",
+                monitor_px: Some((1920, 1080)),
+            }),
+        };
+        assert_eq!(s.os_agrees(), Some(true));
+        assert_eq!(s.correction(), None, "nothing to repair");
+        let lines = s.lines().join(" | ");
+        assert!(lines.contains("agrees with winit"), "{lines}");
+        assert!(lines.contains("point space fits the os window"), "{lines}");
+    }
+
+    #[test]
+    fn without_a_probe_no_second_opinion_is_claimed() {
+        // A non-Windows peer, or a failed read: the line must say so and the ratio must
+        // be absent, so a screenshot cannot be read as "the OS confirmed this".
+        let blind = ScreenSpace {
+            inner_physical: DEFAULT_INNER,
+            scale_factor: MACHINE_SCALE,
+            screen_points: egui::vec2(1280.0, 694.9),
+            presented_physical: DEFAULT_INNER,
+            os: None,
+        };
+        assert_eq!(blind.os_agrees(), None);
+        assert_eq!(blind.os_point_ratio(), None);
+        assert_eq!(blind.authoritative_points(), blind.expected_points());
+        let lines = blind.lines().join(" | ");
+        assert!(lines.contains("os probe n/a"), "{lines}");
+    }
+
+    #[test]
+    fn the_partition_against_the_os_window_fails_for_round_tens_layout() {
+        // The end-to-end statement, as arithmetic: round 10's panels and viewport, the
+        // window the **OS** reports. `left + viewport` is 1426.3 against an 813.7-pt
+        // window, so the identity fails by the window's own width — which is what
+        // "the city was pushed off the right-hand edge" means.
+        let s = round_ten();
+        let os_window = s.authoritative_points();
+        let p = Partition {
+            window: os_window,
+            left: 903.4 / 1.7529,
+            top: 25.0,
+            bottom: 25.0,
+            rect: Rect::from_min_size(Pos2::ZERO, s.screen_points),
+        };
+        assert!(!p.fits_width(), "{}", p.lines().join(" | "));
+        assert!(
+            (p.width_total() - os_window.x) > 600.0,
+            "the overshoot is nearly the whole window: {}",
+            p.width_total() - os_window.x
+        );
+        assert!(!p.ok());
     }
 }
