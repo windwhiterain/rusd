@@ -80,8 +80,17 @@
 ## M6 — 互操作与扩展
 
 - [x] rusd-usd 导出桥：展开→flatten→usda/usdc/usdz（--no-bake 保留 generator schema）；rusd export / agent export_usd（2026-11-17）
-- [ ] USD 导入桥（USD→Rusd）
-- RusdLSystem / RusdTerrain / RusdWfc
-- 示例画廊 + 文档
 - [x] 导出 round-trip：usda/usdc 经 openusd 重导入 prim 数一致（AOUSD 合规背书）（2026-11-17）
-- [ ] usdview / Blender 实际打开确认（子集范围内）
+- [x] 独立验证链：参考实现 pxr（usd-core）读回 + Cycles 路径追踪出图；city 475 / forest 505 prim
+      与 expand 精确一致、gprim 0 无效、stage 元数据与 bbox 合规（2026-11-17）
+      → 证据、复现命令、数字表、Cycles XML 约定与坑、产物位置见 `docs/VERIFICATION.md`；
+      脚本 `scripts/verify/{verify_usd,make_review,usd_to_cycles}.py`
+- [ ] USD 导入桥（USD→Rusd）
+- [ ] RusdLSystem / RusdTerrain / RusdWfc（更多 generator）
+- [ ] 示例画廊 + 文档
+- [ ] 导出相机/灯光 rig 决策：导出件相机为单位矩阵、无灯光，DCC 直开黑/错构图；
+      是否让 `rusd export` 产出可用相机 + 默认灯光待定（现象见 VERIFICATION §7(b)）
+- [ ] usdview / Blender 实际打开确认（子集范围内）——目前由 pxr + Cycles 覆盖
+- 已知 backlog（验证中发现，不阻断 M6 验收）：city Ground 444×444 vs 网格 ~800 致外圈建筑
+  浮空（修复在 `fix/ground-size` 分支）；Cycles local build USD 直入模式空 film（外部工具缺陷，
+  XML 模式绕过）。详见 `docs/VERIFICATION.md` §7。
