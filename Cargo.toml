@@ -6,6 +6,7 @@ members = [
     "crates/rusd-proc",
     "crates/rusd-render",
     "crates/rusd-agent",
+    "crates/rusd-usd",
     "crates/rusd-cli",
     "crates/spike-openusd",
 ]
@@ -16,6 +17,7 @@ default-members = [
     "crates/rusd-proc",
     "crates/rusd-render",
     "crates/rusd-agent",
+    "crates/rusd-usd",
     "crates/rusd-cli",
 ]
 
@@ -32,6 +34,7 @@ rusd-scene = { path = "crates/rusd-scene" }
 rusd-proc = { path = "crates/rusd-proc" }
 rusd-render = { path = "crates/rusd-render" }
 rusd-agent = { path = "crates/rusd-agent" }
+rusd-usd = { path = "crates/rusd-usd" }
 # Scene/composition/interop backend (SPEC D3). Pinned; upgrades go through the spike.
 openusd = "0.8"
 

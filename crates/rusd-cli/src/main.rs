@@ -288,6 +288,24 @@ fn main() {
         Some("serve") => {
             rusd_agent::serve();
         }
+        Some("export") => {
+            let Some(path) = args.get(1) else {
+                eprintln!("usage: rusd export <file.rusd> <out.usda|usdc|usdz> [--no-bake]");
+                std::process::exit(2);
+            };
+            let Some(out) = args.get(2) else {
+                eprintln!("usage: rusd export <file.rusd> <out.usda|usdc|usdz> [--no-bake]");
+                std::process::exit(2);
+            };
+            let bake = !args.iter().any(|a| a == "--no-bake");
+            match rusd_usd::export_file(path, out, bake) {
+                Ok(info) => println!(
+                    "export: {} prims -> {} ({}, baked={})",
+                    info.prim_count, info.path, info.format, info.baked
+                ),
+                Err(diags) => print_diags(&diags),
+            }
+        }
         Some(other) => {
             eprintln!("rusd: '{other}' is not implemented yet — see docs/ROADMAP.md");
             std::process::exit(2);

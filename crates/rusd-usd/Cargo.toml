@@ -1,0 +1,14 @@
+[package]
+name = "rusd-usd"
+description = "Rusd ↔ USD interop bridge (M6): export composed/expanded scenes to usda/usdc/usdz via openusd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+rusd-core.workspace = true
+rusd-scene.workspace = true
+rusd-proc.workspace = true
+openusd.workspace = true

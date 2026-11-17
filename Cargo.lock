@@ -947,6 +947,7 @@ dependencies = [
  "rusd-proc",
  "rusd-render",
  "rusd-scene",
+ "rusd-usd",
  "serde_json",
  "toml_edit",
 ]
@@ -960,6 +961,7 @@ dependencies = [
  "rusd-proc",
  "rusd-render",
  "rusd-scene",
+ "rusd-usd",
 ]
 
 [[package]]
@@ -1000,6 +1002,16 @@ version = "0.0.1"
 dependencies = [
  "openusd",
  "rusd-core",
+]
+
+[[package]]
+name = "rusd-usd"
+version = "0.0.1"
+dependencies = [
+ "openusd",
+ "rusd-core",
+ "rusd-proc",
+ "rusd-scene",
 ]
 
 [[package]]

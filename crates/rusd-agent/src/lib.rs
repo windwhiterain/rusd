@@ -103,6 +103,7 @@ impl Agent {
             "diff" => self.diff(),
             "undo" => self.undo(),
             "redo" => self.redo(),
+            "export" => self.export_usd(p),
             "state" => Ok(json!({"doc": self.doc, "open": self.doc.is_some()})),
             _ => Err(format!("unknown method: {method}")),
         }
@@ -253,6 +254,18 @@ impl Agent {
             "ops_applied": self.provenance.len(),
             "provenance": self.provenance,
         }))
+    }
+    fn export_usd(&self, p: &Value) -> Result<Value, String> {
+        let out = p
+            .get("out")
+            .and_then(Value::as_str)
+            .ok_or("export: `out` path required")?;
+        let bake = p.get("bake").and_then(Value::as_bool).unwrap_or(true);
+        let text = self.doc.as_ref().ok_or("no scene open; call open first")?;
+        let info = rusd_usd::export_text(text, out, bake).map_err(diags_msg)?;
+        Ok(
+            json!({"path": info.path, "format": info.format, "prim_count": info.prim_count, "baked": info.baked}),
+        )
     }
 }
 

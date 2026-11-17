@@ -17,3 +17,4 @@ rusd-scene.workspace = true
 rusd-proc.workspace = true
 rusd-render.workspace = true
 rusd-agent.workspace = true
+rusd-usd.workspace = true
