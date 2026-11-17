@@ -101,3 +101,7 @@ cargo run -p spike-openusd    # O6 增量合成实证基准（SPEC §6）
 - viewer 开窗按 monitor **work area**（GetMonitorInfoW rcWork）夹取居中，底栏不被
   任务栏遮；egui-winit 必须 `features = ["clipboard"]`，否则 `ctx.copy_text` 被平台层
   静默丢弃（toast 会显示「已拷贝」但剪切板不变——验收要读真剪切板）。
+- 两步扫描要**覆盖 commit message**：`git log -1 --format=%B | perl -CSD -ne '$c++ if /\x{FFFD}/; END { print ... }'`。
+  曾出现文件干净但提交信息被写坏（`feature（`→`feature<FFFD><FFFD>`），靠提交后顺手扫才发现。
+- `edit` 工具偶发损坏传入的 `old` 锚点（中文→FFFD）而被服务器拒绝（不改文件）；
+  稳妥插入法：`head -N file / cat block / tail -n +N+1 file` 行号拼接写回。
