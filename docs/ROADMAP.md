@@ -106,6 +106,18 @@ peer 构建 scp 分发）。server 不再拥有相机——相机归 client，se
       `opinion{ops:[{path, field:"xformOp:translate", value:[x,y,z], op:"set"}]}` 节流 ≤30Hz + 拖尾保底，
       本地先预览（re-bake 单 prim），undo/redo 发 server。**`value` = prim 局部坐标**（父会话裁定，
       2026-11-17 第二轮；世界→局部逆变换归 client：`gizmo::drag_translate` + `anchor::Anchor`）
+- [x] **D13 viewer UX 真窗验收**（真窗口 + 真剪切板 + `capture_get`，2026-11-17；证据见
+      `docs/VERIFICATION.md` §9，平台约定见 `REMOTE.md` §13）：
+  - [x] pick 自动拷贝：点建筑 ⇒ 剪切板 = `/World/City/b3_1/lot1_0` + toast + 选中红显
+        （修 `48907f1`：viewport 路径漏调 `copy_toast`，v1.3 契约缺口）
+  - [x] capture 全链：arm → 拖选 → `cap-0003`；`capture_get` image **1337×1172**（= viewport
+        texels）、mask 同尺寸且白区 **(773,665)-(1073,855)** 对应拖选、`camera` = 帧相机、
+        `scene_version` = 2；剪切板 = cap id（读取需等 flush 一帧，早读会 race 到旧值）
+  - [x] 剪切板 feature：`egui-winit` 开 `features=["clipboard"]`，否则 `copy_text` 静默丢弃
+        （toast 显示已拷贝但剪切板不变）；修 `480227d`
+  - [x] 底栏可见：开窗改用 `GetMonitorInfoW` `rcWork` 夹取居中（底栏不再被任务栏遮）；修 `480227d`
+  - [x] 合成树面板真数据（v1.3 只画结构）：4 层 / 2 arc / 475 prim / 0 variant set；点 prim 走
+        `pick → prim_id → comp_node`
 - [ ] SSH 隧道文档（`ssh -L`）与分发说明（peer 构建 → scp，同 win-x64）
 - [ ] 后置：`Diff`/`apply_diff` 细粒度增量（`sdf::Value`/`Diff` 无 serde，需自定义 codec）；
       `--bind LAN`

@@ -342,3 +342,37 @@ viewer 不再是 server 进程内的一个窗口，而是一个**独立 client �
 - **`--bind LAN`**：默认只 loopback + 隧道；LAN 直连要连带认证决策。
 - **浏览器 client**：已否（wasm 跑完整 openusd 合成过重）。
 - **mute / variant 等合成语义的 client 侧交互**：Tier B 之后。
+
+## 13. client 平台约定（D13 真窗验收踩出）
+
+两条都会让 UI「看起来成功」而实际没做成，所以写成约定而不是实现细节。
+
+### 13.1 剪切板必须开 `clipboard` feature
+
+`egui-winit` 若写成 `default-features = false` 且只开 `wayland` / `x11`，**`ctx.copy_text` 会被
+平台层静默丢弃**：toast 照样弹「已拷贝」，但**系统剪切板一个字都没变**。
+约定：`egui-winit` 必须开 `features = ["clipboard"]`（修复 `480227d`）。
+
+推论（验收纪律）：**判据必须是 `Get-Clipboard`，不能是 toast**。同理，pick 自动拷贝的
+验收读真剪切板，才能发现 viewport 路径漏调 `copy_toast` 这类契约缺口（`48907f1`）。
+读剪切板**须让出一帧**：`copy_text` 之后立刻读会 race 到旧值（本轮实测早读读到上一次的
+`cap-0002`）。
+
+### 13.2 开窗按 monitor **work area**，不是整个 monitor
+
+按全 monitor 居中会把底栏（Undo/Redo/Fit/选区截图/note）塞到任务栏下面，点不到。
+约定：用 `GetMonitorInfoW` 的 **`rcWork`**（已扣任务栏/停靠栏）夹取居中（修复 `480227d`）。
+窗口尺寸本身仍遵守 §7.1 的 `screen_points == inner_physical / scale_factor`。
+
+### 13.3 测量管线教训（先怀疑尺子）
+
+同一轮里「城市被裁 / 窗口越界 / 点击偏移」全是**测量工具**的假象，viewer 布局自第六轮起
+一直正确（探针 `overlay partition OK` / `os agrees` / `fits the screen` / `1:1` / `fresh` /
+`same camera` 全绿）。两条已入 `AGENTS.md`：
+
+- **DPI-unaware 的截图/鼠标脚本被 Windows 虚拟化到 1463×823**（真屏 2560×1440 @ 1.75）。
+  任何屏幕测量或合成输入前先 `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`。
+- **PowerShell `Move`/`Mv` 命中 `Move-Item` 别名**，曾让合成拖选静默失效、mask 全黑被
+  误判为产品缺陷。
+
+报告"窗口/渲染有 bug"之前，先用 aware 探针复量一遍——否则量到的是虚拟化后的尺子。

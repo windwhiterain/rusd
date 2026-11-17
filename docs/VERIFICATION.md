@@ -1,11 +1,13 @@
-# Rusd 导出桥独立验证（M6）
+# Rusd 独立验证记录（M6 导出桥 · D13 viewer UX）
 
-状态：完成（post-fix 复测）· 2026-11-17 · 对应 ROADMAP M6 导出桥验收
+状态：完成（post-fix 复测）· 2026-11-17 · 对应 ROADMAP M6 导出桥验收、M4' D13 viewer UX 验收
 
-本文记录 **M6 导出桥（展开→flatten→usda/usdc/usdz）的独立验证链**：用第三方参考实现
-（pxr / usd-core）读回 Rusd 导出的 USD，再用路径追踪渲染器（Cycles）出图，对照
-`rusd expand` 的 prim 数与几何。验证链不依赖 openusd（Rusd 自己的后端），因此是独立背书，
-而非自证。
+本文记录两类**独立验证**，都不自证：
+
+- **§1–§8：M6 导出桥（展开→flatten→usda/usdc/usdz）的验证链**。用第三方参考实现
+  （pxr / usd-core）读回 Rusd 导出的 USD，再用路径追踪渲染器（Cycles）出图，对照
+  `rusd expand` 的 prim 数与几何。验证链不依赖 openusd（Rusd 自己的后端）。
+- **§9：D13 viewer UX 的真窗验收**。真窗口 + 真剪切板 + `capture_get`，读系统状态而非看截图。
 
 脚本在 `scripts/verify/`（tracked）；产物在 `target/`（gitignored，本地产物，需先跑
 `rusd export` 才会出现）。
@@ -190,3 +192,74 @@ argv 取路径。
 - 导出相机/灯光 rig 决策（见 §7.2）；
 - 行道树 scatter 域原点（见 §7.4）；
 - usdview / Blender 实际打开确认（子集范围内）——本文用 pxr + Cycles 覆盖，未用 usdview。
+
+## 9. D13 viewer UX 真窗验收（2026-11-17）
+
+D12 的 viewer 在**真窗口 + 真剪切板 + `capture_get`** 下走了一遍端到端，不是看截图猜，而是读
+系统状态。这一节记录证据，以及**验收时发现并修掉的三个产品缺口**。
+
+### 9.1 pick 自动拷贝（修复 `48907f1`）
+
+- 点一栋建筑 ⇒ **系统剪切板** = `/World/City/b3_1/lot1_0`、toast 显示「已拷贝」、该 prim 红色高亮。
+- 修复根因：viewport 的 pick 路径**漏调 `copy_toast`**——v1.3 契约里有"pick 即拷贝"，但只有
+  树面板那条路径接了，viewport 这条没接。真窗读剪切板才发现（截图看不出，toast 也没显示）。
+
+### 9.2 capture 全链（arm → 拖选 → `capture_get`）
+
+| 项 | 实测值 |
+| --- | --- |
+| capture id | `cap-0003`（`cap-<seq:04d>`，每次 +1） |
+| `image` | **1337×1172**（= viewport texels，与窗口 client area 一致） |
+| `mask` | 同尺寸 1337×1172；**白区 bbox `(773,665)-(1073,855)`** 与拖选矩形对应 |
+| `camera` | 帧相机（fit 视角），非默认 |
+| `scene_version` | **2** |
+| 剪切板 | = capture id（`cap-0002` 实测读到） |
+
+**读取需等 flush 一帧**：`ctx.copy_text` 之后立即读剪切板会 race 到**旧值**，早读会读到上一次的
+capture id。验收脚本里先让出一帧（或延时）再 `Get-Clipboard`。
+
+### 9.3 clipboard feature 缺口（修复 `480227d`）
+
+`egui-winit` 被写成 `default-features = false` 且只开 `wayland`/`x11` ⇒ **`copy_text` 被平台层
+静默丢弃**：toast 照样显示「已拷贝」，但**系统剪切板不变**。修复 = `features = ["clipboard"]`。
+这类缺口的可怕之处是 UI 全程"看起来成功"，只有读真剪切板才暴露——所以验收判据必须是
+`Get-Clipboard`，不能是 toast。
+
+### 9.4 work area 开窗（修复 `480227d`）
+
+默认窗口曾按**整个 monitor** 居中 ⇒ 底栏（Undo/Redo/Fit/选区截图/note）被任务栏遮住、点不到。
+修复 = 用 `GetMonitorInfoW` 的 `rcWork`（工作区，已扣任务栏）夹取居中；真窗底栏完整可见可用。
+
+### 9.5 测量管线教训（不是产品 bug，但会伪造 bug）
+
+同一轮里出现过"城市被裁 / 窗口越界 / 点击偏移"的假象，全部是**测量工具**的问题：
+
+- 父会话的截图/鼠标 PowerShell 是 **DPI-unaware**，被 Windows 虚拟化到 **1463×823**
+  （真屏 2560×1440 @ 1.75）。viewer 自第六轮起布局一直是对的——探针的
+  `overlay partition OK` / `os agrees` / `fits the screen` / `1:1` / `fresh` / `same camera`
+  全绿。教训条目见 `AGENTS.md`（DPI 感知 + 虚拟屏归一化）。
+- PowerShell 自定义函数名 `Move`/`Mv` 命中 `Move-Item` 别名，**合成拖选静默失效**，
+  于是 mask 全黑被误判成产品缺陷。教训见 `AGENTS.md`。
+
+### 9.6 合成树面板（v1.3：只画结构）
+
+真数据下显示 **4 层 / 2 arc / 475 prim / 0 variant set**；点某个 prim 走
+`pick → prim_id → comp_node` 定位到树上对应节点。v1.3 的树**只画结构**，不画属性/值。
+
+### 9.7 复现命令
+
+```powershell
+# 1) pick 自动拷贝：点建筑后读真剪切板（不是看 toast）
+Get-Clipboard            # 期望 /World/City/b3_1/lot1_0
+
+# 2) capture：arm 选区截图 → 拖选 → 读回
+#    经 D12 协议在同一条连接上发 capture_get（id 取剪切板里的 cap-NNNN）
+#    读取前先让出一帧，否则 race 到旧值
+```
+
+`capture_get{id}` 的返回字段：`id`、`camera`、`image`（base64 PNG）、`mask`（base64 PNG，无则
+`null`）、`scene_version`、`created_at`、`note`。
+
+**mask 白区 bbox 验收**：把 `mask` 解码成 PNG，统计白色像素的包围盒，应等于拖选矩形在
+viewport texels 下的位置（本轮 `(773,665)-(1073,855)`）。这一条能同时验出"选区算子正确"和
+"截图与视口同尺寸同坐标系"。
