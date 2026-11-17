@@ -161,6 +161,57 @@ client: Layer::from_bytes → 单层栈 → extract → 本地 wgpu 渲染
 3. **③egui 壳 + gizmo → opinion 闭环 — ②过后开**：交互拖动产出 override opinion，
    经协议回到 server，再收到新快照。
 
+### 热重载延迟：证据与缺口
+
+四层时间轴（epoch ms 对齐，`release` 提交 `8767` 实测；共六个可观测阶段，归四层）：
+
+| 层 | 阶段 | 量级 |
+| --- | --- | --- |
+| 1 | `notify` 交付（文件事件到达监视回调） | 毫秒级 |
+| 1 | wake 入队（投进 sync 线程的消息队列） | 毫秒级 |
+| 2 | sync 出队（循环取到该消息 / 检查 deadline） | 毫秒级 |
+| 3 | deadline（debounce 到期，约 **+205ms**） | 毫秒级 |
+| 4 | 快照就绪（重读 → 重建 → cook → flatten → `write_bytes`） | 毫秒级 |
+| 4 | writer flush（写入订阅连接） | 毫秒级 |
+
+每一个阶段本身都是**毫秒级**——延迟不藏在某一层里，而在**第 2/3 层的交互方式**上（见下）。
+
+client 侧实测端到端 `dt`（落盘 → 收到 `state_changed{reason:"reload"}`）：
+
+| 构建 | 无 client 附着 | idle 附着（只读） | busy 附着（每 200µs 发 `state`） |
+| --- | --- | --- | --- |
+| **`release` `8767`** | —（无接收者） | **252.7ms** | **256.6ms** |
+| `debug` 对照 | A **748ms** | B **911.6ms** | — |
+
+另：`rename` 与 `truncate` **两种改写都触发** reload，且 **watch 跨 rename 存活**
+（第三轮探针：交付 **+36ms / +25ms**，均远小于 200ms debounce 上限）。
+
+**机制与修复**（merge `f88af5f` ← `7f585ba`）：sync 循环原先**只在 `recv_timeout` 报超时时**
+才认定 debounce 到期。持续 client 流量会让每次 `recv_timeout` 立即返回，于是 reload 被
+**无界推迟到流量停止**——这正是“viewer 一边动画一边收不到更新”的现场症状。
+修复 = **每轮 `recv` 前先查 `deadline_passed()`**，到期就地发布，不等超时。
+（`is_ok()` 吞掉错误交付的修复更早，在第三轮 `034cb13` 已入。）
+
+#### 诚实缺口（必须写明）
+
+1. **busy 回归测试没有锁住缺陷本身**。`a_busy_client_still_gets_its_reload` 做过
+   red-check：**撤掉 `deadline_passed()` 修复后该测试仍 **646ms 绿****。也就是说它验证的是
+   “busy 下能收到 reload”，而不是“没有饥饿”；现有回归**未锁住饥饿缺陷本身**。
+2. **15.59s 的单次观测未被任何组合复现**。`release` / `debug` × 无 / idle / busy 六种组合
+   全跑过，**均未复现**父会话那次 15.59s。
+3. **早先“reload 延迟 10–20s”的结论已撤回**。那是 harness 错觉：批内 `exec` 串行执行，
+   改写落在观测窗口之外，被误读成延迟（AGENTS 已有对应纪律条目）。
+4. **15.59s 因此保留为“未解释的单次观测”**，既不当已知 bug、也不当已证伪。
+
+**后置项**：要真正锁住饥饿需要**负载注入式测试基础设施**（可控持续流量 + 断言
+“deadline 到期即发布”而非“最终收到”），列为可选项，不挡 M4'。
+
+**测试读取器两真缺陷已修**（同一批）：`notification_within` 超时丢半行导致 80KB 快照行错乱；
+拒收带 `id` 响应导致 `poll` / `listen` 互吃。这两条是测试工具的 bug，不是 server 的。
+
+**回归预算仍为 2s**（`BUDGET = Duration::from_secs(2)`，多处共用）；
+`release` 实测 ≤1s，判据成立且留有约 4× 余量。
+
 ## 11. 里程碑（M4 重排为 M4'）
 
 原 M4 的"热重载交互 viewer（winit + egui），走 SPEC §6 增量管线"被本决策取代：

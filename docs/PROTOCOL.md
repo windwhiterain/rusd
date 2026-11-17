@@ -141,10 +141,22 @@ client 见到的版本序列没有空洞——除非它错过了某条通知（�
 - **任何一次事件交付都触发重读，包括错误交付**（Windows 后端在事件突发时会用错误
   形态报缓冲区溢出）。丢掉错误交付就会让 reload 等到下一次保存才发生，这是实测
   过的故障形态，所以不按 `is_ok()` 过滤。
+- **debounce 的到期检查不看 `recv_timeout`**：sync 循环**每轮 `recv` 前先查
+  `deadline_passed()`**（deadline 已过期就就地发布 reload），而不是等 `recv_timeout`
+  报超时才算到期。理由：持续 client 流量（viewer 边动画边每 200µs 发 `state`）会让每次
+  `recv_timeout` 立即返回，若只靠超时认定到期，reload 就会被**无界推迟到流量停止**。
+  修复见 `f88af5f` ← `7f585ba`；证据与缺口详见 `docs/REMOTE.md` §10「热重载延迟：证据与缺口」。
+- **回归未锁住饥饿（诚实注记）**：busy 回归测试做过 red-check——撤掉 `deadline_passed()`
+  修复后它仍 **646ms 绿**，说明它验证"busy 下能收到 reload"而**不是**"没有饥饿"。
+  父会话曾观测到一次 **15.59s** 延迟，但 release/debug × 无/idle/busy **六种组合均未复现**；
+  早先"reload 延迟 10–20s"的结论**已撤回**（批内 exec 串行致改写落在观测窗口外的 harness
+  错觉），15.59s 保留为**未解释的单次观测**。锁饥饿需负载注入式测试基础设施，列为后置可选。
 - **延迟预算**：从落盘到收到 `state_changed{"reason":"reload"}` 的实测值是
   **634ms / 786ms**（peer x64，debug 构建，city 475 prim：200ms debounce +
   重建/cook/flatten/usdc 写）。回归测试以 **2s** 为预算断言。release 构建下管线
-  显著更快，同样的 debounce 仍是主要固定开销。
+  显著更快（`release` `8767`：无 client 附着 — / idle 附着 **252.7ms** / busy 附着
+  **256.6ms**；debug 对照 A **748ms** / B **911.6ms**），四层时间轴逐层均为毫秒级，
+  同样的 debounce 仍是主要固定开销。
 - 该监视**不**违反 REMOTE §9 G4：那条说的是 openusd crate **无 stage reload / 无外部变更
   探测**（client 镜像侧的限制），不是禁止 server 侧文件 watch——重载由 server 重读文档 +
   重建 stage 完成，crate 缺口不参与。
