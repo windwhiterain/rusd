@@ -1,0 +1,25 @@
+[package]
+name = "rusd-viewer"
+description = "Spike: memory-only composite stacks (MemResolver) rendered headless — USD-layer remote, no network, no egui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "rusd-viewer"
+path = "src/main.rs"
+
+[dependencies]
+rusd-core.workspace = true
+rusd-scene.workspace = true
+rusd-render.workspace = true
+openusd.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+rusd-proc.workspace = true
+rusd-usd.workspace = true
+png = "0.18.1"

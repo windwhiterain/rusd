@@ -8,6 +8,7 @@ members = [
     "crates/rusd-agent",
     "crates/rusd-usd",
     "crates/rusd-cli",
+    "crates/rusd-viewer",
     "crates/spike-openusd",
 ]
 # Routine builds/tests skip the openusd spike (heavy dep); run it with -p spike-openusd.
@@ -19,6 +20,7 @@ default-members = [
     "crates/rusd-agent",
     "crates/rusd-usd",
     "crates/rusd-cli",
+    "crates/rusd-viewer",
 ]
 
 [workspace.package]
