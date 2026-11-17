@@ -49,6 +49,14 @@ pub struct ViewArgs {
     pub connect: String,
     /// A `.usdc` to show when the server never answers: the offline fallback.
     pub usdc: Option<String>,
+    /// Draw the size/frame overlay in the viewport's top-left corner.
+    ///
+    /// The overlay reports the numbers that were guessed wrong three rounds
+    /// running — `pixels_per_point`, the rect, the texel size, the camera's
+    /// distance and target, and how many frames arrived against which one is on
+    /// screen — so a screenshot answers "is the frame fresh, and is it 1:1?"
+    /// without another probe.
+    pub debug_ui: bool,
 }
 
 impl ViewArgs {
@@ -57,6 +65,7 @@ impl ViewArgs {
     pub fn parse(args: &[String]) -> Result<Self, String> {
         let mut connect = None;
         let mut usdc = None;
+        let mut debug_ui = false;
         let mut it = args.iter();
         while let Some(a) = it.next() {
             let (flag, inline) = match a.split_once('=') {
@@ -77,11 +86,16 @@ impl ViewArgs {
                         return Err("--usdc needs a path".to_owned());
                     }
                 }
+                "--debug-ui" => debug_ui = true,
                 other => return Err(format!("unexpected argument {other:?}")),
             }
         }
         let connect = connect.ok_or_else(|| "--connect <addr:port> is required".to_owned())?;
-        Ok(Self { connect, usdc })
+        Ok(Self {
+            connect,
+            usdc,
+            debug_ui,
+        })
     }
 }
 
@@ -132,6 +146,17 @@ pub struct Shell {
     frame: Option<(crate::net::Frame, egui::TextureHandle)>,
     /// The render size the texture was made at, so a resize forces a new one.
     tex_size: (u32, u32),
+    /// The viewport's geometry — the one place its rect, scale and texel size come
+    /// from (`crate::viewport::ViewportSize`). Updated by the layout each frame;
+    /// the render thread is told only when the texel size changes.
+    viewport: crate::viewport::ViewportSize,
+    /// A frame counter for the debug overlay: how many frames the render thread has
+    /// handed over, and which one is on screen. A stale window shows a smaller
+    /// `shown` than `received`, which is what makes "displaying an old frame"
+    /// visible in a screenshot instead of a guess.
+    frames_received: u64,
+    /// Whether `--debug-ui` draws the size/frame overlay.
+    debug_ui: bool,
 
     drag: Option<DragState>,
     /// The prim a gizmo drag is moving, with the anchor it started from (world
@@ -225,6 +250,9 @@ impl Shell {
             }),
         );
 
+        let scale = window.scale_factor() as f32;
+        let window_points = egui::vec2(size.width as f32, size.height as f32) / scale;
+
         Ok(Self {
             window,
             painter,
@@ -243,6 +271,11 @@ impl Shell {
                 diags: Vec::new(),
             },
             frame: None,
+            // A placeholder until the first layout: the whole window as the rect.
+            // It is replaced by `publish_viewport` before anything is drawn, and the
+            // render thread's first `Resize` comes from there.
+            viewport: crate::viewport::whole_window(window_points, scale),
+            frames_received: 0,
             tex_size: (0, 0),
             drag: None,
             gizmo: None,
@@ -254,6 +287,7 @@ impl Shell {
             fps: 0.0,
             last_frame_at: Instant::now(),
             offline_usdc: args.usdc.clone(),
+            debug_ui: args.debug_ui,
         })
     }
 
@@ -326,7 +360,7 @@ impl Shell {
         // wiring tests cannot disagree about it. The bug this replaces: the
         // camera was only taken when `orbit` was `None`, and by the first snapshot
         // it never was.
-        let aspect = self.window_aspect();
+        let aspect = self.viewport_aspect();
         if let Some(orbit) = crate::view::camera_for_scene(&mut self.model, &made, aspect) {
             self.orbit = Some(orbit);
         }
@@ -368,7 +402,7 @@ impl Shell {
 
     /// No server: show the `.usdc` the user named so the window is not empty.
     fn load_offline(&mut self, path: &str) {
-        let aspect = self.window_aspect();
+        let aspect = self.viewport_aspect();
         // A fallback scene is not a server's: the status bar must say 离线 rather
         // than 连接中.
         self.model.offline = true;
@@ -412,8 +446,17 @@ impl Shell {
             .egui_ctx
             .load_texture("viewport", image, egui::TextureOptions::LINEAR);
         self.tex_size = (frame.width, frame.height);
+        self.frames_received += 1;
         self.frame = Some((frame, texture));
-        self.window.request_redraw();
+        // **The upload only becomes visible on the *next* pass.** `load_texture`
+        // registers the image with the texture manager, and the manager's deltas are
+        // handed to the painter at the end of the pass that is running now — a pass
+        // whose widget tree was built *before* this texture existed. So a frame that
+        // arrives while a redraw is in flight is uploaded but not drawn: the window
+        // keeps showing the previous one. Repainting once here is what actually puts
+        // the new frame on screen, and it is the difference the debug overlay shows
+        // as `shown == received` instead of `shown < received`.
+        self.request_repaint();
     }
 
     /// Ask the render thread for a frame with the current camera and selection.
@@ -494,23 +537,22 @@ impl Shell {
 
         egui::CentralPanel::no_frame().show(root, |ui| {
             let avail = ui.available_size();
+            // The rect is allocated from the layout; its size, scale and texel size
+            // come back from one source (`crate::viewport::ViewportSize`), which is
+            // what the render thread is told to render at and what the camera is
+            // fitted to. Nothing here re-derives a second size.
             let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+            let size = crate::viewport::ViewportSize::new(rect, ui.pixels_per_point());
+            self.publish_viewport(size);
             match &self.frame {
-                Some((frame, texture)) => {
-                    // The one place a texture of fixed texel size meets egui's
-                    // point-space layout: `crate::viewport` decides the rect and the
-                    // UV, so the frame covers the viewport 1:1 at any ppp instead of
-                    // being resampled out of the top-left corner.
-                    let image = crate::viewport::viewport_image(
-                        rect,
-                        (frame.width, frame.height),
-                        ui.pixels_per_point(),
-                    );
-                    let uv = crate::viewport::viewport_uv();
+                Some((_frame, texture)) => {
+                    // The frame was rendered at `size.texels()`; paint it into
+                    // `size.rect()` with the whole texture, so one texel is one
+                    // device pixel whatever the scale.
                     egui::Image::new(texture)
-                        .fit_to_exact_size(image.size())
-                        .uv(uv)
-                        .paint_at(ui, image);
+                        .fit_to_exact_size(size.rect().size())
+                        .uv(size.uv())
+                        .paint_at(ui, size.rect());
                 }
                 None => {
                     ui.painter()
@@ -525,6 +567,9 @@ impl Shell {
                 }
             }
             self.handle_input(ui, &resp, rect);
+            if self.debug_ui {
+                self.paint_debug_overlay(ui, rect);
+            }
         });
         let _ = ctx;
     }
@@ -536,7 +581,7 @@ impl Shell {
         };
         // Fit the window as it is now: "Fit" is the user asking for a fresh
         // framing, which is the one moment a resize is allowed to matter.
-        let aspect = self.window_aspect();
+        let aspect = self.viewport_aspect();
         self.model.set_aspect(aspect);
         self.orbit = Some(Orbit::from_camera(&crate::scene::fit_camera(
             &crate::scene::BBox {
@@ -549,13 +594,33 @@ impl Shell {
         self.window.request_redraw();
     }
 
-    /// The viewport's `width / height`, from the window's real size.
-    fn window_aspect(&self) -> f64 {
-        let s = self.window.inner_size();
-        if s.height == 0 {
-            return 16.0 / 9.0;
+    /// Record the laid-out viewport and, when its texel size changed, tell the
+    /// render thread to render at exactly that.
+    ///
+    /// This is the join that was missing: the render size used to come from
+    /// `window.inner_size()` (the whole window, including the title bar and the
+    /// panels' height) while the image was painted into the viewport rect. The rect
+    /// is smaller than the window and has a different aspect, so the frame was
+    /// resampled into it — the city reduced to a magnified corner. Now both sides
+    /// read `ViewportSize`: one rect, one scale, one texel size.
+    fn publish_viewport(&mut self, size: crate::viewport::ViewportSize) {
+        if size.texels() == self.viewport.texels() {
+            self.viewport = size;
+            return;
         }
-        f64::from(s.width) / f64::from(s.height)
+        self.viewport = size;
+        let (w, h) = size.texels();
+        self.render.send(RenderCommand::Resize {
+            width: w,
+            height: h,
+        });
+    }
+
+    /// The aspect the camera is fitted to: the **viewport rect's**, not the
+    /// window's. The rect is what the picture is drawn into, so it is the shape the
+    /// frame must be framed for.
+    fn viewport_aspect(&self) -> f64 {
+        self.viewport.aspect()
     }
 
     /// Pointer input over the viewport: orbit, pan, zoom, pick, and the gizmo.
@@ -755,6 +820,65 @@ impl Shell {
         }
     }
 
+    /// Draw the `--debug-ui` overlay in the viewport's top-left corner.
+    ///
+    /// Plain shapes and text, no widgets: it must not take clicks from the
+    /// viewport, and it must be readable in a screenshot. The text comes from
+    /// [`crate::viewport::OverlayReport::lines`] so what a test asserts and what a
+    /// screenshot shows are the same strings.
+    fn paint_debug_overlay(&self, ui: &egui::Ui, rect: egui::Rect) {
+        let vp = self.viewport;
+        let frame_texels = self
+            .frame
+            .as_ref()
+            .map(|(f, _)| (f.width, f.height))
+            .unwrap_or((0, 0));
+        let orbit = self.orbit;
+        let report = crate::viewport::OverlayReport {
+            pixels_per_point: vp.pixels_per_point(),
+            rect_points: (vp.rect().width(), vp.rect().height()),
+            viewport_texels: vp.texels(),
+            frame_texels,
+            texels_match: frame_texels.0 > 0 && vp.is_pixel_exact(frame_texels),
+            frames_received: self.frames_received,
+            // Only one texture is ever on screen, so the frame in hand is the one
+            // drawn this pass `drain_frames` ran before `paint`.
+            frames_shown: self.frames_received,
+            orbit_distance: orbit.map_or(0.0, |o| o.distance),
+            orbit_target: orbit.map_or([0.0; 3], |o| o.target),
+        };
+        let lines = report.lines();
+        let font = egui::FontId::monospace(12.0);
+        let pad = 6.0;
+        let painter = ui.painter().clone();
+        let galleys: Vec<_> = lines
+            .iter()
+            .map(|l| painter.layout_no_wrap(l.clone(), font.clone(), egui::Color32::WHITE))
+            .collect();
+        let line_h = galleys.first().map(|g| g.size().y).unwrap_or(14.0).max(1.0) + 2.0;
+        let width = galleys.iter().map(|g| g.size().x).fold(0.0f32, f32::max) + pad * 2.0;
+        let height = line_h * lines.len() as f32 + pad * 2.0;
+        let bg =
+            egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), egui::vec2(width, height));
+        painter.rect_filled(bg, 3.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190));
+        for (i, line) in lines.iter().enumerate() {
+            // `1:1 NO` and `fresh NO` are failures: colour them so a screenshot
+            // cannot be mistaken for a healthy one.
+            let colour = if line.contains("NO") {
+                egui::Color32::from_rgb(255, 120, 120)
+            } else {
+                egui::Color32::from_rgb(200, 240, 200)
+            };
+            painter.text(
+                bg.min + egui::vec2(pad, pad + line_h * i as f32),
+                egui::Align2::LEFT_TOP,
+                line.clone(),
+                font.clone(),
+                colour,
+            );
+        }
+    }
+
     /// Send the drag's newest **local** translation (throttled samples, and the
     /// final one which is never throttled away).
     fn flush_opinion(&mut self, final_sample: bool) {
@@ -900,14 +1024,14 @@ impl ApplicationHandler<AppEvent> for App {
                 return;
             }
             WindowEvent::Resized(size) => {
+                // **No render resize here.** The renderer's framebuffer is the
+                // *viewport rect's* device pixels, not the window's — the rect is
+                // smaller (the status bar and controls take their height) and has a
+                // different aspect. Sizing it from the window here was the second
+                // source of the size, and it is what made a correctly framed frame
+                // land in the wrong shape. The next layout pass publishes the right
+                // size through `Shell::publish_viewport`.
                 if size.width > 0 && size.height > 0 {
-                    // winit reports a physical size here (as `inner_size` does), so
-                    // this keeps the render viewport in the same space the texture is
-                    // painted from. No `pixels_per_point` conversion belongs here.
-                    shell.render.send(RenderCommand::Resize {
-                        width: size.width,
-                        height: size.height,
-                    });
                     shell.window.request_redraw();
                 }
                 return;

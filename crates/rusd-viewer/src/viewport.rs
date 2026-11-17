@@ -1,196 +1,386 @@
-//! Where the render thread's frame goes on screen, as pure arithmetic.
+//! The viewport's size, in **one** place.
 //!
-//! The viewport is the one widget whose **content is a texture of a fixed texel
-//! size** rather than something egui lays out, so it is the one place where a
-//! coordinate-space slip shows up as a picture that is the wrong size in the wrong
-//! corner instead of as a layout that looks slightly off. The rule is:
+//! The window kept showing the city as a cropped corner of itself because the
+//! viewport's size had four independent sources that disagreed:
 //!
-//! - **the image covers the allocated rect exactly** — one texel of the frame per
-//!   one *pixel* of the window, never scaled and never anchored anywhere but the
-//!   rect's top-left;
-//! - **the UV rectangle is the whole texture** — `(0,0)` to `(1,1)`, so no part of
-//!   the frame is cropped and no wrapping is reached.
+//! | what | where it came from | value on the machine that showed the bug |
+//! | --- | --- | --- |
+//! | the rect egui allocates for the viewport | the layout, in **points** | 1280 × 670 |
+//! | the render thread's framebuffer | `window.inner_size()`, **physical px** | 2240 × 1260 |
+//! | the aspect the camera was fitted at | `window.inner_size()` (`1.777`) | ≠ the rect's `1.910` |
+//! | the image's paint rect | the frame's texel count, read as points | 2240 × 1260 "points" |
 //!
-//! Both are computed here, as values, so a test can assert them without a GPU and
-//! the widget code cannot quietly pass a different rect (or a different UV) than
-//! the one this function describes.
+//! Every pair of those is a different number, so the picture was rendered at one
+//! aspect, stretched into a rect of another, and finally drawn at a texel-derived
+//! size — which lands on screen as the top-left `1 / pixels_per_point` of the frame,
+//! magnified (57% at the 1.75 scale factor that exposed it).
 //!
-//! # Why the frame is drawn at the rect's *point* size
+//! [`ViewportSize`] is the fix: one struct that carries the rect's **point** size,
+//! the `pixels_per_point` it is laid out at, and the **texel** size derived from
+//! them — and nothing else may invent a size. The rules it enforces:
 //!
-//! egui positions and sizes everything in **points**, and the painter multiplies by
-//! `pixels_per_point` on the way to the GPU. The frame arrives in **texels** — the
-//! render thread's viewport is a real pixel buffer of `window.inner_size()`. At
-//! `pixels_per_point = 1.0` the two coincide; at 1.25 or 2.0 they do not, and that
-//! is the only way a "full frame" can end up looking like it was magnified from the
-//! top-left: the image was painted into a rect of the wrong *point* size for its
-//! texel size, so the sampler stretched it. [`viewport_image`] therefore derives the
-//! paint rect from the texel size and the current `pixels_per_point`, and
-//! [`texel_scale`] reports the ratio so a mismatch is visible rather than silent.
+//! - `texels == rect × pixels_per_point`, rounded once, so the renderer's framebuffer
+//!   is exactly the device-pixel area the rect covers;
+//! - [`ViewportSize::aspect`] is the **rect's** aspect (not the window's), so the
+//!   camera is fitted to the shape it will actually be drawn into;
+//! - the paint rect is [`ViewportSize::rect`], so the image covers it exactly;
+//! - **`pixels_per_point` never reaches the camera.** It is a property of the
+//!   display, not of the scene; the only place it is allowed to multiply anything is
+//!   `texels`, here.
 
 use egui::emath::GuiRounding as _;
 use egui::{Pos2, Rect, Vec2};
 
-/// The rect a frame of `frame_texels` is painted into inside `viewport`, given the
-/// UI's `pixels_per_point`.
-///
-/// `viewport` is the rect egui allocated for the viewport in **points**. The result
-/// is that same rect: the frame fills it corner to corner. `frame_texels` and
-/// `pixels_per_point` are taken so the caller cannot accidentally pass a rect
-/// derived from the frame's texel count (which is what a "draw the buffer at its
-/// own size" mistake looks like), and so any future letterboxing decision has one
-/// place to live.
-pub fn viewport_image(viewport: Rect, frame_texels: (u32, u32), pixels_per_point: f32) -> Rect {
-    debug_assert!(
-        frame_texels.0 > 0 && frame_texels.1 > 0,
-        "a zero-sized frame has no image to paint"
-    );
-    debug_assert!(pixels_per_point > 0.0, "pixels_per_point must be positive");
-    // The frame fills the viewport exactly — and on the **pixel grid**: egui's
-    // `paint_at` rounds the rect it is given to whole device pixels
-    // (`Rect::round_to_pixels`), so a rect left at a fractional point position
-    // (y = 20.2 at ppp 1.25) would be painted at the rounded position while the
-    // layout still reports the fractional one. Rounding here makes the two agree,
-    // and an image that is off by a fraction of a pixel is what leaves a seam
-    // between the panels and the viewport.
-    viewport.round_to_pixels(pixels_per_point)
-}
-
-/// The UV rectangle: the whole texture, `(0,0)` top-left to `(1,1)` bottom-right.
-///
-/// A constant, expressed as a function so every caller (and the test) asks the same
-/// place rather than writing `Rect::from_min_max(pos2(0,0), pos2(1,1))` again — the
-/// one form that is easy to get subtly wrong (`Rect::ZERO` even means "no texture").
-pub fn viewport_uv() -> Rect {
-    Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(1.0, 1.0))
-}
-
-/// The physical pixel size the render thread should render at so the frame is 1:1
-/// with the window.
-///
-/// The UI is in points and the window's surface is in physical pixels; a frame
-/// rendered at the *point* size (or at a stale size) is then resampled by the
-/// sampler to the rect's physical size — which is precisely "magnified, anchored at
-/// the top-left" when the frame is smaller than the window. Multiplying here keeps
-/// the render size and the paint rect in the same space.
-pub fn render_texel_size(window_points: Vec2, pixels_per_point: f32) -> (u32, u32) {
-    let ppp = pixels_per_point.max(0.1);
-    let w = (window_points.x * ppp).round().max(1.0) as u32;
-    let h = (window_points.y * ppp).round().max(1.0) as u32;
-    (w, h)
-}
-
-/// How much the sampler must scale a `frame_texels` image to fill a `viewport` of
-/// `viewport_points` at `pixels_per_point`: `(1,1)` means one texel per device
-/// pixel, i.e. a pixel-exact blit.
-///
-/// The test asserts this is `(1,1)`, which is what "1:1 铺满" means in numbers.
-pub fn texel_scale(
-    viewport_points: Vec2,
-    frame_texels: (u32, u32),
+/// The viewport's geometry: the single source of truth for every size the client
+/// uses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ViewportSize {
+    /// The rect egui allocated for the viewport, in **points**, on the pixel grid.
+    rect: Rect,
+    /// The display scale the rect is laid out at.
     pixels_per_point: f32,
-) -> (f32, f32) {
-    if frame_texels.0 == 0 || frame_texels.1 == 0 {
-        return (f32::INFINITY, f32::INFINITY);
+    /// The framebuffer size, in **texels** (`rect · pixels_per_point`).
+    texels: (u32, u32),
+}
+
+impl ViewportSize {
+    /// The viewport layout for a rect allocated at `pixels_per_point`.
+    ///
+    /// `rect` is snapped to the pixel grid, and the texel size is derived from the
+    /// snapped rect — so a fractional point position (y = 20.2 at a 1.25 scale)
+    /// cannot leave the framebuffer a pixel short of the area it is drawn into.
+    pub fn new(rect: Rect, pixels_per_point: f32) -> Self {
+        let ppp = if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+            pixels_per_point
+        } else {
+            1.0
+        };
+        let rect = rect.round_to_pixels(ppp);
+        let texels = (
+            (rect.width() * ppp).round().max(1.0) as u32,
+            (rect.height() * ppp).round().max(1.0) as u32,
+        );
+        Self {
+            rect,
+            pixels_per_point: ppp,
+            texels,
+        }
     }
-    // Device pixels the image is asked to cover, over its own texel count.
-    let device_w = viewport_points.x * pixels_per_point;
-    let device_h = viewport_points.y * pixels_per_point;
-    (
-        device_w / frame_texels.0 as f32,
-        device_h / frame_texels.1 as f32,
+
+    /// The rect to allocate and to paint the frame into, in points.
+    pub fn rect(&self) -> Rect {
+        self.rect
+    }
+
+    /// The display scale the rect is laid out at.
+    pub fn pixels_per_point(&self) -> f32 {
+        self.pixels_per_point
+    }
+
+    /// The framebuffer size the render thread must use, in texels.
+    pub fn texels(&self) -> (u32, u32) {
+        self.texels
+    }
+
+    /// `width / height` of the **rect** — what the camera is fitted to, because it
+    /// is the shape the picture is drawn into. Not the window's aspect: the status
+    /// bar and the controls take their height out of the window first, so the two
+    /// differ whenever the window is not exactly the panels' shape.
+    pub fn aspect(&self) -> f64 {
+        let s = self.rect.size();
+        if s.y <= 0.0 {
+            return 16.0 / 9.0;
+        }
+        f64::from(s.x) / f64::from(s.y)
+    }
+
+    /// The UV rectangle to paint with: the whole texture, `(0,0)`–`(1,1)`.
+    pub fn uv(&self) -> Rect {
+        Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
+    }
+
+    /// How much the sampler must scale a `frame_texels` image to cover the rect:
+    /// `(1, 1)` is a pixel-exact blit, which is what this type exists to arrange.
+    pub fn texel_scale(&self, frame_texels: (u32, u32)) -> (f32, f32) {
+        if frame_texels.0 == 0 || frame_texels.1 == 0 {
+            return (f32::INFINITY, f32::INFINITY);
+        }
+        (
+            self.texels.0 as f32 / frame_texels.0 as f32,
+            self.texels.1 as f32 / frame_texels.1 as f32,
+        )
+    }
+
+    /// Whether a frame of `frame_texels` covers this rect exactly — the check a
+    /// debug overlay reports and a test asserts.
+    pub fn is_pixel_exact(&self, frame_texels: (u32, u32)) -> bool {
+        let (sx, sy) = self.texel_scale(frame_texels);
+        (sx - 1.0).abs() <= 1.0 / self.texels.0 as f32
+            && (sy - 1.0).abs() <= 1.0 / self.texels.1 as f32
+    }
+}
+
+/// A viewport whose size is known only as a **window** size, for the frames before
+/// the first layout and for tests: the rect is taken as the whole window.
+///
+/// This is the one place a window size is allowed to stand in for a rect, and it
+/// exists only because the render thread must be started before egui has laid out
+/// anything. The first real layout replaces it (`Shell::sync_viewport`).
+pub fn whole_window(window_points: Vec2, pixels_per_point: f32) -> ViewportSize {
+    ViewportSize::new(
+        Rect::from_min_size(Pos2::ZERO, window_points),
+        pixels_per_point,
     )
+}
+
+/// What the `--debug-ui` overlay reports, as data so a test can assert it and a
+/// screenshot can be read without a second probe.
+///
+/// Three rounds of guessing about sizes and frame freshness ended in screenshots; this
+/// is the answer to the questions those rounds kept posing: what scale is the UI at,
+/// how big is the rect, how big is the frame, are they the same size, and is the frame
+/// on screen the latest one. If `fresh` is false the window is showing an older frame,
+/// and `texels_match` says whether the picture is being resampled.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OverlayReport {
+    pub pixels_per_point: f32,
+    pub rect_points: (f32, f32),
+    pub viewport_texels: (u32, u32),
+    pub frame_texels: (u32, u32),
+    /// Whether the frame on screen has the viewport's texel size (a 1:1 blit).
+    pub texels_match: bool,
+    /// Frames the render thread has delivered, and how many have been shown.
+    pub frames_received: u64,
+    pub frames_shown: u64,
+    /// The camera the viewport is drawn with.
+    pub orbit_distance: f64,
+    pub orbit_target: [f64; 3],
+}
+
+impl OverlayReport {
+    /// Whether the frame on screen is the latest one delivered.
+    pub fn fresh(&self) -> bool {
+        self.frames_shown >= self.frames_received
+    }
+
+    /// The overlay's lines, one per fact. Kept as text here so the same strings a
+    /// screenshot shows are what a test asserts.
+    pub fn lines(&self) -> Vec<String> {
+        vec![
+            format!("ppp {:.2}", self.pixels_per_point),
+            format!(
+                "rect {:.0}x{:.0} pt (aspect {:.3})",
+                self.rect_points.0,
+                self.rect_points.1,
+                if self.rect_points.1 > 0.0 {
+                    self.rect_points.0 / self.rect_points.1
+                } else {
+                    0.0
+                }
+            ),
+            format!(
+                "viewport tex {}x{} · frame tex {}x{} · 1:1 {}",
+                self.viewport_texels.0,
+                self.viewport_texels.1,
+                self.frame_texels.0,
+                self.frame_texels.1,
+                if self.texels_match { "yes" } else { "NO" }
+            ),
+            format!(
+                "frames {} received / {} shown · fresh {}",
+                self.frames_received,
+                self.frames_shown,
+                if self.fresh() { "yes" } else { "NO" }
+            ),
+            format!(
+                "orbit dist {:.1} target ({:.1}, {:.1}, {:.1})",
+                self.orbit_distance,
+                self.orbit_target[0],
+                self.orbit_target[1],
+                self.orbit_target[2]
+            ),
+        ]
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const SIZES: [(f32, f32); 3] = [(1100.0, 620.0), (900.0, 900.0), (1375.0, 800.0)];
+    /// The machine that showed the bug: 1.75 scale, a 1280×720 window, and the
+    /// viewport rect 1280×670 points (the status bar and controls take 50).
+    const BUG_CASE: (f32, Vec2) = (1.75, egui::vec2(1280.0, 670.0));
 
     #[test]
-    fn the_image_rect_is_the_allocated_rect_at_every_pixels_per_point() {
-        for (w, h) in SIZES {
-            for ppp in [1.0f32, 1.25, 1.5, 2.0] {
-                let viewport = Rect::from_min_size(Pos2::new(0.0, 22.0), Vec2::new(w, h));
-                // The frame is the window's physical pixels — the case that must be
-                // 1:1.
-                let texels = render_texel_size(Vec2::new(w, h), ppp);
-                let image = viewport_image(viewport, texels, ppp);
-                // The rect is the viewport's own rect, snapped to the pixel grid (a
-                // whole device pixel's worth of slack, expressed in points).
-                let slack = 1.0 / ppp + 1e-3;
-                assert!(
-                    (image.min - viewport.min).length() <= slack
-                        && (image.max - viewport.max).length() <= slack,
-                    "ppp {ppp}: the image must cover the viewport, not a rect derived \
-                     from the frame's texel count (image {image:?}, viewport {viewport:?})"
-                );
-                assert_eq!(
-                    viewport_uv(),
-                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0))
-                );
-            }
-        }
+    fn the_overlay_says_whether_the_frame_on_screen_is_fresh() {
+        let mut r = OverlayReport {
+            pixels_per_point: 1.75,
+            rect_points: (1280.0, 670.0),
+            viewport_texels: (2240, 1173),
+            frame_texels: (2240, 1173),
+            texels_match: true,
+            frames_received: 7,
+            frames_shown: 7,
+            orbit_distance: 1287.0,
+            orbit_target: [116.9, 116.3, 25.0],
+        };
+        assert!(r.fresh(), "shown == received is fresh");
+        let lines = r.lines().join(" | ");
+        assert!(lines.contains("ppp 1.75"), "{lines}");
+        assert!(lines.contains("rect 1280x670 pt"), "{lines}");
+        assert!(lines.contains("1:1 yes"), "{lines}");
+        assert!(lines.contains("fresh yes"), "{lines}");
+
+        // A frame that has not reached the screen yet: the overlay must say "NO"
+        // in both places that would let a screenshot be misread.
+        r.frames_received = 8;
+        r.frame_texels = (2240, 1260);
+        r.texels_match = false;
+        assert!(!r.fresh());
+        let lines = r.lines().join(" | ");
+        assert!(lines.contains("1:1 NO"), "{lines}");
+        assert!(lines.contains("fresh NO"), "{lines}");
+        assert!(lines.contains("8 received / 7 shown"), "{lines}");
     }
 
     #[test]
-    fn the_texture_is_whole_and_not_wrapped() {
-        let uv = viewport_uv();
-        assert_eq!(uv.min, Pos2::ZERO, "UV starts at the texture's top-left");
-        assert_eq!(uv.max, Pos2::new(1.0, 1.0), "and ends at its bottom-right");
-        assert_ne!(uv, Rect::ZERO, "Rect::ZERO would mean 'no texture at all'");
+    fn the_overlay_reports_the_bug_case_as_both_wrong() {
+        // The numbers the parent's probe logged: a 2240x1260 frame in a 1280x670 pt
+        // rect at 1.75 — not 1:1, and (before the fix) not fresh either.
+        let vp = whole_window(egui::vec2(1280.0, 670.0), 1.75);
+        let report = OverlayReport {
+            pixels_per_point: vp.pixels_per_point(),
+            rect_points: (vp.rect().width(), vp.rect().height()),
+            viewport_texels: vp.texels(),
+            frame_texels: (2240, 1260),
+            texels_match: vp.is_pixel_exact((2240, 1260)),
+            frames_received: 2,
+            frames_shown: 1,
+            orbit_distance: 1287.0,
+            orbit_target: [0.0; 3],
+        };
+        assert!(!report.texels_match, "the window-sized frame is not 1:1");
+        assert!(!report.fresh(), "and it was not the latest frame");
+        let lines = report.lines().join(" | ");
+        assert!(lines.contains("viewport tex 2240x1173"), "{lines}");
+        assert!(lines.contains("frame tex 2240x1260"), "{lines}");
     }
 
     #[test]
-    fn the_render_size_is_the_window_in_physical_pixels() {
-        // The render thread's viewport must be the window's *device* pixels, or the
-        // sampler stretches the frame — the "2× from the top-left" picture.
+    fn texels_are_the_rect_times_the_scale_never_the_window() {
+        let (ppp, rect_pts) = BUG_CASE;
+        let vp = whole_window(rect_pts, ppp);
+        // The rect's own device pixels, which is what the renderer must produce. The
+        // height is the *snapped* rect's (the grid rounds a fractional point edge),
+        // so it is derived rather than written down.
+        let (tw, th) = vp.texels();
+        assert_eq!(tw, 2240, "1280 pt at 1.75");
         assert_eq!(
-            render_texel_size(Vec2::new(1100.0, 620.0), 1.0),
-            (1100, 620)
+            th,
+            (vp.rect().height() * ppp).round() as u32,
+            "670 pt, snapped, at 1.75"
         );
-        assert_eq!(
-            render_texel_size(Vec2::new(1100.0, 620.0), 1.25),
-            (1375, 775)
+        // The window's inner size would have given 2240x1260 — the bug.
+        let window = whole_window(egui::vec2(1280.0, 720.0), ppp);
+        assert_eq!(window.texels(), (2240, 1260));
+        assert_ne!(
+            vp.texels(),
+            window.texels(),
+            "the rect and the window are different sizes; the rect must win"
         );
-        assert_eq!(
-            render_texel_size(Vec2::new(1100.0, 620.0), 2.0),
-            (2200, 1240)
-        );
-        // Never zero, whatever the window does.
-        assert_eq!(render_texel_size(Vec2::ZERO, 1.0), (1, 1));
     }
 
     #[test]
-    fn a_frame_at_the_windows_physical_size_is_a_pixel_exact_blit() {
-        for (w, h) in SIZES {
-            for ppp in [1.0f32, 1.25, 1.5, 2.0] {
-                let points = Vec2::new(w, h);
-                let texels = render_texel_size(points, ppp);
-                let (sx, sy) = texel_scale(points, texels, ppp);
-                // The render size is rounded to whole pixels (`round` in
-                // `render_texel_size`), so the ratio is 1 up to that rounding — a
-                // sub-pixel of slack on a 4-digit width, never a visible stretch.
-                let slack = 1.0 / (texels.0 as f32);
-                assert!(
-                    (sx - 1.0).abs() <= slack && (sy - 1.0).abs() <= slack,
-                    "ppp {ppp}: one texel must be one device pixel ({sx}, {sy})"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_frame_rendered_at_the_point_size_is_detectably_stretched() {
-        // The mistake this module exists to prevent: render at the window's *point*
-        // size while the surface is `ppp` times bigger. The sampler then blows the
-        // image up, and `texel_scale` names the factor instead of hiding it.
-        let points = Vec2::new(1100.0, 620.0);
-        let wrong = (1100, 620);
-        let (sx, _sy) = texel_scale(points, wrong, 2.0);
+    fn the_fit_aspect_is_the_rects_not_the_windows() {
+        let (ppp, rect_pts) = BUG_CASE;
+        let vp = whole_window(rect_pts, ppp);
+        // The stored rect is snapped to the pixel grid, so the aspect is that rect's
+        // — not the un-snapped input's, which is off by a fraction of a device pixel.
+        let snapped = vp.rect().width() / vp.rect().height();
+        // `aspect()` divides in f64 from the rect's f32 sizes, so the two agree to
+        // f32 precision — not to the last bit of an f64.
         assert!(
-            (sx - 2.0).abs() < 1e-6,
-            "a point-sized frame on a 2x surface is stretched 2x (got {sx})"
+            (vp.aspect() - f64::from(snapped)).abs() < 1e-6,
+            "aspect {} vs rect's {snapped}",
+            vp.aspect()
         );
+        assert!(
+            (vp.aspect() - 1280.0 / 670.0).abs() < 1e-2,
+            "the rect's aspect, 1.910 up to the pixel grid: {}",
+            vp.aspect()
+        );
+        let window = whole_window(egui::vec2(1280.0, 720.0), ppp);
+        assert!(
+            (window.aspect() - 1280.0 / 720.0).abs() < 1e-2,
+            "window aspect 1.778"
+        );
+        assert!(
+            (vp.aspect() - window.aspect()).abs() > 0.1,
+            "the two aspects are far apart: fitting to the window is the bug"
+        );
+    }
+
+    #[test]
+    fn a_frame_of_the_viewport_size_is_a_pixel_exact_blit() {
+        for ppp in [1.0f32, 1.25, 1.75, 2.0] {
+            for rect_pts in [
+                egui::vec2(1280.0, 670.0),
+                egui::vec2(1100.0, 620.0),
+                egui::vec2(900.0, 880.0),
+            ] {
+                let vp = whole_window(rect_pts, ppp);
+                assert!(
+                    vp.is_pixel_exact(vp.texels()),
+                    "ppp {ppp}, rect {rect_pts:?}: a frame of the viewport's own texel \
+                     size must be 1:1, scale {:?}",
+                    vp.texel_scale(vp.texels())
+                );
+                assert_eq!(vp.texel_scale(vp.texels()), (1.0, 1.0));
+            }
+        }
+    }
+
+    #[test]
+    fn a_frame_rendered_from_the_window_size_is_detectably_stretched() {
+        // The bug's arithmetic: a 2240x1260 frame (window-sized) into a 1280x670 pt
+        // rect at 1.75 covers 2240x1173 device pixels, so the sampler squeezes it
+        // vertically — and the aspect is wrong so the picture is not even the right
+        // shape.
+        let vp = whole_window(egui::vec2(1280.0, 670.0), 1.75);
+        let (_, th) = vp.texels();
+        let (sx, sy) = vp.texel_scale((2240, 1260));
+        assert!(
+            (sx - 1.0).abs() < 1e-6,
+            "same width, so no horizontal stretch"
+        );
+        assert!(
+            (sy - th as f32 / 1260.0).abs() < 1e-3,
+            "the frame is squeezed vertically instead of blitted: {sy}"
+        );
+        assert!(!vp.is_pixel_exact((2240, 1260)));
+    }
+
+    #[test]
+    fn the_paint_rect_is_the_layout_rect_and_the_uv_is_whole() {
+        for ppp in [1.0f32, 1.25, 1.75, 2.0] {
+            let layout = Rect::from_min_size(egui::pos2(0.0, 25.0), egui::vec2(1280.0, 670.0));
+            let vp = ViewportSize::new(layout, ppp);
+            // The rect the widget allocates and the rect it paints must be one rect.
+            assert_eq!(vp.rect(), layout.round_to_pixels(ppp));
+            // And no tolerance here: small differences at the corners are the seam.
+            assert_eq!(vp.uv(), Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)));
+        }
+    }
+
+    #[test]
+    fn a_zero_or_nonsense_scale_falls_back_to_one() {
+        for bad in [0.0f32, -1.0, f32::NAN, f32::INFINITY] {
+            let vp = ViewportSize::new(
+                Rect::from_min_size(Pos2::ZERO, egui::vec2(100.0, 50.0)),
+                bad,
+            );
+            assert_eq!(vp.pixels_per_point(), 1.0, "scale {bad} is not usable");
+            assert_eq!(vp.texels(), (100, 50));
+        }
     }
 }
