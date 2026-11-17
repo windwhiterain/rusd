@@ -173,9 +173,17 @@ pub struct ClientModel {
     ///
     /// A snapshot is composed once and used for as long as the scene stands, so
     /// the fit needs the aspect at that moment; a later resize does **not** refit
-    /// (the user's orbit wins — `docs/REMOTE.md`'s "相机归 client"), but a new
-    /// snapshot fits to whatever the window is then.
+    /// (the user's orbit wins — `docs/REMOTE.md`'s "相机归 client"); the **first**
+    /// scene of a connection always fits, at the window's aspect then (see
+    /// `ClientModel::apply`).
     pub aspect: f64,
+    /// Whether a scene has been adopted since the last connection, i.e. whether
+    /// the camera is a real fit rather than absent. The first scene after a
+    /// connect replaces the camera; later ones keep the user's.
+    pub framed: bool,
+    /// The scene on screen came from `--usdc`, not from a server: the status bar
+    /// says 离线 rather than claiming a connection it does not have.
+    pub offline: bool,
     /// Each prim's world bbox center in the last scene, so a gizmo drag can start
     /// from where the prim actually is. Sorted (`BTreeMap`), so nothing depends
     /// on a hash order.
@@ -213,8 +221,39 @@ impl ClientModel {
             bbox: None,
             last_reason: None,
             aspect: 16.0 / 9.0,
+            framed: false,
+            offline: false,
             centers: std::collections::BTreeMap::new(),
         }
+    }
+
+    /// The client is connected: `hello` was answered with our protocol and
+    /// `subscribe` was granted.
+    ///
+    /// This is what turns the status line from `connecting` into a live one — the
+    /// app never set it before, so a viewer that had been receiving snapshots for
+    /// minutes still claimed to be connecting. A dropped connection clears it.
+    pub fn mark_live(&mut self) {
+        self.state.protocol = Some(crate::protocol::PROTOCOL);
+        self.state.subscribed = true;
+    }
+
+    /// The connection ended: the status line must stop claiming to be live, and
+    /// the next scene to arrive counts as a fresh first fit.
+    pub fn mark_closed(&mut self) {
+        self.state.subscribed = false;
+        self.framed = false;
+    }
+
+    /// Whether a scene's camera should replace the current orbit: the first one
+    /// of a connection does (that is the fit), later ones do not (the user's
+    /// orbit wins).
+    pub fn wants_first_fit(&mut self) -> bool {
+        if self.framed {
+            return false;
+        }
+        self.framed = true;
+        true
     }
 
     /// Set the aspect a following snapshot will be fitted at. The view calls this
@@ -350,7 +389,41 @@ impl ClientModel {
         self.reload_badge = false;
     }
 
-    /// The status bar's one-line summary.
+    /// The status bar's Chinese summary: the CJK text the font work exists to
+    /// draw, and the line the UI shows.
+    ///
+    /// `已连接 · v8 · 434 prim · 未选中` — connection, snapshot version, prim count,
+    /// selection. The separator is a middle dot rather than `·`'s ASCII cousin so
+    /// the line is visibly one script; every character here is CJK except the
+    /// middots and `v8`, which is what makes it a real test of the font (a tofu
+    /// box would be unmistakable next to the ASCII-only line below).
+    pub fn status_line_zh(&self) -> String {
+        let conn = if self.offline {
+            "离线"
+        } else if self.state.is_live() {
+            "已连接"
+        } else {
+            // Before `subscribe` is granted the viewer is still connecting, whatever
+            // `hello` said.
+            "连接中"
+        };
+        let version = match self.version {
+            Some(v) => format!("v{v}"),
+            None => "无快照".to_owned(),
+        };
+        let prims = format!("{} prim", self.item_count);
+        let sel = match &self.selection {
+            Some(p) => format!("选中 {p}"),
+            None => "未选中".to_owned(),
+        };
+        let mut line = format!("{conn} · {version} · {prims} · {sel}");
+        if let Some(r) = &self.last_reason {
+            line.push_str(&format!(" · {}", reason_zh(r)));
+        }
+        line
+    }
+
+    /// The status bar's one-line summary (ASCII; the logs and the tests read it).
     pub fn status_line(&self) -> String {
         let conn = if self.state.is_live() {
             "live"
@@ -386,6 +459,20 @@ impl Default for ClientModel {
 /// `MadeScene` and the `--usdc` fallback share.
 pub fn extract_fitted(stage: &openusd::usd::Stage) -> SceneGeometry {
     geometry::extract(stage)
+}
+
+/// The Chinese word for a `state_changed` reason.
+fn reason_zh(reason: &str) -> &'static str {
+    match reason {
+        "open" => "已打开",
+        "patch" => "已补丁",
+        "opinion" => "已覆盖",
+        "undo" => "已撤销",
+        "redo" => "已重做",
+        "reload" => "已热重载",
+        // A reason this build does not name: 'update' keeps the line Chinese.
+        _ => "已更新",
+    }
 }
 
 #[cfg(test)]

@@ -31,6 +31,9 @@
 //! - [`fonts`]: system CJK font loading, so Chinese UI text is glyphs and not
 //!   tofu (the built-in egui faces are Latin-only).
 //! - [`window`]: the opening rectangle — 1280×720 centred on the primary monitor.
+//! - [`view`]: the view's own decisions (which scene frames the camera, and how a
+//!   frame's corners are judged), so the window and its tests run one copy of the
+//!   logic instead of two that can drift.
 //! - [`app`]: the winit + egui shell that ties them together (`view`).
 
 pub mod anchor;
@@ -45,6 +48,7 @@ pub mod net;
 pub mod protocol;
 pub mod scene;
 pub mod session;
+pub mod view;
 pub mod window;
 
 use rusd_core::Diagnostic;
