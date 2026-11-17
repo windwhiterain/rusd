@@ -40,6 +40,36 @@ use rusd_scene::geometry::SceneGeometry;
 /// other error code means the connection is over.
 pub const E_WIRE_IDLE: &str = "E_WIRE_IDLE";
 
+/// The code a request returns when its reply did not arrive before the caller's
+/// deadline.
+///
+/// **A timeout is not a broken connection.** The peer may answer the next request
+/// perfectly well, and the notifications it pushes in the meantime are still
+/// wanted, so a caller reports this one request as failed and keeps its socket.
+/// The alternative — parking on the channel until the server speaks — is what
+/// wedged the network thread: with no deadline, one unanswered request stopped it
+/// draining commands *and* stopped every `stage_snapshot` behind it, so the
+/// window had no frame to draw and sat at 0% CPU.
+pub const E_WIRE_TIMEOUT: &str = "E_WIRE_TIMEOUT";
+
+/// How long a greeting (`hello` + `subscribe`) may take before the viewer gives up
+/// on that server.
+///
+/// Longer than a city snapshot's cook-and-flatten (measured ~0.2 s) by a wide
+/// margin, short enough that a server which accepts a connection and then says
+/// nothing ends as one diagnostic instead of a permanently silent client. The
+/// window never waits for this: the greeting runs on the network thread.
+pub const GREETING_DEADLINE: Duration = Duration::from_secs(5);
+
+/// How long one request (`opinion`, `undo`, `composition_tree`, `capture`, …) may
+/// wait for its reply.
+///
+/// A `composition_tree` on city is a structural read of the authority stack; ten
+/// seconds is far beyond it. What matters is that it is **bounded**: the tree panel
+/// already knows how to degrade, and a caller that gets [`E_WIRE_TIMEOUT`] can say
+/// so, while a caller parked on `recv` cannot say anything.
+pub const REPLY_DEADLINE: Duration = Duration::from_secs(10);
+
 /// The synchronous wire client: one connection, one request id counter.
 ///
 /// ## Why a reader thread
@@ -66,19 +96,39 @@ pub struct ProtocolClient {
     early: Vec<Notification>,
     /// The peer address, for messages.
     pub addr: String,
+    /// How long one request's reply is waited for (`REPLY_DEADLINE` unless a test
+    /// shortened it).
+    reply_deadline: Duration,
 }
 
 impl ProtocolClient {
     /// Connect to `addr` (`host:port`) and answer the greeting: `hello`, then
     /// `subscribe`. Returns the client and everything the server said before the
     /// greeting was done (its `hello` reply, and any notification that raced it).
+    ///
+    /// The greeting is bounded by [`GREETING_DEADLINE`]: a peer that accepts the
+    /// connection and then says nothing ends as a diagnostic, not as a client
+    /// parked in `recv` forever.
     pub fn open(addr: &str) -> Result<(Self, Vec<Notification>), Vec<Diagnostic>> {
+        Self::open_within(addr, GREETING_DEADLINE)
+    }
+
+    /// [`ProtocolClient::open`] with the greeting's deadline named outright.
+    ///
+    /// A test uses this to prove that a silent server ends in
+    /// [`E_WIRE_TIMEOUT`] rather than in a hung thread; the viewer passes
+    /// [`GREETING_DEADLINE`].
+    pub fn open_within(
+        addr: &str,
+        deadline: Duration,
+    ) -> Result<(Self, Vec<Notification>), Vec<Diagnostic>> {
+        let deadline_at = std::time::Instant::now() + deadline;
         let sock_addr = addr
             .to_socket_addrs()
             .map_err(|e| vec![diag("E_CONNECT", format!("{addr}: {e}"))])?
             .next()
             .ok_or_else(|| vec![diag("E_CONNECT", format!("{addr}: resolves to no address"))])?;
-        let stream = TcpStream::connect_timeout(&sock_addr, Duration::from_secs(5))
+        let stream = TcpStream::connect_timeout(&sock_addr, deadline)
             .map_err(|e| vec![diag("E_CONNECT", format!("{addr}: {e}"))])?;
         stream
             .set_nodelay(true)
@@ -118,9 +168,10 @@ impl ProtocolClient {
             next_id: 1,
             early: Vec::new(),
             addr: addr.to_owned(),
+            reply_deadline: REPLY_DEADLINE,
         };
         let mut early = Vec::new();
-        let hello = client.call(&protocol::hello_line(1))?;
+        let hello = client.call_within(&protocol::hello_line(1), deadline_at)?;
         match hello.result {
             Ok(result) => {
                 let mut state = protocol::ClientState::default();
@@ -134,7 +185,7 @@ impl ProtocolClient {
             }
         }
         client.next_id = 2;
-        let sub = client.call(&protocol::subscribe_line(2))?;
+        let sub = client.call_within(&protocol::subscribe_line(2), deadline_at)?;
         if let Err(e) = sub.result {
             return Err(vec![diag(
                 "E_WIRE_PROTOCOL",
@@ -147,8 +198,23 @@ impl ProtocolClient {
     }
 
     /// Send one line and wait for the reply to its `id`, keeping any notification
-    /// that arrives first.
+    /// that arrives first. There is no deadline: use [`ProtocolClient::call_within`]
+    /// unless the caller owns a thread it may park forever.
+    #[allow(dead_code)]
     fn call(&mut self, line: &str) -> Result<Call, Vec<Diagnostic>> {
+        self.call_within(line, std::time::Instant::now() + REPLY_DEADLINE)
+    }
+
+    /// Send one line and wait for the reply to its `id` **until `by`**, keeping any
+    /// notification that arrives first.
+    ///
+    /// A reply that does not arrive before `by` returns [`E_WIRE_TIMEOUT`]. The
+    /// connection stays open: the reader thread still holds the socket, and the
+    /// caller keeps its reader, so a late reply is dropped as an unsolicited one
+    /// and the next request works. That is the difference between a server that is
+    /// slow and a client that is wedged, and the network thread must tell them
+    /// apart — it is the thread everything else waits behind.
+    fn call_within(&mut self, line: &str, by: std::time::Instant) -> Result<Call, Vec<Diagnostic>> {
         let id = parse_id(line)
             .ok_or_else(|| vec![diag("E_WIRE", "a request line with no id".to_owned())])?;
         self.writer
@@ -159,19 +225,36 @@ impl ProtocolClient {
             .map_err(|e| vec![diag("E_IO", format!("{}: flush failed: {e}", self.addr))])?;
         let mut early = Vec::new();
         loop {
-            match self.read_wire()? {
+            let left = by.saturating_duration_since(std::time::Instant::now());
+            let wire = match self.read_within(left) {
+                Ok(w) => w,
+                // Nothing arrived before the deadline: this one request failed and
+                // the connection lives on. A read that had time left cannot end
+                // this way, so an idle answer here *is* the timeout.
+                Err(diags) if diags.iter().all(|d| d.code == E_WIRE_IDLE) => {
+                    // **The notifications that did arrive are kept.** A snapshot
+                    // that raced the timed-out request is not the server's reply,
+                    // and throwing it away would make one slow request swallow the
+                    // frame it had already been sent.
+                    self.early.extend(early);
+                    return Err(vec![diag(
+                        E_WIRE_TIMEOUT,
+                        format!("{}: no reply to id {id} in time", self.addr),
+                    )]);
+                }
+                Err(diags) => return Err(diags),
+            };
+            match wire {
                 Wire::Response(r) if r.id == id => {
                     return Ok(Call {
                         result: r.result,
                         early,
                     });
                 }
-                Wire::Response(other) => {
-                    return Err(vec![diag(
-                        "E_WIRE",
-                        format!("expected a reply to id {id}, got a reply to {}", other.id),
-                    )]);
-                }
+                // A reply to a request that has already timed out: its caller is
+                // gone and the connection is not at fault, so it is dropped
+                // rather than reported as a disagreement.
+                Wire::Response(_) => continue,
                 Wire::Notification(n) => early.push(n),
             }
         }
@@ -179,11 +262,14 @@ impl ProtocolClient {
 
     /// Block until one line arrives (a notification or a reply) and parse it.
     ///
-    /// With an idle timeout set ([`ProtocolClient::set_idle_timeout`]) a silent
-    /// server makes this return `Err` with the code [`E_WIRE_IDLE`] instead of
-    /// parking; every other error means the connection is over. `read_line` keeps a
-    /// half-read line in its buffer across the timeout, so nothing is lost when the
-    /// line arrives late.
+    /// **This has no deadline and a caller on a thread others wait behind must not
+    /// use it.** A request uses [`ProtocolClient::call_within`], which reads with a
+    /// time limit; the network thread's idle read uses
+    /// [`ProtocolClient::read_within`]. Only a test that owns its thread can park
+    /// here forever. A silent server makes `read_within` return [`E_WIRE_IDLE`]
+    /// instead; every other error means the connection is over. A half-read line
+    /// stays in the reader thread's buffer across a timeout, so nothing is lost when
+    /// the line arrives late.
     pub fn read_wire(&mut self) -> Result<Wire, Vec<Diagnostic>> {
         match self.lines.recv() {
             Ok(Ok(line)) => {
@@ -228,7 +314,7 @@ impl ProtocolClient {
     /// follows the server's own re-composition, and the caller renders that.
     pub fn opinion(&mut self, ops: &[OpinionOp]) -> Result<Response, Vec<Diagnostic>> {
         let line = protocol::opinion_line(self.next_id, ops);
-        let Call { result, .. } = self.call(&line)?;
+        let Call { result, .. } = self.call_within(&line, self.reply_deadline())?;
         self.next_id += 1;
         Ok(Response {
             id: self.next_id - 1,
@@ -239,12 +325,20 @@ impl ProtocolClient {
     /// Send `undo` or `redo`.
     pub fn edit(&mut self, redo: bool) -> Result<Response, Vec<Diagnostic>> {
         let line = protocol::edit_line(self.next_id, redo);
-        let Call { result, .. } = self.call(&line)?;
+        let Call { result, .. } = self.call_within(&line, self.reply_deadline())?;
         self.next_id += 1;
         Ok(Response {
             id: self.next_id - 1,
             result,
         })
+    }
+
+    /// The deadline a request's reply is given: [`REPLY_DEADLINE`] from now.
+    ///
+    /// One place, so every request a caller sends has the same bound and a test
+    /// that shortens it changes them all together.
+    fn reply_deadline(&self) -> std::time::Instant {
+        std::time::Instant::now() + self.reply_deadline
     }
 
     /// Send any request and answer with the server's JSON-RPC result or error.
@@ -261,10 +355,19 @@ impl ProtocolClient {
         params: serde_json::Value,
     ) -> Result<Result<serde_json::Value, protocol::RpcError>, Vec<Diagnostic>> {
         let line = protocol::request_line(self.next_id, method, params);
-        let Call { result, early } = self.call(&line)?;
+        let Call { result, early } = self.call_within(&line, self.reply_deadline())?;
         self.next_id += 1;
         self.early.extend(early);
         Ok(result)
+    }
+
+    /// Shorten (or lengthen) how long a request's reply is waited for.
+    ///
+    /// A test uses a few hundred milliseconds to prove that a server which never
+    /// answers ends its request as [`E_WIRE_TIMEOUT`]; the viewer keeps the
+    /// default `REPLY_DEADLINE`.
+    pub fn set_reply_deadline(&mut self, deadline: Duration) {
+        self.reply_deadline = deadline;
     }
 
     /// Take any notification that arrived while a [`ProtocolClient::request`] was
@@ -282,6 +385,16 @@ struct Call {
 fn parse_id(line: &str) -> Option<u64> {
     let v: serde_json::Value = serde_json::from_str(line.trim_end()).ok()?;
     v.get("id").and_then(serde_json::Value::as_u64)
+}
+
+/// Every diagnostic's `code: message`, joined — what a [`NetEvent::Reply`] carries
+/// when the failure was this side's (a timeout has no server message of its own).
+fn join_codes(diags: &[Diagnostic]) -> String {
+    diags
+        .iter()
+        .map(|d| format!("{}: {}", d.code, d.message))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// A transfer of whole objects where only the newest matters: a frame that
@@ -446,11 +559,33 @@ impl NetWorker {
                                 Ok(result) => {
                                     let _ = ev_tx.send(NetEvent::Reply { tag, result });
                                 }
+                                // **A request that timed out is not a dead
+                                // connection.** The reader thread still holds the
+                                // socket and notifications are still arriving, so
+                                // the request is reported as failed under its tag
+                                // and the loop goes on. Ending the connection here
+                                // is what left the window with no stream at all
+                                // after one slow `composition_tree`.
+                                Err(diags) if diags.iter().any(|d| d.code == E_WIRE_TIMEOUT) => {
+                                    let _ = ev_tx.send(NetEvent::Reply {
+                                        tag,
+                                        result: Err(protocol::RpcError {
+                                            code: protocol::TIMEOUT_CODE,
+                                            message: join_codes(&diags),
+                                        }),
+                                    });
+                                }
                                 Err(diags) => {
                                     let _ = ev_tx.send(NetEvent::Closed(diags));
                                     wake();
                                     return;
                                 }
+                            }
+                            // A snapshot that raced the request is delivered
+                            // rather than dropped: on a timeout it may be the only
+                            // thing that arrived at all.
+                            for n in client.take_early() {
+                                let _ = ev_tx.send(NetEvent::Notification(n));
                             }
                             continue;
                         }
@@ -473,11 +608,24 @@ impl NetWorker {
                                 )]));
                             }
                         },
+                        Err(diags) if diags.iter().any(|d| d.code == E_WIRE_TIMEOUT) => {
+                            // A gizmo sample or an undo the server did not answer in
+                            // time: say so and keep the connection. The next edit is
+                            // still sendable, and the snapshots the server pushes in
+                            // the meantime are still delivered.
+                            let _ = ev_tx.send(NetEvent::Failed(vec![diag(
+                                E_WIRE_TIMEOUT,
+                                format!("{what}: {}", join_codes(&diags)),
+                            )]));
+                        }
                         Err(diags) => {
                             let _ = ev_tx.send(NetEvent::Closed(diags));
                             wake();
                             return;
                         }
+                    }
+                    for n in client.take_early() {
+                        let _ = ev_tx.send(NetEvent::Notification(n));
                     }
                 }
                 // **Wake before the blocking read.** The events of this batch — a

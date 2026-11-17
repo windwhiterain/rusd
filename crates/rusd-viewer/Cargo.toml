@@ -32,3 +32,6 @@ pollster = "1.0.1"
 [dev-dependencies]
 rusd-proc.workspace = true
 rusd-usd.workspace = true
+# The real `rusd serve` in-process, so `tests/served_startup.rs` checks startup
+# against the server that actually ships rather than against a mock of it.
+rusd-agent.workspace = true

@@ -200,6 +200,15 @@ pub struct RpcError {
     pub message: String,
 }
 
+/// The code a request's failure carries when **this client** gave up waiting for
+/// its reply, rather than the server refusing it.
+///
+/// It is outside JSON-RPC's reserved range on purpose: a panel that degrades on
+/// `-32601 method not found` must not mistake a timeout for a missing method, and
+/// the tree panel reports it as 「服务器未在时限内应答」 instead of 「合成树不可用
+/// （server 版本）」. `tests/startup.rs` asserts both.
+pub const TIMEOUT_CODE: i64 = -32001;
+
 /// A reply to one of this client's requests.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Response {

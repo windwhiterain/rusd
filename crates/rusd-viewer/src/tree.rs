@@ -715,6 +715,16 @@ impl TreeModel {
                     Err(e)
                 }
             },
+            Err((crate::protocol::TIMEOUT_CODE, message)) => {
+                // **A timeout is not a version problem.** The server speaks v1.2 and
+                // simply did not answer in time (a busy cook, a slow ssh tunnel), so
+                // the panel says so and can be retried with 「刷新」 — it must not
+                // claim the method does not exist, which is what a shared failure
+                // arm would say.
+                let text = format!("合成树：服务器未在时限内应答（{message}）");
+                *self = TreeModel::Failed(text.clone());
+                Err(text)
+            }
             Err((METHOD_NOT_FOUND, message)) => {
                 let text = unavailable_text();
                 *self = TreeModel::Unavailable(if message.is_empty() {
