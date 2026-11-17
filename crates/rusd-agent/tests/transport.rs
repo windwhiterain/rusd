@@ -12,6 +12,7 @@ use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use openusd::ar::{Asset, AssetBuffer, ResolvedPath, Resolver, SharedBuffer};
 use openusd::sdf::{self, Layer};
@@ -41,6 +42,43 @@ impl Client {
             writer: stream,
             next_id: 1,
             inbox: VecDeque::new(),
+        }
+    }
+
+    /// Wait at most `budget` for the next notification, reporting how long it
+    /// took. `None` means nothing arrived in time.
+    fn notification_within(&mut self, budget: Duration) -> Option<(Duration, Value)> {
+        let start = Instant::now();
+        loop {
+            if let Some(msg) = self.inbox.pop_front() {
+                if msg.get("id").is_none_or(Value::is_null) {
+                    return Some((start.elapsed(), msg));
+                }
+                self.inbox.push_front(msg);
+                return None;
+            }
+            let remaining = budget.checked_sub(start.elapsed())?;
+            let timeout = Some(remaining.max(Duration::from_millis(1)));
+            self.reader
+                .get_ref()
+                .set_read_timeout(timeout)
+                .expect("set a read timeout");
+            let mut line = String::new();
+            let outcome = self.reader.read_line(&mut line);
+            // The socket keeps the timeout once set: an ordinary blocking read
+            // later must not inherit this budget.
+            self.reader
+                .get_ref()
+                .set_read_timeout(None)
+                .expect("clear the read timeout");
+            match outcome {
+                Ok(0) => return None,
+                Ok(_) => {
+                    let msg: Value = serde_json::from_str(&line).expect("the server writes JSON");
+                    self.inbox.push_back(msg);
+                }
+                Err(_) => return None,
+            }
         }
     }
 
@@ -552,6 +590,14 @@ impl Drop for Scratch {
 
 #[test]
 fn rewriting_the_document_file_publishes_a_reload() {
+    // The reload pipeline is the debounce (200 ms) plus a rebuild + cook +
+    // flatten + usdc write of a 400-prim city: measured at 634 ms and 786 ms on
+    // an unoptimised build (peer, x64), the second a little slower because it
+    // re-grows the block grid. The budget is 2 s, which fails the defect seen in
+    // the field (no reload for many seconds, or none at all) without failing on
+    // a slow machine.
+    const BUDGET: Duration = Duration::from_secs(2);
+
     let scratch = Scratch::new("reload.rusd", CITY);
     let (server, mut client, mut mirror) = subscribed();
     let path = scratch.spec();
@@ -562,22 +608,20 @@ fn rewriting_the_document_file_publishes_a_reload() {
     let v1 = mirror.version;
     let before = mirror.bounds();
 
-    // Rewrite the document on disk exactly as an editor would. The server is
-    // watching the file, so it re-reads, re-cooks and publishes a `reload`.
+    // Rewrite the document on disk the way `perl -i` / `sed -i` save: a temp
+    // file renamed over the original. The server is watching the file, so it
+    // must re-read and publish a `reload` — promptly, and without needing a
+    // second save to notice the first.
     scratch.write(&CITY.replace("blocks_x = 6", "blocks_x = 2"));
-
-    let mut saw_reload = false;
-    for _ in 0..2 {
-        let (snapshot, state) = client.mutation();
-        assert!(mirror.apply(&snapshot), "snapshot {snapshot:?}");
-        let reason = state["reason"].as_str().unwrap_or_default().to_owned();
-        assert_eq!(state["version"].as_u64(), Some(mirror.version));
-        if reason == "reload" {
-            saw_reload = true;
-            break;
-        }
-    }
-    assert!(saw_reload, "the rewrite must publish a reload");
+    let (latency, seen) = reload_with_delay(&mut client, BUDGET)
+        .expect("a rename-style rewrite must publish a reload");
+    assert!(
+        latency <= BUDGET,
+        "the reload took {latency:?}, over the {BUDGET:?} budget"
+    );
+    let (snapshot, state) = split_reload(&seen);
+    assert!(mirror.apply(&snapshot), "snapshot {snapshot:?}");
+    assert_eq!(state["reason"].as_str(), Some("reload"));
     assert_eq!(mirror.version, v1 + 1, "one rewrite, one version");
 
     let after = mirror.bounds();
@@ -587,15 +631,12 @@ fn rewriting_the_document_file_publishes_a_reload() {
     );
     assert!(after.1[0] < before.1[0], "2 blocks is narrower in X");
 
-    // Re-opening the same path keeps the watch: a second rewrite still reloads,
-    // and the first one is not published twice.
+    // The watch survives the rename: a second rewrite triggers a second reload.
     scratch.write(CITY);
-    let (snapshot, state) = loop {
-        let pair = client.mutation();
-        if pair.1["reason"].as_str() == Some("reload") {
-            break pair;
-        }
-    };
+    let (latency2, seen2) =
+        reload_with_delay(&mut client, BUDGET).expect("the second rewrite must reload too");
+    assert!(latency2 <= BUDGET, "the second reload took {latency2:?}");
+    let (snapshot, state) = split_reload(&seen2);
     assert!(mirror.apply(&snapshot));
     assert_eq!(state["version"].as_u64(), Some(v1 + 2));
     let restored = mirror.bounds();
@@ -604,6 +645,41 @@ fn rewriting_the_document_file_publishes_a_reload() {
         "the block grid is back"
     );
     drop(server);
+}
+
+/// The notification lines a reload published, in arrival order.
+struct ReloadMessages {
+    snapshot: Value,
+    state: Value,
+}
+
+fn split_reload(messages: &ReloadMessages) -> (Value, Value) {
+    (messages.snapshot.clone(), messages.state.clone())
+}
+
+/// Wait for a `reload` `state_changed`, reporting how long it took to arrive
+/// and the snapshot + notice it came with.
+fn reload_with_delay(client: &mut Client, budget: Duration) -> Option<(Duration, ReloadMessages)> {
+    let start = Instant::now();
+    let mut snapshot = None;
+    loop {
+        let remaining = budget.checked_sub(start.elapsed())?;
+        let (_took, msg) = client.notification_within(remaining)?;
+        match msg["method"].as_str() {
+            Some("stage_snapshot") => snapshot = Some(msg["params"].clone()),
+            Some("state_changed") if msg["params"]["reason"] == "reload" => {
+                return Some((
+                    start.elapsed(),
+                    ReloadMessages {
+                        snapshot: snapshot?,
+                        state: msg["params"].clone(),
+                    },
+                ));
+            }
+            Some(_) => {}
+            None => return None,
+        }
+    }
 }
 
 #[test]

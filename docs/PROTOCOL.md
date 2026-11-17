@@ -138,6 +138,13 @@ client 见到的版本序列没有空洞——除非它错过了某条通知（�
   `state_changed{reason:"reload"}`。
 - `open` 换到另一个路径 ⇒ 旧监视撤销、新监视建立。文件在保存中途短暂不可读不计错误，
   等下一次事件。
+- **任何一次事件交付都触发重读，包括错误交付**（Windows 后端在事件突发时会用错误
+  形态报缓冲区溢出）。丢掉错误交付就会让 reload 等到下一次保存才发生，这是实测
+  过的故障形态，所以不按 `is_ok()` 过滤。
+- **延迟预算**：从落盘到收到 `state_changed{"reason":"reload"}` 的实测值是
+  **634ms / 786ms**（peer x64，debug 构建，city 475 prim：200ms debounce +
+  重建/cook/flatten/usdc 写）。回归测试以 **2s** 为预算断言。release 构建下管线
+  显著更快，同样的 debounce 仍是主要固定开销。
 - 该监视**不**违反 REMOTE §9 G4：那条说的是 openusd crate **无 stage reload / 无外部变更
   探测**（client 镜像侧的限制），不是禁止 server 侧文件 watch——重载由 server 重读文档 +
   重建 stage 完成，crate 缺口不参与。
