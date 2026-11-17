@@ -5,3 +5,4 @@
 *.log
 python/.venv/
 __pycache__/
+.wt/
