@@ -186,8 +186,11 @@ pub struct Shell {
     last_frame_at: Instant,
     offline_usdc: Option<String>,
 
-    /// The composition-tree panel (`docs/PROTOCOL.md` v1.2).
+    /// The composition-tree panel (`docs/PROTOCOL.md` v1.2/v1.3).
     tree: crate::panel::TreePanel,
+    /// Whether the composition-tree panel is expanded. Collapsing it gives the width
+    /// back to the viewport on the next pass — the same path a drag-resize takes.
+    tree_open: bool,
     /// Whether `composition_tree{}` has been asked for this connection: asked once
     /// when the first snapshot arrives, and again on 「刷新」.
     tree_asked: bool,
@@ -331,6 +334,7 @@ impl Shell {
             offline_usdc: args.usdc.clone(),
             debug_ui: args.debug_ui,
             tree: crate::panel::TreePanel::new(),
+            tree_open: true,
             tree_asked: false,
             capture_armed: false,
             capture_start: None,
@@ -718,18 +722,43 @@ impl Shell {
             });
         });
 
-        egui::Panel::left("composition-tree")
-            .default_size(280.0)
-            .min_size(180.0)
-            .show(root, |ui| {
-                match crate::panel::tree_panel(ui, &self.tree) {
-                    crate::panel::TreeAction::Select(sel) => self.on_tree_select(sel),
-                    crate::panel::TreeAction::Refresh => self.ask_tree(),
-                    crate::panel::TreeAction::None => {}
-                }
-                ui.separator();
-                crate::panel::detail_panel(ui, &self.tree);
-            });
+        // The composition-tree panel: **resizable and collapsible**, and when either
+        // happens the viewport re-derives its rect from `ui.available_size()` on the
+        // next pass — the panels' width is an input to the viewport's size, never a
+        // constant (`tests/panel_layout.rs` pins the partition). A resize does **not**
+        // re-fit the camera (REMOTE §6: the camera is the client's; only the first
+        // scene and the Fit button fit).
+        if self.tree_open {
+            egui::Panel::left("composition-tree")
+                .resizable(true)
+                .default_size(280.0)
+                .min_size(180.0)
+                .show(root, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("⟨ 收起").clicked() {
+                            self.tree_open = false;
+                        }
+                    });
+                    match crate::panel::tree_panel(ui, &self.tree) {
+                        crate::panel::TreeAction::Select(sel) => self.on_tree_select(sel),
+                        crate::panel::TreeAction::Refresh => self.ask_tree(),
+                        crate::panel::TreeAction::None => {}
+                    }
+                    ui.separator();
+                    crate::panel::detail_panel(ui, &self.tree);
+                });
+        } else {
+            // Collapsed: a strip that reopens it. The viewport takes the width back on
+            // the next pass, which is the same path a drag-resize takes.
+            egui::Panel::left("composition-tree-collapsed")
+                .resizable(false)
+                .exact_size(24.0)
+                .show(root, |ui| {
+                    if ui.small_button("⟩").on_hover_text("展开合成树").clicked() {
+                        self.tree_open = true;
+                    }
+                });
+        }
 
         egui::Panel::bottom("controls").show(root, |ui| {
             ui.horizontal(|ui| {
@@ -975,7 +1004,50 @@ impl Shell {
         if sel != before {
             self.status = self.model.status_line();
             self.ask_render();
+            // v1.3: the tree no longer lists prims, so picking one in the viewport
+            // is the way to inspect it — picked path → `prim_nodes[].id` →
+            // `comp_node{id}`. A path the composition report does not describe is
+            // ordinary (a flattened cook output has prims no layer spec authored),
+            // so it is said plainly rather than treated as a failure.
+            if let Some(path) = self.model.selection.clone() {
+                self.inspect_picked(&path);
+            } else {
+                // Clicking the background clears the selection; the detail panel
+                // should stop describing the prim that was there.
+                self.tree.detail = None;
+                self.tree.detail_error = None;
+                self.tree.selection = None;
+            }
             self.window.request_redraw();
+        }
+    }
+
+    /// Inspect the prim the user picked in the viewport: look its `comp_node` id up
+    /// in the composition tree's `prim_nodes`, then ask for its detail.
+    fn inspect_picked(&mut self, path: &str) {
+        match self.tree.model.prim_id(path) {
+            Some(id) => {
+                let id = id.to_owned();
+                self.tree.selection = Some(crate::tree::TreeSelection {
+                    id: id.clone(),
+                    kind: crate::tree::TreeNodeKind::Prim,
+                    prim: Some(path.to_owned()),
+                });
+                self.ask_node(&id);
+            }
+            None => {
+                // No `comp_node` node for this path. Say why, and leave the previous
+                // detail cleared so the panel cannot be read as describing this prim.
+                self.tree.detail = None;
+                self.tree.selection = None;
+                self.tree.detail_error = Some(if self.tree.model.is_unavailable() {
+                    "合成树不可用：无法检视该 prim（server 版本）".to_owned()
+                } else if self.tree.model.ready() {
+                    format!("合成树未列出 {path}（可能来自 cook 展开），无法给出逐层 opinions")
+                } else {
+                    "合成树尚未到达：稍后重试".to_owned()
+                });
+            }
         }
     }
 

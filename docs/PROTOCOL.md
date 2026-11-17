@@ -258,3 +258,37 @@ API 可读，不依赖 pcp 内部），序列化后供 client 画树。Tier B �
   arcs 含 reference 到 prototypes，prim_nodes 的 authored_in 强度序正确；
 - comp_node 四类详情各一测试；overrides 覆盖过的 prim 的 opinions 首条 = session layer；
 - 未知 id -32602。
+
+## v1.3 增补（prim 节点移出树面板；2026-11-17 用户裁定，取代 v1.2 的「prim 节点挂在作者层下」）
+
+**用户裁定：合成树面板不画 prim 节点列表（「太多了没有用」）。**
+
+city 这样的栈有数百个 prim，逐个列进树里既撑爆面板宽度又没人读；用户要的是
+**层与结构**。因此：
+
+### 树面板只画三类行
+
+1. **layers** —— 按 strength 序（session 最强）；
+2. **arcs** —— 作边/命名行指向目标层（cross-layer 的目标层作其叶子行）；
+3. **variant_sets / variants** —— 可展开。
+
+**prim 行不再出现在树里。** `composition_tree` 的 payload 与 server **不动**，
+`prim_nodes` 仍在响应里（其余消费者与 `authored_in` 校验照旧）；只是 client 不渲染它。
+
+### prim 检视的入口改为 viewport 点选
+
+```
+viewport 点选 pick → prim path
+  → 在 composition_tree 的 prim_nodes 里按 path 查 id
+  → comp_node{id}   （详情面板）
+```
+
+- 点选仍自动拷贝 prim path 到剪切板 + toast（v1.1 条款保留）。
+- path 在 `prim_nodes` 里查不到（例如该 prim 来自 cook 的 flatten，或 server 的报告
+  尚未到达）时，详情面板说明这一点，不报错、不崩。
+- 树面板点击仍走 `comp_node{id}`（layer / arc / variant_set 三类），行为不变。
+
+### 理由
+
+面板变窄 ⇒ viewport 可用空间变大；同时把「检视哪个 prim」交给用户实际指着的那一个，
+而不是让人在几百行里找一个 path。

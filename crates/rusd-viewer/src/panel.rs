@@ -403,23 +403,26 @@ mod tests {
     }
 
     #[test]
-    fn a_prim_row_copies_its_path_and_a_layer_row_copies_nothing() {
+    fn no_prim_rows_are_drawn_and_a_layer_row_copies_nothing() {
+        // v1.3 (`docs/PROTOCOL.md` 末节): the panel draws no prim rows — a picked prim
+        // is inspected in the viewport instead. The clipboard rule itself is unchanged
+        // and is covered from the pick side in `tests/tree_v13.rs`.
         let mut panel = TreePanel::new();
         panel.apply_tree(Ok(sample_tree()));
         let rows = rows(&panel);
-        let prim = rows
-            .iter()
-            .find(|(_, n)| n.kind == TreeNodeKind::Prim)
-            .expect("a prim row");
-        assert_eq!(
-            copy_payload(&TreeSelection::of(&prim.1)).as_deref(),
-            Some("/World/Block")
+        assert!(
+            !rows.iter().any(|(_, n)| n.kind == TreeNodeKind::Prim),
+            "the tree panel must not draw prim rows"
         );
         let layer = rows
             .iter()
             .find(|(_, n)| n.kind == TreeNodeKind::Layer)
             .expect("a layer row");
-        assert_eq!(copy_payload(&TreeSelection::of(&layer.1)), None);
+        assert_eq!(
+            copy_payload(&TreeSelection::of(&layer.1)),
+            None,
+            "a layer identifier is not a prim path"
+        );
     }
 
     #[test]

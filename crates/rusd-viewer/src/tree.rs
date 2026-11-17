@@ -210,6 +210,21 @@ impl CompositionTree {
         self.variants.iter().filter(|v| v.prim == prim).collect()
     }
 
+    /// The prim node at `path` — the id `comp_node` wants, for a path the user
+    /// picked in the viewport (v1.3: the tree no longer lists prims, so a click is
+    /// the way to name one).
+    ///
+    /// `None` when this composition report does not describe that prim, which is
+    /// ordinary: a flattened cook output has prims the layer specs never authored,
+    /// and a report may not have arrived yet. The caller says so rather than
+    /// treating it as an error.
+    pub fn prim_id(&self, path: &str) -> Option<&str> {
+        self.prims
+            .iter()
+            .find(|p| p.path == path)
+            .map(|p| p.id.as_str())
+    }
+
     /// The layer `id` names, when it is one of this tree's.
     pub fn layer(&self, id: &str) -> Option<&LayerNode> {
         self.layers.iter().find(|l| l.id == id)
@@ -257,16 +272,17 @@ impl TreeNodeKind {
 }
 
 /// Build the panel's roots: one subtree per layer, **in strength order**, and
-/// under each layer its arcs and the prims it authors.
+/// under each layer its arcs and its variant sets.
 ///
-/// The shape, in the order the panel draws it:
+/// The shape, in the order the panel draws it (v1.3, `docs/PROTOCOL.md` 末节 —
+/// **no prim rows**: a stacked city has hundreds, and a prim is inspected by picking
+/// it in the viewport, which resolves its path to a `prim_nodes[].id`):
 ///
 /// ```text
 /// <layer id>  [kind, strength]        ← a root, strongest first (session on top)
 ///   ↳ arc:<n>  kind → target_layer:target_prim
-///   ↳ prim:<path>  authored_in: [this layer, …]
-///       ↳ vset:<n> name = selection
-///           ↳ variant name
+///   ↳ vset:<n> name = selection       ← structure, so it stays
+///       ↳ variant name
 /// ```
 ///
 /// **The arc's target layer is a row that names it, not a second copy of its
@@ -311,10 +327,18 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         });
     }
 
+    // **No prim rows.** v1.3 (user ruling, `docs/PROTOCOL.md`): a city stack has
+    // hundreds of prims and listing them ``既撑爆面板宽度又没人读`` — the tree is
+    // about structure (layers, arcs, variants). A prim is inspected by picking it in
+    // the viewport, which turns the picked path into `prim_nodes[].id` and asks
+    // `comp_node{id}` (`CompositionTree::prim_id`). The payload still *carries*
+    // `prim_nodes`, and the variant sets below are keyed by the prim they belong to,
+    // so the rows a prim owns are still reachable — only the path rows are gone.
     for prim in tree.prims_in(&layer.id) {
-        let mut kids = Vec::new();
-        for vset in tree.variants_of(&prim.path) {
-            kids.push(TreeNode {
+        let kids: Vec<TreeNode> = tree
+            .variants_of(&prim.path)
+            .into_iter()
+            .map(|vset| TreeNode {
                 id: vset.id.clone(),
                 kind: TreeNodeKind::VariantSet,
                 label: match &vset.selection {
@@ -326,10 +350,10 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                     .variants
                     .iter()
                     .map(|v| TreeNode {
-                        // A variant's own spec is not a `comp_node` node in v1.2 —
-                        // only its *set* is. The row is therefore a label, and its
-                        // id is the set's, so clicking it asks the same question
-                        // the set does rather than one the server would refuse.
+                        // A variant's own spec is not a `comp_node` node — only its
+                        // *set* is. The row is therefore a label, and its id is the
+                        // set's, so clicking it asks the same question the set does
+                        // rather than one the server would refuse.
                         id: vset.id.clone(),
                         kind: TreeNodeKind::VariantSet,
                         label: v.clone(),
@@ -337,15 +361,11 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                         children: Vec::new(),
                     })
                     .collect(),
-            });
+            })
+            .collect();
+        if !kids.is_empty() {
+            children.extend(kids);
         }
-        children.push(TreeNode {
-            id: prim.id.clone(),
-            kind: TreeNodeKind::Prim,
-            label: prim.path.clone(),
-            prim: Some(prim.path.clone()),
-            children: kids,
-        });
     }
 
     TreeNode {
@@ -775,6 +795,20 @@ impl TreeModel {
         matches!(self, TreeModel::Unavailable(_) | TreeModel::Failed(_))
     }
 
+    /// Whether a composition report has arrived and is usable — the counterpart of
+    /// `is_unavailable`, for callers that must tell "no prim node for this path"
+    /// (ordinary) from "no report yet" (retry).
+    pub fn ready(&self) -> bool {
+        matches!(self, TreeModel::Ready(_))
+    }
+
+    /// The `comp_node` id of the prim at `path`, when the report describes it. This
+    /// is the v1.3 entry point: a viewport pick gives a path, and the tree turns it
+    /// into the id `comp_node` takes.
+    pub fn prim_id(&self, path: &str) -> Option<&str> {
+        self.tree()?.prim_id(path)
+    }
+
     /// The roots to draw: empty unless a tree is ready.
     pub fn roots(&self) -> Vec<TreeNode> {
         match self {
@@ -954,14 +988,16 @@ mod tests {
             ["anon:session", "city.rusd.cooked.usda", "prototypes.usda"],
             "the session layer is the strongest, so it is the first root"
         );
-        // Every root is a layer row, and only the session layer has a prim of its own.
+        // Every root is a layer row, and v1.3 draws no prim rows under them.
         assert!(roots.iter().all(|r| r.kind == TreeNodeKind::Layer));
+        // (v1.3) The session layer authors a prim in this sample, but the prim's row
+        // is not drawn — only the layers, arcs and variant sets are. The session
+        // branch therefore has no children of its own here.
         assert_eq!(
             roots[0].children.len(),
-            1,
-            "the session layer authors one prim in this sample"
+            0,
+            "v1.3: the session layer's prim is inspected by picking it, not listed"
         );
-        assert_eq!(roots[0].children[0].label, "/World/City/Block_01/over");
     }
 
     #[test]
@@ -1021,7 +1057,10 @@ mod tests {
             .into_iter()
             .filter(|(_, n)| n.id == "prim:/S")
             .count();
-        assert_eq!(shared_rows, 1, "the shared prim is drawn exactly once");
+        // v1.3 draws no prim rows at all, so the shared prim contributes none — the
+        // property this test protects (a shared target is not repeated per incoming
+        // edge) now holds trivially for prims, and still has to hold for the arcs.
+        assert_eq!(shared_rows, 0, "v1.3 draws no prim rows");
         // Both arcs still exist as rows, each pointing at it.
         let arc_rows = flatten(&roots)
             .into_iter()
@@ -1031,30 +1070,35 @@ mod tests {
     }
 
     #[test]
-    fn a_prim_hangs_under_every_layer_that_authors_it_and_a_variant_set_under_its_prim() {
+    fn the_variant_set_stays_even_though_its_prim_row_does_not() {
+        // v1.3: prim rows are gone from the tree (`docs/PROTOCOL.md` 末节), but a
+        // variant set is *structure* and must still be drawn and expandable —
+        // otherwise dropping prim rows would silently drop variants too.
         let tree = CompositionTree::parse(&sample()).unwrap();
         let roots = roots(&tree);
-        let session_prims: Vec<&str> = roots[0].children.iter().map(|c| c.label.as_str()).collect();
-        assert_eq!(session_prims, ["/World/City/Block_01/over"]);
-
-        let prototype = flatten(&roots)
+        let rows = flatten(&roots);
+        assert!(
+            !rows.iter().any(|(_, n)| n.kind == TreeNodeKind::Prim),
+            "no prim rows at all"
+        );
+        let vset = rows
             .into_iter()
-            .find(|(_, n)| {
-                n.prim.as_deref() == Some("/Prototypes/Block") && n.kind == TreeNodeKind::Prim
-            })
-            .expect("the prototype's prim row");
-        let vset = prototype
-            .1
-            .children
-            .first()
-            .expect("the variant set under its prim");
-        assert_eq!(vset.kind, TreeNodeKind::VariantSet);
-        assert_eq!(vset.label, "size = small", "the selection is in the row");
-        let names: Vec<&str> = vset.children.iter().map(|c| c.label.as_str()).collect();
+            .find(|(_, n)| n.kind == TreeNodeKind::VariantSet)
+            .expect("the variant set is drawn");
+        assert_eq!(vset.1.label, "size = small", "the selection is in the row");
         assert_eq!(
-            names,
+            vset.1
+                .children
+                .iter()
+                .map(|c| c.label.as_str())
+                .collect::<Vec<_>>(),
             ["small", "large"],
             "the variants are expandable rows"
+        );
+        assert_eq!(
+            vset.1.prim.as_deref(),
+            Some("/Prototypes/Block"),
+            "and the row still knows which prim it belongs to, for the detail panel"
         );
     }
 
@@ -1149,21 +1193,30 @@ mod tests {
     }
 
     #[test]
-    fn a_prim_rows_path_is_what_a_click_copies_and_a_layers_row_copies_nothing() {
+    fn a_layers_row_copies_nothing_and_a_picked_prim_copies_its_path() {
+        // v1.3: no prim rows, so the clipboard's prim source is the viewport pick.
+        // What must not change is the rule itself (v1.1): a prim copies its path, a
+        // layer identifier copies nothing.
         let tree = CompositionTree::parse(&sample()).unwrap();
         let roots = roots(&tree);
-        let prim_row = &roots[0].children[0];
-        let sel = TreeSelection::of(prim_row);
-        assert_eq!(sel.kind, TreeNodeKind::Prim);
-        assert_eq!(
-            clipboard_for(&sel).as_deref(),
-            Some("/World/City/Block_01/over")
-        );
         let layer_row = TreeSelection::of(&roots[0]);
         assert_eq!(
             clipboard_for(&layer_row),
             None,
             "a layer identifier is not a prim path"
+        );
+        // The picked prim arrives as a selection with a prim path on it.
+        let picked = TreeSelection {
+            id: tree
+                .prim_id("/World/City/Block_01/over")
+                .unwrap()
+                .to_owned(),
+            kind: TreeNodeKind::Prim,
+            prim: Some("/World/City/Block_01/over".to_owned()),
+        };
+        assert_eq!(
+            clipboard_for(&picked).as_deref(),
+            Some("/World/City/Block_01/over")
         );
     }
 
@@ -1174,7 +1227,8 @@ mod tests {
         let trail = path_to(&roots, "vset:0").expect("the variant set is in the tree");
         assert_eq!(trail.first().map(String::as_str), Some("prototypes.usda"));
         assert_eq!(trail.last().map(String::as_str), Some("vset:0"));
-        assert!(trail.len() >= 3, "layer → prim → variant set: {trail:?}");
+        // v1.3: layer → variant set, with no prim row in between.
+        assert_eq!(trail.len(), 2, "layer → variant set: {trail:?}");
         assert_eq!(path_to(&roots, "nope"), None);
     }
 
