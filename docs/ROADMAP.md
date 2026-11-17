@@ -79,7 +79,9 @@
 
 ## M6 — 互操作与扩展
 
-- rusd-usd：Rusd ↔ openusd 导出/导入桥（usda/usdc/usdz 由 openusd 承担，含 --bake）
+- [x] rusd-usd 导出桥：展开→flatten→usda/usdc/usdz（--no-bake 保留 generator schema）；rusd export / agent export_usd（2026-11-17）
+- [ ] USD 导入桥（USD→Rusd）
 - RusdLSystem / RusdTerrain / RusdWfc
 - 示例画廊 + 文档
-- 验收：导出的 USD 能被 usdview / Blender 打开（子集范围内）
+- [x] 导出 round-trip：usda/usdc 经 openusd 重导入 prim 数一致（AOUSD 合规背书）（2026-11-17）
+- [ ] usdview / Blender 实际打开确认（子集范围内）
