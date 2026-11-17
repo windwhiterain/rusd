@@ -493,6 +493,19 @@ impl RenderWorker {
                         } => {
                             viewport.set_scene(&geometry);
                             bounds = b;
+                            // **This is the render thread's own camera, and its only
+                            // source besides a `View` command.** The composed scene
+                            // carries a fitted camera (`scene::extract_fitted` always
+                            // sets one), so the thread has a usable orbit the moment a
+                            // scene lands — which is why a probe can see a plausible
+                            // "fit" here even if the app never sent a `View`. That is
+                            // not a second opinion about the framing: the app sends
+                            // `View` right after `Scene` (`app::adopt_scene`) with the
+                            // camera *it* fitted for the live window aspect, and that
+                            // overwrites this one on the next iteration. The value set
+                            // here exists so the very first draw after a scene is not
+                            // a blank one, and so a scene that arrives before any
+                            // `View` still renders something.
                             if let Some(cam) = geometry.camera {
                                 orbit = Some(Orbit::from_camera(&cam));
                             }

@@ -29,11 +29,17 @@ use crate::session::{ClientModel, MadeScene};
 ///   belongs to the client). `None` is what says so; returning the scene's own
 ///   camera here instead would make the caller overwrite the user's orbit with it.
 ///
-/// `None` also when the scene carries no camera at all.
+/// # The first fit needs only the bounds
+///
+/// A scene whose `geometry.camera` is `None` — an exported layer with no `Camera`
+/// prim is exactly that, and so is one whose camera the extractor could not read —
+/// **is still a scene**, with a bbox to frame. So the early return this function
+/// used to make on `made.geometry.camera?` is gone: the fit is computed from
+/// `made.bounds` alone, and the camera's presence is only consulted afterwards, for
+/// the "is there anything to draw" question the caller asks separately. That early
+/// return is what left `orbit` at `None` (and the gizmo, the anchors and the Fit
+/// button with it) whenever a scene arrived without a camera in it.
 pub fn camera_for_scene(model: &mut ClientModel, made: &MadeScene, aspect: f64) -> Option<Orbit> {
-    // `geometry.camera` is always set by the composer, so a scene that has one can
-    // be framed; a scene without one leaves the view as it is.
-    made.geometry.camera?;
     if !model.wants_first_fit() {
         return None;
     }
@@ -107,6 +113,28 @@ mod tests {
             crate::session::Effect::NewScene(m) => *m,
             _ => panic!("expected a scene"),
         }
+    }
+
+    #[test]
+    fn a_first_scene_without_a_camera_still_gets_fitted() {
+        // An exported layer may carry no `Camera` prim; the scene is still a bbox
+        // to frame. The first fit must not depend on the camera's presence — the
+        // early return that did is what left `orbit` (and the gizmo, the anchors
+        // and the Fit button) at `None`.
+        let mut made = scene();
+        made.geometry.camera = None;
+        let mut model = ClientModel::new();
+        let orbit = camera_for_scene(&mut model, &made, 16.0 / 9.0)
+            .expect("a scene with bounds is fitted even with no camera in it");
+        let (inside, worst) = framing(&orbit, made.bounds, 1280, 720);
+        assert!(
+            inside,
+            "and the fit is the real one: worst |NDC| {worst:.4}"
+        );
+        assert_eq!(
+            orbit.target[0],
+            f64::midpoint(made.bounds.0[0], made.bounds.1[0])
+        );
     }
 
     #[test]
