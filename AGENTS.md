@@ -91,3 +91,13 @@ cargo run -p spike-openusd    # O6 增量合成实证基准（SPEC §6）
   rusd-viewer 窗口进程在通道结束后仍锁着 exe，导致 scp 覆盖报 Broken pipe）。
   覆盖二进制或重开窗口前先 `tasklist | grep <name>` 查孤儿；只清自己起的 smoke
   进程，子 agent 的进程按协调规矩处理。
+- 本机屏幕 2560×1440 @ scale 1.75。**DPI-unaware 的 powershell/python 做截图与鼠标
+  归一化会被 Windows 虚拟化到 1463×823**，曾造成「窗口越界/城市被裁/点击偏移」一连串
+  假象（viewer 本身布局一直正确）。任何屏幕测量或合成输入前先
+  `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2 = -4)`；`mouse_event` ABSOLUTE
+  用虚拟屏归一化（GetSystemMetrics 76..79）；截图用 aware 后的 PrimaryScreen.Bounds。
+- PowerShell 自定义函数名避开内建别名：`Move`/`Mv` 都是 Move-Item（大小写不敏感），
+  曾让合成拖选静默失效、mask 全黑被误判为产品 bug。
+- viewer 开窗按 monitor **work area**（GetMonitorInfoW rcWork）夹取居中，底栏不被
+  任务栏遮；egui-winit 必须 `features = ["clipboard"]`，否则 `ctx.copy_text` 被平台层
+  静默丢弃（toast 会显示「已拷贝」但剪切板不变——验收要读真剪切板）。
