@@ -58,17 +58,42 @@
 - [ ] 递归 cook 图实例化（每 parcel 独立 BlockFill 节点，P6 动态发现）
 - 验收：同 seed 逐字节一致 ✓；6×6 城市在预算内 ✓；超预算确定性截断 + 诊断 ✓；RNG 路径键控不 reshuffle ✓
 
-## M4 — 渲染 MVP（2026-11-16 启动，headless 优先）
+## M4 — 渲染 MVP（2026-11-16 启动，headless 优先）· **已重排为 M4'**（D12）
+
+原 M4 的"进程内 winit + egui 热重载 viewer"已被 **D12 v2**（viewer 是 client、remote 切在 USD 层，
+见 docs/REMOTE.md）取代：viewer 不再是 server 进程里的窗口，而是独立 client 二进制（同 win-x64，
+peer 构建 scp 分发）。server 不再拥有相机——相机归 client，server 对相机无状态。
+
+### M4 — 已完成（headless 渲染核心，与 M4' 共用）
 
 - [x] wgpu device/headless 出图 spike（DX12 + RTX 3060 Ti，离屏渲染 + readback + PNG，2026-11-16）
 - [x] 几何提取层 rusd-scene::geometry：Stage→网格/世界变换/相机（xformOpOrder 复合、内建细分、Mesh 三角化、容错占位）；city/forest 验收（2026-11-16）
 - [x] wgpu headless：beauty + prim-id（R32Uint）pass、look-at 相机、确定性截图（2026-11-16）
 - [x] 容错品红占位 + 确定性截图；诊断叠加待做
-- [ ] 热重载交互 viewer（winit + egui），走 SPEC §6 增量管线
 - [x] `rusd render` / `rusd pick`（beauty/ids PNG + metadata JSON；pick 像素→path，2026-11-16）
 - [x] 视觉选择闭环：指点准星标注 + 选中换色/描边（多选多色；描边只向自身内部扩张、不互相覆盖；pick --visual / render --select，2026-11-16）
 - [x] 渲染/标注全参数可配置（RenderConfig + Style：尺寸/背景/fov/光照/描边宽/准星半径/换色保明度；CLI flag，2026-11-16）
 - [x] 验收：forest/city 出图；id pass 像素 → prim path 往返正确（2000/2000，确定性，2026-11-16）
+- 原「热重载交互 viewer（winit + egui），走 SPEC §6 增量管线」→ **被 D12 取代，改到 M4'**
+
+### M4' — client-server viewer（D12 v2，docs/REMOTE.md）
+
+- [x] spike ①：传输可行性 —— city flatten usdc **58KB**；release 全进程 export 0.159s /
+      expand 0.107s ⇒ 传场景而非传帧（2026-11-17）
+- [ ] spike ②：headless 内存合成 + 渲染 parity（`Rusd/viewer-spike`，`snapshot` / `compose`
+      两子命令）—— Tier B 成立的前置证据
+- [ ] server 传输层：TCP NDJSON JSON-RPC（复用 rusd-agent 工具名）+ `subscribe` + 通知
+      `stage_snapshot` / `layers_changed` / `diagnostics` / `state_changed`；默认 loopback
+- [ ] Tier A 推送：change 时推 flattened usdc 快照；client `Layer::from_bytes` 单层栈 →
+      extract → 本地 wgpu 渲染（flatten 丢 arcs ⇒ 匿名安全）
+- [ ] Tier B 镜像：命名 identifier layer stack 逐层推送（usda 文本 / usdc 字节）+ client 自定义
+      `ar::Resolver` + `Stage::builder().resolver().session_layer().open()`；层变更 = 重建 stage
+- [ ] `rusd-viewer` crate：winit + egui 壳，本地 orbit/zoom/pick/annotate（零网络往返），
+      相机归 client（每次 render 带全 RenderConfig）
+- [ ] spike ③：egui 壳 + gizmo → override opinion 闭环（②过后开）
+- [ ] SSH 隧道文档（`ssh -L`）与分发说明（peer 构建 → scp，同 win-x64）
+- [ ] 后置：`Diff`/`apply_diff` 细粒度增量（`sdf::Value`/`Diff` 无 serde，需自定义 codec）；
+      `--bind LAN`
 
 ## M5 — Agent 协议（2026-11-16 完成）
 

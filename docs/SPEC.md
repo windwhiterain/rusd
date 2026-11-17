@@ -223,6 +223,23 @@ parse (CST) → compose → validate → expand → render
 - **D9**（2026-11-16）：cook 只包过程化生成，不包 USD 合成操作；compose op 全归 openusd pcp（docs/PIPELINE.md §10）。
 - **D10**（2026-11-16）：agent 操作接口 = 一套 Python 脚本（subprocess 驱动 rusd CLI / JSON-RPC），不做 MCP adapter。原 O5 关闭。
 - **D11**（2026-11-16）：`patch` 编辑 TOML 文档本身（toml_edit CST opinion ops），非 session-layer——cook 从文档读 generator 节点，文档是唯一事实来源（可编辑性）。解决 §6/§8 措辞张力，取 §6；M2 Overlay 保留为独立非破坏运行时机制。undo/redo = 文档快照回放。
+- **D12**（2026-11-17）：**viewer 是 client，rusd 是 server；remote 切在 USD 层，不传像素**（docs/REMOTE.md）。
+  背景：server 机器有 GPU 而仓库/GPU 在 peer，SSH 无显示；传帧方案因带宽/延迟被否。同步对象 =
+  USD layer / 快照；client 本地合成 + 本地 wgpu 渲染 + 本地 pick/annotate ⇒ orbit/zoom/点击零网络往返。
+  viewer 是人类 + agent 协同开发的 interface，共享物是场景。浏览器 client 出局（wasm 合成 USD 太重），
+  原生 Rust 二进制（peer 构建 scp 到用户机，同 win-x64）。**分层两条**：Tier A = change 时推 flattened
+  usdc 快照（city 58KB；release export 0.159s / expand 0.107s），client `Layer::from_bytes` 单层栈
+  → extract → 本地渲染（flatten 烘资产/丢 arcs ⇒ 匿名安全）；Tier B = 命名 identifier 的 layer stack
+  逐层推送（usda 文本 / usdc 字节），client 自定义 `ar::Resolver` + `Stage::builder().resolver()
+  .session_layer().open()` 逐 opinion 镜像；layer 变更 = **重建 stage**（crate 无 reload/rebind，
+  session 仅 builder 期），`Diff`/`apply_diff` 留作细粒度增量后置（`sdf::Value`/`Diff` 无 serde，
+  需自定义 codec）。协议 = TCP NDJSON JSON-RPC，复用 rusd-agent 工具名 + `subscribe` + 通知
+  `stage_snapshot`/`layers_changed`/`diagnostics`/`state_changed`；默认 loopback + SSH 隧道（`ssh -L`），
+  `--bind LAN` 后置；相机归 client（每次 render 带全 `RenderConfig`），server 对相机无状态。
+  线程：`Stage` = `Rc` ⇒ `!Send`，sync 线程独占 stage，owned `GeoItems` 经 channel 交渲染线程。
+  确定性：openusd 0.8 双端 pin、同 win-x64；只序列化命名 identifier（匿名 id 是进程计数器）；
+  resolver identity 双端恒等；wire 用 usda/usdc 不用 usdz（zip 时间戳风险）。
+  取代原 M4 的"进程内 winit + egui 热重载 viewer"，M4 重排为 M4'（见 ROADMAP）。
 
 开放：
 
