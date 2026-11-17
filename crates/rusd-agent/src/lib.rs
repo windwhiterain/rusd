@@ -26,6 +26,7 @@ use rusd_scene::geometry::{self, SceneGeometry};
 use serde_json::{Value, json};
 
 mod patch;
+pub mod transport;
 
 /// A live editing session: the current document source + undo history + renders.
 pub struct Agent {
@@ -36,6 +37,12 @@ pub struct Agent {
     provenance: Vec<Value>,
     out_dir: PathBuf,
     seq: u64,
+    /// The live stage the transport owns, when this agent runs as `rusd serve
+    /// --listen` (D12): [`scene`](Self::scene) then reads that one stage —
+    /// cooked, with the overrides session layer — instead of re-deriving the
+    /// pipeline from the document, so a tool call and a published snapshot
+    /// describe the same scene. `None` in the stdio session, which re-derives.
+    live: Option<ExpandOutput>,
 }
 
 struct Scene {
@@ -55,7 +62,25 @@ impl Agent {
             provenance: Vec::new(),
             out_dir,
             seq: 0,
+            live: None,
         }
+    }
+
+    /// The current document source, or `None` before `open`.
+    pub(crate) fn doc_text(&self) -> Option<&str> {
+        self.doc.as_deref()
+    }
+
+    /// Replace the document without touching the history stacks: the
+    /// transport keeps its own undo faces (REMOTE §3: both edit faces undo).
+    pub(crate) fn replace_doc(&mut self, text: String) {
+        self.doc = Some(text);
+        self.redo_stack.clear();
+    }
+
+    /// Install (or clear) the live stage [`scene`](Self::scene) reads (D12).
+    pub(crate) fn set_live(&mut self, live: Option<ExpandOutput>) {
+        self.live = live;
     }
 
     /// Run the stdio JSON-RPC loop until stdin closes.
@@ -131,6 +156,18 @@ impl Agent {
     }
 
     fn scene(&self) -> Result<Scene, String> {
+        if let Some(live) = &self.live {
+            return Ok(Scene {
+                out: ExpandOutput {
+                    stage: live.stage.clone(),
+                    stats: live.stats,
+                    diags: live.diags.clone(),
+                    prim_count: live.prim_count,
+                    node_count: live.node_count,
+                },
+                geo: geometry::extract(&live.stage),
+            });
+        }
         let text = self.doc.as_ref().ok_or("no scene open; call open first")?;
         let doc = rusd_core::syntax::parse(text).map_err(diags_msg)?;
         let vdiags = rusd_scene::validate(&doc);
@@ -277,7 +314,7 @@ impl Default for Agent {
 
 // --- helpers --------------------------------------------------------------
 
-fn diags_json(diags: &[Diagnostic]) -> Value {
+pub(crate) fn diags_json(diags: &[Diagnostic]) -> Value {
     Value::Array(
         diags
             .iter()

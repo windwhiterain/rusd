@@ -74,3 +74,12 @@ cargo run -p spike-openusd    # O6 增量合成实证基准（SPEC §6）
   追加中文段落用 write 产字节 + `cat >>` 拼接，别让 perl 插值层碰中文。
 - edit 工具在本类会话曾报参数编码错误：整文件 write 或 perl 替代；跨行替换用 `perl -0777`。
 - 子 agent turn_end 通知正文偶发乱码：验收以磁盘文件与实测为准，通知只作线索。
+- 丢字节不止 U+FFFD：还有中间字节翻转成「合法但语义错」的字符（实测 `≡` e2 89 a1
+  变成 `⩡` e2 a9 a1），FFFD 检查完全漏掉。中文/数学符号写后第二步兜底——生僻码点
+  白名单扫描：
+  `perl -CSD -ne 'while (/([^\x00-\x7F])/g) { my $ch=$1; next if $ch =~ /[\x{4E00}-\x{9FFF}\x{3000}-\x{303F}\x{FF00}-\x{FFEF}]/; $c{$ch}++ } END { print map { sprintf("U+%04X %s x%d\n", ord($_), $_, $c{$_}) } sort keys %c }' <files>`
+  输出应只剩 § × Δ µ · ≡ ⇒ → ← − … — “ ” ① ② ③ ─ ✓ 这类合法字符；出现生僻码点
+  即损坏，按字节 perl 修回后再扫一遍（AGENTS 本条自带 ⩡ 作反例，扫描时豁免）。
+- 损坏集中在 flash 子 agent 的 write/edit 调用（父会话 write 多轮实测干净）：疑似
+  模型侧 tool-call 多字节序列化缺陷，而非写盘逻辑。故子 agent 交付的中文文档必须
+  过 FFFD + 生僻码点两步扫描才验收。
