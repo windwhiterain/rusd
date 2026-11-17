@@ -26,6 +26,11 @@ render/pick**——它在本地合成、本地渲染、本地拾取（D12 核心
 - `opinion{ops:[{path, field, value, op:"set"|"remove"}]}` → `{version}`。
   落点 = server 的 **overrides session layer**（D12 §3 第三编辑面），不是文档 CST。
   gizmo 拖动节流 ≤30Hz 发 opinion；server 作者后重合成并广播。
+  **`value` 的形状由字段的 Sdf 类型决定**（本协议不另定壳）；`remove` 不带 `value`。
+  v1 client 只发一种：`field="xformOp:translate"`、`value=[x,y,z]` 三个数的 JSON 数组
+  （世界坐标；server 若需相对父变换，按自己的 session layer 语义落成 `point3f`）。
+  **待 server 侧确认**：本行是 client 侧的唯一假设，若 server 选别的 enc（如 `{x,y,z}`）只改
+  `protocol::OpinionOp::set_translate` 一处。
 - `undo`/`redo` 覆盖文档 CST 与 overrides 两个编辑面（D11 + D12 §3）。
 
 ## 通知（server → 订阅者）
