@@ -135,7 +135,11 @@ egui-winit 自己的集成的做法。
 
 ```
 screen <w>x<h> pt · inner <w>x<h> px · scale <s> · expect <w>x<h> pt
-scale count <r>x (1.000 = ok) · <ok | NO pixels as points | NO scaled twice | NO not a whole scale>
+winit scale count <r>x (1.000 = ok) · <ok | NO pixels as points | NO scaled twice | NO not a whole scale | NO winit agrees with itself; its scale is stale (see the os row)>
+os client <w>x<h> px · os scale <s> · window <w>x<h> px · <agrees with winit | NO winit disagrees>      (仅 Windows；否则 `os probe n/a`)
+os expect <w>x<h> pt · layout is <r>x<r> of it · <point space fits the os window | NO point space overflows the os window>
+dpi awareness <per-monitor-aware | ...>
+monitor <W>x<H> px · client <w>x<h> px · <fits the screen | NO the window is bigger than its screen>
 layout used <w>x<h> pt: the screen rect was corrected this pass | layout used the platform's own screen rect (no correction)
 back buffer <w>x<h> px · window inner <w>x<h> px · matches <yes|NO>
 present stretch <sx>x<sy> (1.000x1.000 = ok) · <blit | NO magnified | NO anisotropic ...>
@@ -144,6 +148,11 @@ partition OK|NO
 width <left> + <rect> = <sum> vs window <w> (Δ <d>) · fits <yes|NO>
 height <top> + <bottom> + <rect> = <sum> vs window <h> (Δ <d>) · fits <yes|NO> · bars <yes|NO>
 ```
+
+`winit scale count` 只能检查 winit **自己**是否自洽（`screen_rect == inner / scale`，两边都是
+winit 的数字），因此 winit 的 scale 陈旧时它照样读 `ok`——而那正是陈旧 scale 唯一的症状。
+所以 OS 行说"不一致"时，这一行也改说 `NO ... its scale is stale`：读者不必越过后面的行
+才看见缺陷，`NO` 的红字也和其它失败一视同仁。
 
 `back buffer` 报的是**这一趟继承到的**尺寸，不是这一趟装上去的：否则修好的那一帧会永远
 读成 `matches yes`，唯一能看见"UI 被拉伸"的仪表就自己闭眼了。修复本身由 `swapchain
@@ -168,7 +177,8 @@ resized this pass` 单独一行说明。
 7.1 的三条约束都由 **winit 自己的输出**构成：`inner_size()` 的实现就是 `GetClientRect`
 （winit-0.30.13 `platform_impl/windows/window.rs:214`），`scale_factor()` 是它缓存的
 `WindowState` 字段，而 7.1 的应有值又是这两个数相除。于是「比值 1.000」只证明**winit 与
-自己一致**——第九轮的真机就出现了这种情形：叠加层 `scale count 1.000x · ok`、
+自己一致**——第九轮的真机就出现了这种情形：当时的叠加层（那一版把第一行叫 `scale count`，
+现在叫 `winit scale count`）报 `1.000x · ok`、
 `present stretch 1.000x1.000 · blit`、`partition OK` 全绿，而城市仍在窗外。仪表当时把
 自洽当成了健康。
 

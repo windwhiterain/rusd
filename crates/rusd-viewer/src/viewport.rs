@@ -218,6 +218,10 @@ pub struct ScreenSpace {
     /// numbers whose ratio it printed came from the same division. This field, and the
     /// `os` lines built from it, are the only place a wrong answer can show up.
     ///
+    /// (Round 9's build printed that first row as `scale count`; it is `winit scale
+    /// count` now, renamed when the second opinion arrived — the row says whose numbers
+    /// it compares.)
+    ///
     /// `None` on a platform without the probe (and on a failed read): no second
     /// opinion, so no agreement is claimed — see [`ScreenSpace::os_agrees`].
     pub os: Option<OsView>,
@@ -449,13 +453,23 @@ impl ScreenSpace {
 
     /// The overlay's lines for this: what the platform said, what the contract
     /// expects, and the ratio that names the row.
+    ///
+    /// The first row's verdict is scoped to what it can actually check. It compares
+    /// `screen_rect` with `inner / scale` — arithmetic that **winit itself performed**,
+    /// so it reads `ok` even when winit's scale is stale, which is the one failure a
+    /// stale scale produces. A reader who stops at the first `ok` would therefore stop
+    /// before the row that matters; so when the OS disagrees, that is said on this row
+    /// too, and the `NO` highlights it the way every other failure is highlighted.
     pub fn lines(&self) -> Vec<String> {
         let e = self.expected_points();
-        let label = match self.agreement() {
-            ScreenAgreement::Consistent => "ok",
-            ScreenAgreement::PixelsAsPoints => "NO pixels as points",
-            ScreenAgreement::ScaledTwice => "NO scaled twice",
-            ScreenAgreement::Odd => "NO not a whole scale",
+        let label = match (self.agreement(), self.os, self.os_agrees()) {
+            (ScreenAgreement::Consistent, Some(_), Some(false)) => {
+                "NO winit agrees with itself; its scale is stale (see the os row)"
+            }
+            (ScreenAgreement::Consistent, _, _) => "ok",
+            (ScreenAgreement::PixelsAsPoints, _, _) => "NO pixels as points",
+            (ScreenAgreement::ScaledTwice, _, _) => "NO scaled twice",
+            (ScreenAgreement::Odd, _, _) => "NO not a whole scale",
         };
         let mut out = vec![
             format!(
@@ -1106,7 +1120,7 @@ mod tests {
             os: None,
         };
         assert_eq!(plain.agreement(), ScreenAgreement::Consistent);
-        assert!(plain.lines().join(" | ").contains("ok"));
+        assert!(plain.lines().join(" | ").contains("· ok"));
         // A correct space is not corrected, and the line says so rather than staying
         // silent about it.
         assert!(
@@ -1134,6 +1148,50 @@ mod tests {
         let lines = stale.lines().join(" | ");
         assert!(lines.contains("back buffer 2240x1216 px"), "{lines}");
         assert!(lines.contains("matches NO"), "{lines}");
+    }
+
+    #[test]
+    fn a_stale_scale_does_not_get_to_read_ok_on_the_winit_row() {
+        // winit's own check is `screen_rect == inner / scale_factor`, and both sides of
+        // that are winit's — inner_size() from GetClientRect, scale_factor() from its
+        // cached WindowState. A stale scale makes the equation true to 1.000x while the
+        // layout is 1.75x too large. Printed as a bare `ok`, that row is the one a
+        // reader stops at; it must carry the disagreement instead.
+        let stale = ScreenSpace {
+            inner_physical: (2496, 1336),
+            scale_factor: 1.0,
+            screen_points: egui::vec2(2496.0, 1336.0),
+            presented_physical: (2496, 1336),
+            os: Some(crate::viewport::OsView {
+                client_px: (2496, 1336),
+                scale: 1.75,
+                window_px: (2512, 1384),
+                awareness: "per-monitor-aware",
+                monitor_px: Some((2560, 1440)),
+            }),
+        };
+        // The arithmetic winit performed is self-consistent: that is the trap.
+        assert_eq!(stale.agreement(), ScreenAgreement::Consistent);
+        let lines = stale.lines().join(" | ");
+        assert!(
+            lines.contains("NO winit agrees with itself; its scale is stale"),
+            "{lines}"
+        );
+        assert!(
+            "winit scale count 1.000x (1.000 = ok) · ok" != lines,
+            "{lines}"
+        );
+        // And the row that can see it still says what it says.
+        assert!(lines.contains("NO winit disagrees"), "{lines}");
+        assert!(lines.contains("layout is 1.750x1.750"), "{lines}");
+        // With no probe there is no second opinion, so the winit row stays `ok`: the
+        // label must not accuse a build that cannot check.
+        let unprobed = ScreenSpace { os: None, ..stale };
+        assert!(
+            unprobed.lines().join(" | ").contains("· ok"),
+            "{}",
+            unprobed.lines().join(" | ")
+        );
     }
 
     fn partition(window: Vec2, left: f32, top: f32, bottom: f32, rect: Rect) -> Partition {
@@ -1434,10 +1492,11 @@ mod tests {
 
     #[test]
     fn round_ten_passed_every_winit_check_which_is_why_it_needed_a_second_opinion() {
-        // This is the whole reason the round happened: `scale count 1.000x · ok`,
-        // `matches yes`, `stretch 1.000x1.000 · blit` — all true, because they compare
-        // winit with winit. If any of these ever stops being true the reproduction has
-        // drifted, and the assertions below are testing something else.
+        // This is the whole reason the round happened: the first row read `1.000x · ok`
+        // (that build called it `scale count`), `matches yes`, `stretch 1.000x1.000 ·
+        // blit` — all true, because they compare winit with winit. If any of these ever
+        // stops being true the reproduction has drifted, and the assertions below are
+        // testing something else.
         let s = round_ten();
         assert_eq!(s.agreement(), ScreenAgreement::Consistent);
         assert!((s.ratio() - 1.0).abs() < 1e-3, "winit's own ratio is 1.000");

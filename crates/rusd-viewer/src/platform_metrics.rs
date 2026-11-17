@@ -3,8 +3,8 @@
 //!
 //! Round 9 made the shell print three numbers — `inner_size()` in physical pixels,
 //! `scale_factor()`, and the point size egui laid out in — and called `1.000` on their
-//! ratio "the contract met". Round 10's window then showed `partition OK`, `scale count
-//! 1.000x · ok` and `present stretch 1.000x1.000 · blit` while the city was off the
+//! ratio "the contract met". Round 10's window then showed `partition OK`, `winit scale
+//! count 1.000x · ok` and `present stretch 1.000x1.000 · blit` while the city was off the
 //! right-hand edge. Those three lines agreed because **they are all winit's own
 //! answers**: `inner_size()` is `GetClientRect` (winit-0.30.13
 //! `platform_impl/windows/window.rs:214`), the point size is that value divided by
