@@ -87,3 +87,7 @@ cargo run -p spike-openusd    # O6 增量合成实证基准（SPEC §6）
   wait 会先把批次占住，改写调用排在它后面）——曾因此把「改写落在观测窗口外」误判为
   「server 延迟 10–20s」。观测 client 一律走**后台通道**（wait 0）再单独发改写调用；
   跨进程时间轴用 epoch ms 对齐，别信单侧 dt。
+- `del_channel` 只终止通道里的 shell，**GUI/长驻子进程可能成孤儿继续跑**（实测
+  rusd-viewer 窗口进程在通道结束后仍锁着 exe，导致 scp 覆盖报 Broken pipe）。
+  覆盖二进制或重开窗口前先 `tasklist | grep <name>` 查孤儿；只清自己起的 smoke
+  进程，子 agent 的进程按协调规矩处理。
