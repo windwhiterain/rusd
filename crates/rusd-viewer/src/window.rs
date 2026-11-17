@@ -38,6 +38,46 @@ pub fn centred_position(
     (origin.0 + dx, origin.1 + dy)
 }
 
+/// The monitor's **work area** (monitor minus taskbar/appbars), physical px.
+/// Opening against the full monitor let the controls bar land behind the
+/// taskbar; the work area is the rectangle a window may actually occupy.
+#[cfg(windows)]
+fn work_area_px(
+    origin: (i32, i32),
+    size: PhysicalSize<u32>,
+) -> Option<((i32, i32), PhysicalSize<u32>)> {
+    use windows_sys::Win32::Foundation::POINT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    let pt = POINT {
+        x: origin.0 + (size.width / 2) as i32,
+        y: origin.1 + (size.height / 2) as i32,
+    };
+    let hmon = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
+    if hmon.is_null() {
+        return None;
+    }
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if unsafe { GetMonitorInfoW(hmon, &mut info) } == 0 {
+        return None;
+    }
+    let r = info.rcWork;
+    Some((
+        (r.left, r.top),
+        PhysicalSize::new((r.right - r.left) as u32, (r.bottom - r.top) as u32),
+    ))
+}
+
+#[cfg(not(windows))]
+fn work_area_px(
+    _origin: (i32, i32),
+    _size: PhysicalSize<u32>,
+) -> Option<((i32, i32), PhysicalSize<u32>)> {
+    None
+}
+
 /// The opening rectangle for a window of `size` (physical) on `monitor`.
 pub fn place_on(
     origin: (i32, i32),
@@ -65,11 +105,12 @@ pub fn startup_window_attrs(event_loop: &ActiveEventLoop) -> Result<WindowAttrib
     // so converting with it keeps the two consistent.
     let scale = monitor.scale_factor().max(0.1);
     let want = LogicalSize::new(OPEN_SIZE.0, OPEN_SIZE.1).to_physical::<u32>(scale);
-    let (size, position) = place_on(
+    let (origin, area) = work_area_px(
         (monitor.position().x, monitor.position().y),
         monitor.size(),
-        want,
-    );
+    )
+    .unwrap_or(((monitor.position().x, monitor.position().y), monitor.size()));
+    let (size, position) = place_on(origin, area, want);
     Ok(attrs.with_inner_size(size).with_position(position))
 }
 

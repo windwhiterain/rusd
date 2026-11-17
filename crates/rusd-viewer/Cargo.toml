@@ -25,7 +25,7 @@ png = "0.18.1"
 wgpu = "30.0.2"
 egui = { version = "0.37", features = ["default_fonts"] }
 egui-wgpu = { version = "0.37", features = ["winit"] }
-egui-winit = { version = "0.37", default-features = false, features = ["wayland", "x11"] }
+egui-winit = { version = "0.37", default-features = false, features = ["clipboard"] }
 winit = "0.30"
 pollster = "1.0.1"
 
