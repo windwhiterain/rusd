@@ -32,6 +32,8 @@ struct Client {
     next_id: u64,
     /// Lines read but not yet consumed, oldest first.
     inbox: VecDeque<Value>,
+    /// A line received only in part when a timed read ran out.
+    partial: String,
 }
 
 impl Client {
@@ -42,11 +44,50 @@ impl Client {
             writer: stream,
             next_id: 1,
             inbox: VecDeque::new(),
+            partial: String::new(),
+        }
+    }
+
+    /// The next message of any kind (response or notification) within `budget`.
+    ///
+    /// Distinct from [`notification_within`](Self::notification_within), which
+    /// refuses to consume a response: a client that is both polling and
+    /// listening needs each message as it comes, whichever it is.
+    fn next_message_within(&mut self, budget: Duration) -> Option<(Duration, Value)> {
+        let start = Instant::now();
+        if let Some(msg) = self.inbox.pop_front() {
+            return Some((start.elapsed(), msg));
+        }
+        let remaining = budget.checked_sub(start.elapsed())?;
+        let timeout = Some(remaining.max(Duration::from_millis(1)));
+        self.reader
+            .get_ref()
+            .set_read_timeout(timeout)
+            .expect("set a read timeout");
+        let outcome = self.reader.read_line(&mut self.partial);
+        self.reader
+            .get_ref()
+            .set_read_timeout(None)
+            .expect("clear the read timeout");
+        match outcome {
+            Ok(0) => None,
+            Ok(_) => {
+                let line = std::mem::take(&mut self.partial);
+                let msg: Value = serde_json::from_str(&line).expect("the server writes JSON");
+                Some((start.elapsed(), msg))
+            }
+            Err(_) => None,
         }
     }
 
     /// Wait at most `budget` for the next notification, reporting how long it
     /// took. `None` means nothing arrived in time.
+    ///
+    /// A timeout must not corrupt the stream: the bytes of a partially received
+    /// line are kept in `partial`, and the next call continues from there. A
+    /// snapshot line is ~80 KB, so a short budget will routinely land mid-line,
+    /// and a reader that dropped the prefix there would mis-parse every later
+    /// message (the defect this test first tripped over).
     fn notification_within(&mut self, budget: Duration) -> Option<(Duration, Value)> {
         let start = Instant::now();
         loop {
@@ -63,8 +104,7 @@ impl Client {
                 .get_ref()
                 .set_read_timeout(timeout)
                 .expect("set a read timeout");
-            let mut line = String::new();
-            let outcome = self.reader.read_line(&mut line);
+            let outcome = self.reader.read_line(&mut self.partial);
             // The socket keeps the timeout once set: an ordinary blocking read
             // later must not inherit this budget.
             self.reader
@@ -74,9 +114,11 @@ impl Client {
             match outcome {
                 Ok(0) => return None,
                 Ok(_) => {
+                    let line = std::mem::take(&mut self.partial);
                     let msg: Value = serde_json::from_str(&line).expect("the server writes JSON");
                     self.inbox.push_back(msg);
                 }
+                // Timed out mid-line: keep what arrived and try again later.
                 Err(_) => return None,
             }
         }
@@ -92,9 +134,21 @@ impl Client {
     }
 
     fn read_line(&mut self) -> Value {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line).expect("read a line");
-        assert!(n > 0, "the server closed the connection");
+        // A blocking read must also continue a line a timed read left half-read.
+        let line = if self.partial.is_empty() {
+            let mut line = String::new();
+            let n = self.reader.read_line(&mut line).expect("read a line");
+            assert!(n > 0, "the server closed the connection");
+            line
+        } else {
+            let mut line = std::mem::take(&mut self.partial);
+            self.reader.read_line(&mut line).expect("read a line");
+            assert!(
+                line.ends_with('\n'),
+                "the server closed the connection mid-line"
+            );
+            line
+        };
         serde_json::from_str(&line).expect("the server writes JSON")
     }
 
@@ -680,6 +734,56 @@ fn reload_with_delay(client: &mut Client, budget: Duration) -> Option<(Duration,
             None => return None,
         }
     }
+}
+
+#[test]
+fn a_busy_client_still_gets_its_reload() {
+    // The shape a live viewer has: subscribed, and still talking (polling
+    // `state` every few milliseconds while it animates) when the file changes.
+    //
+    // This is the case the idle-client tests miss. The sync loop used to learn
+    // of a due reload only from a `recv_timeout` timeout, so a client that kept
+    // requests flowing made every receive return at once and the reload starved
+    // until the traffic stopped — unbounded delay, which is the field symptom.
+    const BUDGET: Duration = Duration::from_secs(2);
+    let scratch = Scratch::new("busy.rusd", CITY);
+    let (server, mut client, mut mirror) = subscribed();
+    let path = scratch.spec();
+    let (_, snapshot, _) = client.mutate("open", json!({"path": path}));
+    assert!(mirror.apply(&snapshot));
+    let v1 = mirror.version;
+
+    // Start the rewrite, then keep the connection busy while waiting for the
+    // reload: send a cheap request, then read whatever arrives with a short
+    // timeout. Nothing here blocks, so the loop cannot hang on a miss.
+    scratch.write(&CITY.replace("blocks_x = 6", "blocks_x = 2"));
+    let start = Instant::now();
+    let mut reload = None;
+    while start.elapsed() < BUDGET {
+        let id = client.send("state", json!({}));
+        let quiet_until = Instant::now() + Duration::from_millis(50);
+        while Instant::now() < quiet_until {
+            let Some((_took, msg)) = client.next_message_within(Duration::from_millis(5)) else {
+                break;
+            };
+            if msg["method"].as_str() == Some("state_changed")
+                && msg["params"]["reason"] == "reload"
+            {
+                reload = Some(start.elapsed());
+                break;
+            }
+        }
+        if reload.is_some() {
+            break;
+        }
+        let _ = id;
+    }
+    let latency = reload.unwrap_or_else(|| {
+        panic!("a busy, subscribed client never saw the reload within {BUDGET:?}")
+    });
+    assert!(latency <= BUDGET, "the reload took {latency:?}");
+    let _ = v1;
+    drop(server);
 }
 
 #[test]

@@ -135,8 +135,19 @@ impl Server {
                 loop {
                     // A pending file-watch debounce turns the blocking receive
                     // into a timed one: the loop wakes on the deadline when no
-                    // message arrives first, so a reload never blocks a
-                    // request and a request never delays a reload forever.
+                    // message arrives first, so a reload never blocks a request
+                    // and a request never delays a reload forever.
+                    //
+                    // The deadline is checked *before* the receive, not only
+                    // reported by a receive timeout: a client that keeps
+                    // sending requests (a live viewer polling `state`) makes
+                    // every `recv_timeout` return at once, so a reload due
+                    // during that traffic would otherwise starve until the
+                    // client went quiet.
+                    if session.deadline_passed() {
+                        session.on_deadline();
+                        continue;
+                    }
                     let msg = match session.next_deadline() {
                         Some(deadline) => {
                             let wait = deadline.saturating_duration_since(Instant::now());
@@ -416,6 +427,13 @@ impl Session {
     /// The instant the sync loop must wake at, if a file event is debouncing.
     fn next_deadline(&self) -> Option<Instant> {
         self.reload_due
+    }
+
+    /// Whether a debounce has expired with the loop not yet having seen it. The
+    /// loop asks this before every receive, so a reload that falls due while
+    /// requests are arriving is published then and not after the traffic stops.
+    fn deadline_passed(&self) -> bool {
+        self.reload_due.is_some_and(|due| Instant::now() >= due)
     }
 
     /// The debounce expired with no newer event: re-read the watched document
