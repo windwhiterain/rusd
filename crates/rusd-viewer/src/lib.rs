@@ -28,12 +28,16 @@
 //!   → fitted geometry — plus the pure [`session::ClientModel`] the view drives.
 //! - [`net`]: the TCP client thread (owner of `hello`/`subscribe`/outgoing
 //!   edits) and the render thread that owns the GPU.
+//! - [`fonts`]: system CJK font loading, so Chinese UI text is glyphs and not
+//!   tofu (the built-in egui faces are Latin-only).
+//! - [`window`]: the opening rectangle — 1280×720 centred on the primary monitor.
 //! - [`app`]: the winit + egui shell that ties them together (`view`).
 
 pub mod anchor;
 pub mod app;
 pub mod camera;
 pub mod compose;
+pub mod fonts;
 pub mod gizmo;
 pub mod gpu;
 pub mod memresolver;
@@ -41,6 +45,7 @@ pub mod net;
 pub mod protocol;
 pub mod scene;
 pub mod session;
+pub mod window;
 
 use rusd_core::Diagnostic;
 

@@ -126,7 +126,11 @@ pub fn compose_to_png(
     let manifest = Manifest::from_json(manifest_json)?;
     let stack = Stack::build(&manifest)?;
     let mut diags = stack.diags.clone();
-    let geo = scene::extract_fitted(&stack.stage);
+    // The headless snapshot's frame is the output image: fit to the image the
+    // PNG will be, so a `compose` of a wide scene is framed like the same scene
+    // in a wide window.
+    let aspect = f64::from(width) / f64::from(height.max(1));
+    let geo = scene::extract_fitted(&stack.stage, aspect);
     diags.extend(geo.diags.iter().cloned());
     let render = scene::write_snapshot(&geo, width, height, out)?;
     let bbox = BBox {

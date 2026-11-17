@@ -319,7 +319,7 @@ mod tests {
             min: [-100.0, -100.0, 0.0],
             max: [100.0, 100.0, 40.0],
         };
-        let cam = scene::fit_camera(&bbox);
+        let cam = scene::fit_camera(&bbox, 16.0 / 9.0);
         (Orbit::from_camera(&cam), bbox.corners())
     }
 
@@ -330,7 +330,7 @@ mod tests {
             min: [-100.0, -100.0, 0.0],
             max: [100.0, 100.0, 40.0],
         };
-        let want = scene::fit_camera(&bbox);
+        let want = scene::fit_camera(&bbox, 16.0 / 9.0);
         let got = orbit.camera();
         for k in 0..3 {
             assert!(
