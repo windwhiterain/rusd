@@ -19,47 +19,57 @@
 //!
 //! Which mutations rebuild, and which edit in place:
 //!
-//! - `open` / `patch` / `undo` / `redo`: the document changed, so the root layer
-//!   must be re-authored — rebuild the stage, replay the opinions, re-cook.
+//! - `open` / `patch` / `undo` / `redo` / a hot **reload**: the document
+//!   changed, so the root layer must be re-authored — rebuild the stage, replay
+//!   the opinions, re-cook.
 //! - `opinion`: the session layer is edited in place (`Stage::layer_mut`), which
 //!   is what a gizmo drag sends tens of times a second; the stage survives, so
 //!   the cook engine's memo still hits for every node whose inputs did not move.
 //!
+//! Hot reload watches the opened *file* (`notify`, no recursion) — a document
+//! handed in as `content` has none — and re-reads it once the save has gone
+//! quiet (`RELOAD_DEBOUNCE`). A rewrite that leaves the bytes unchanged publishes
+//! nothing. REMOTE §9 G4's missing reload is an `openusd` crate gap on the client
+//! mirror side; the server needs no crate reload because it rebuilds the stage
+//! from the document.
+//!
 //! `Stage` is `Rc`-based and therefore `!Send`, so the whole session — document,
-//! stage, cook memo, versions, subscriber list — lives on one dedicated sync
-//! thread and every connection talks to it through a channel (REMOTE §7's hard
-//! boundary, applied to the server).
+//! stage, cook memo, versions, subscriber list, the live watch — lives on one
+//! dedicated sync thread and every connection talks to it through a channel
+//! (REMOTE §7's hard boundary, applied to the server). The watch callback runs on
+//! `notify`'s thread and only wakes this loop; the debounce is a deadline on the
+//! loop's timed receive, so a pending reload never starves a request.
 //!
-//! ## Deviations from `docs/PROTOCOL.md`, and the gaps found
+//! ## Semantics beyond the protocol's shape
 //!
-//! - **No file watcher.** PROTOCOL lists hot reload as a mutation and the
-//!   `state_changed` reason `"reload"`; REMOTE §9 G4 decides there is no
-//!   external change detection ("推送驱动"), so nothing produces that reason
-//!   yet. The reason is reserved, not implemented.
+//! Everything below is recorded in `docs/PROTOCOL.md`'s 「v1 实现语义补记」, which
+//! the parent decision made part of the contract — none of it is a deviation:
+//!
 //! - **`subscribe` also pushes the current snapshot** to that connection when a
-//!   stage exists, right after its `{version}` response. Without it a client
-//!   that subscribes to an already-open document has no way to obtain the
-//!   current snapshot: the protocol defines no snapshot fetch. The message shape
-//!   is unchanged (an ordinary `stage_snapshot` notification the client's
-//!   version rule already handles).
-//! - **`hello.session`** is the server's session name (`rusd-serve/<pid>`); the
-//!   contract fixes the field, not its meaning.
-//! - **A mutation that cannot compose** (validation errors, a failed flatten)
-//!   reports `diagnostics` and does not advance `version`: there is no stage to
-//!   snapshot, so a `state_changed` naming a version no snapshot will ever carry
-//!   would desynchronize every client.
-//! - **Order inside one broadcast**: `stage_snapshot`, then `diagnostics` when
-//!   there are any, then `state_changed`.
+//!   stage exists, right after its `{version}` response: the protocol defines no
+//!   snapshot fetch, so a late subscriber would otherwise never see the scene.
+//! - **`hello.session`** is `rusd-serve/<pid>`; a protocol mismatch is refused
+//!   with `-32602 invalid params`.
+//! - **A mutation that cannot compose** (parse/validation errors, a failed
+//!   flatten) broadcasts `diagnostics` and does not advance `version`: a
+//!   `state_changed` naming a version no snapshot will carry would strand every
+//!   client.
+//! - **Order after one request**: its response, then `stage_snapshot`, then
+//!   `diagnostics` when there are any, then `state_changed`.
+//! - **`rusd serve --listen`** takes `DEFAULT_LISTEN` for a bare flag; no flag
+//!   leaves the server on stdio.
 
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use notify::Watcher as _;
 use openusd::gf;
 use openusd::sdf::{self, AttributeSpec, Variability};
 use openusd::usd::Stage;
@@ -71,6 +81,15 @@ use crate::Agent;
 
 /// The wire protocol version this server speaks (`hello`).
 pub const PROTOCOL_VERSION: u64 = 1;
+
+/// The bind address `rusd serve --listen` uses when the flag carries no value
+/// (PROTOCOL §传输).
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:8765";
+
+/// How long after the last file event the document is re-read. A save is not
+/// one write event — a truncate, the write, a rename, a metadata touch — so the
+/// quiet period after the last event is what marks the save complete.
+const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// JSON-RPC codes used here (PROTOCOL §传输).
 const INVALID_REQUEST: i64 = -32600;
@@ -108,12 +127,34 @@ impl Server {
 
         let (tx, rx) = mpsc::channel::<Msg>();
         let name = format!("rusd-serve/{}", std::process::id());
+        let sync_tx = tx.clone();
         thread::Builder::new()
             .name("rusd-sync".to_owned())
             .spawn(move || {
-                let mut session = Session::new(name);
-                for msg in rx {
-                    session.handle(msg);
+                let mut session = Session::new(name, sync_tx);
+                loop {
+                    // A pending file-watch debounce turns the blocking receive
+                    // into a timed one: the loop wakes on the deadline when no
+                    // message arrives first, so a reload never blocks a
+                    // request and a request never delays a reload forever.
+                    let msg = match session.next_deadline() {
+                        Some(deadline) => {
+                            let wait = deadline.saturating_duration_since(Instant::now());
+                            match rx.recv_timeout(wait) {
+                                Ok(msg) => Some(msg),
+                                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        None => match rx.recv() {
+                            Ok(msg) => Some(msg),
+                            Err(_) => break,
+                        },
+                    };
+                    match msg {
+                        Some(msg) => session.handle(msg),
+                        None => session.on_deadline(),
+                    }
                 }
             })?;
 
@@ -181,6 +222,16 @@ pub fn serve_tcp(addr: &str) -> Result<(), String> {
     }
 }
 
+/// What a `--listen` flag means given the word after it: a value that is not
+/// another flag is the address, and a bare flag (no word, or a flag following)
+/// means [`DEFAULT_LISTEN`].
+pub fn listen_target(next: Option<&str>) -> &str {
+    match next {
+        Some(value) if !value.starts_with('-') => value,
+        _ => DEFAULT_LISTEN,
+    }
+}
+
 // --- one connection -------------------------------------------------------
 
 /// A message from a connection thread to the sync thread.
@@ -194,6 +245,8 @@ enum Msg {
     },
     /// The connection closed: forget its subscription.
     Gone { conn: u64 },
+    /// The watched document file changed on disk: (re)arm the debounce.
+    FileChanged,
 }
 
 /// Read NDJSON requests from `stream` until it closes, handing each to the sync
@@ -309,10 +362,29 @@ struct Session {
     /// that request's response is written: a client that sends `open` reads the
     /// response to `open` first, then the snapshot it caused.
     pending: Vec<String>,
+    /// A channel back into this same sync loop, which the file-watch callback
+    /// uses to wake it (that callback runs on `notify`'s own thread).
+    wake: mpsc::Sender<Msg>,
+    /// The document path being watched for hot reload, and the watcher that
+    /// holds the registration. One watcher is kept and re-pointed when `open`
+    /// names a different file, because dropping it would end the watch.
+    watch: Option<Watch>,
+    /// When the debounce of the last file event expires; `None` when no file
+    /// event is pending.
+    reload_due: Option<Instant>,
+}
+
+/// The hot-reload watch on one document path (PROTOCOL `reason:"reload"`).
+struct Watch {
+    /// The path `open` named — the file, not its directory, so an unrelated
+    /// write beside it never wakes the session.
+    path: PathBuf,
+    /// Held, never read: dropping it ends the watch.
+    _watcher: notify::RecommendedWatcher,
 }
 
 impl Session {
-    fn new(session_name: String) -> Self {
+    fn new(session_name: String, wake: mpsc::Sender<Msg>) -> Self {
         Session {
             agent: Agent::new(),
             session_name,
@@ -325,6 +397,9 @@ impl Session {
             redo: Vec::new(),
             subs: BTreeMap::new(),
             pending: Vec::new(),
+            wake,
+            watch: None,
+            reload_due: None,
         }
     }
 
@@ -334,7 +409,72 @@ impl Session {
             Msg::Gone { conn } => {
                 self.subs.remove(&conn);
             }
+            Msg::FileChanged => self.reload_due = Some(Instant::now() + RELOAD_DEBOUNCE),
         }
+    }
+
+    /// The instant the sync loop must wake at, if a file event is debouncing.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.reload_due
+    }
+
+    /// The debounce expired with no newer event: re-read the watched document
+    /// and publish it as a `reload`.
+    fn on_deadline(&mut self) {
+        if self.reload_due.take().is_none() {
+            return;
+        }
+        let Some(path) = self.watch.as_ref().map(|w| w.path.clone()) else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            // A save caught mid-write is not an error worth publishing: the
+            // next event brings the finished file.
+            return;
+        };
+        if self.agent.doc_text() == Some(text.as_str()) {
+            return;
+        }
+        if let Some(before) = self.agent.doc_text().map(str::to_owned) {
+            self.undo.push(Face::Doc(before));
+        }
+        self.redo.clear();
+        self.agent.replace_doc(text);
+        let pipeline = self.rebuild();
+        let _ = self.after_mutation("reload", &pipeline);
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            self.broadcast(&pending);
+        }
+    }
+
+    /// Point the hot-reload watch at `path`, replacing any earlier one.
+    fn watch_doc(&mut self, path: &str) {
+        if self.watch.as_ref().map(|w| w.path.as_path()) == Some(Path::new(path)) {
+            return;
+        }
+        self.watch = None;
+        self.reload_due = None;
+        let wake = self.wake.clone();
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            // Any delivery is a hint to re-read; the re-read itself decides
+            // whether the content changed.
+            if event.is_ok() {
+                let _ = wake.send(Msg::FileChanged);
+            }
+        });
+        let Ok(mut watcher) = watcher else {
+            eprintln!("rusd serve: cannot watch {path} for hot reload: the OS watcher failed");
+            return;
+        };
+        if let Err(e) = watcher.watch(Path::new(path), notify::RecursiveMode::NonRecursive) {
+            eprintln!("rusd serve: cannot watch {path} for hot reload: {e}");
+            return;
+        }
+        self.watch = Some(Watch {
+            path: PathBuf::from(path),
+            _watcher: watcher,
+        });
     }
 
     /// Dispatch one request and write its JSON-RPC response to `out`.
@@ -474,6 +614,15 @@ impl Session {
         self.ops.clear();
         self.undo.clear();
         self.redo.clear();
+        // Hot reload follows a document opened by path; a document handed in as
+        // `content` has no file to watch.
+        match p.get("path").and_then(Value::as_str) {
+            Some(path) => self.watch_doc(path),
+            None => {
+                self.watch = None;
+                self.reload_due = None;
+            }
+        }
         let pipeline = self.rebuild();
         self.after_mutation("open", &pipeline)?;
         Ok(result)

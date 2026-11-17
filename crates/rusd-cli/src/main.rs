@@ -286,11 +286,14 @@ fn main() {
             }
         }
         Some("serve") => {
-            // `--listen <addr:port>` switches the same tool server to TCP NDJSON
-            // JSON-RPC (D12, docs/PROTOCOL.md); without it, stdio is unchanged.
-            match flag_val(&args, "--listen") {
-                Some(addr) => {
-                    if let Err(e) = rusd_agent::transport::serve_tcp(&addr) {
+            // `--listen [addr:port]` switches the same tool server to TCP NDJSON
+            // JSON-RPC (D12, docs/PROTOCOL.md). A bare flag takes PROTOCOL's
+            // default `127.0.0.1:8765`; without the flag, stdio is unchanged.
+            match args.iter().position(|a| a == "--listen") {
+                Some(i) => {
+                    let addr =
+                        rusd_agent::transport::listen_target(args.get(i + 1).map(String::as_str));
+                    if let Err(e) = rusd_agent::transport::serve_tcp(addr) {
                         eprintln!("rusd: {e}");
                         std::process::exit(2);
                     }

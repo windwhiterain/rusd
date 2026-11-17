@@ -499,3 +499,165 @@ fn a_tool_call_fails_cleanly_before_open() {
     assert_eq!(msg["id"].as_u64(), Some(id));
     assert_eq!(msg["error"]["code"].as_i64(), Some(-32000), "{msg}");
 }
+
+#[test]
+fn a_bare_listen_flag_takes_the_protocol_default() {
+    assert_eq!(rusd_agent::transport::listen_target(None), "127.0.0.1:8765");
+    assert_eq!(
+        rusd_agent::transport::listen_target(Some("--verbose")),
+        "127.0.0.1:8765",
+        "a following flag is not an address"
+    );
+    assert_eq!(
+        rusd_agent::transport::listen_target(Some("0.0.0.0:9000")),
+        "0.0.0.0:9000"
+    );
+}
+
+// --- hot reload -----------------------------------------------------------
+
+/// A unique scratch document under the system temp dir, removed on drop.
+struct Scratch {
+    path: std::path::PathBuf,
+}
+
+impl Scratch {
+    fn new(name: &str, text: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("rusd_agent_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the scratch dir");
+        let path = dir.join(name);
+        std::fs::write(&path, text).expect("seed the scratch document");
+        Scratch { path }
+    }
+
+    /// The path as `open` wants it: a Windows path on this peer, so the server
+    /// process resolves it the same way the test's own `read_to_string` does.
+    fn spec(&self) -> String {
+        self.path.to_string_lossy().replace('\\', "/")
+    }
+
+    /// Atomically replace the file, the way an editor saves.
+    fn write(&self, text: &str) {
+        let tmp = self.path.with_extension("tmp");
+        std::fs::write(&tmp, text).expect("write the new document");
+        std::fs::rename(&tmp, &self.path).expect("replace the document");
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[test]
+fn rewriting_the_document_file_publishes_a_reload() {
+    let scratch = Scratch::new("reload.rusd", CITY);
+    let (server, mut client, mut mirror) = subscribed();
+    let path = scratch.spec();
+
+    let (_, snapshot, state) = client.mutate("open", json!({"path": path}));
+    assert!(mirror.apply(&snapshot));
+    assert_eq!(state["reason"].as_str(), Some("open"));
+    let v1 = mirror.version;
+    let before = mirror.bounds();
+
+    // Rewrite the document on disk exactly as an editor would. The server is
+    // watching the file, so it re-reads, re-cooks and publishes a `reload`.
+    scratch.write(&CITY.replace("blocks_x = 6", "blocks_x = 2"));
+
+    let mut saw_reload = false;
+    for _ in 0..2 {
+        let (snapshot, state) = client.mutation();
+        assert!(mirror.apply(&snapshot), "snapshot {snapshot:?}");
+        let reason = state["reason"].as_str().unwrap_or_default().to_owned();
+        assert_eq!(state["version"].as_u64(), Some(mirror.version));
+        if reason == "reload" {
+            saw_reload = true;
+            break;
+        }
+    }
+    assert!(saw_reload, "the rewrite must publish a reload");
+    assert_eq!(mirror.version, v1 + 1, "one rewrite, one version");
+
+    let after = mirror.bounds();
+    assert!(
+        bounds_differ(before, after, 1.0),
+        "the reloaded document must change the composed bbox: {before:?} -> {after:?}"
+    );
+    assert!(after.1[0] < before.1[0], "2 blocks is narrower in X");
+
+    // Re-opening the same path keeps the watch: a second rewrite still reloads,
+    // and the first one is not published twice.
+    scratch.write(CITY);
+    let (snapshot, state) = loop {
+        let pair = client.mutation();
+        if pair.1["reason"].as_str() == Some("reload") {
+            break pair;
+        }
+    };
+    assert!(mirror.apply(&snapshot));
+    assert_eq!(state["version"].as_u64(), Some(v1 + 2));
+    let restored = mirror.bounds();
+    assert!(
+        bounds_differ(after, restored, 1.0),
+        "the block grid is back"
+    );
+    drop(server);
+}
+
+#[test]
+fn an_unreadable_document_reports_diagnostics_without_a_version() {
+    let scratch = Scratch::new("broken.rusd", CITY);
+    let (_server, mut client, mut mirror) = subscribed();
+    let path = scratch.spec();
+    let (_, snapshot, _) = client.mutate("open", json!({"path": path}));
+    assert!(mirror.apply(&snapshot));
+    let v1 = mirror.version;
+
+    // A document that cannot even be parsed publishes its diagnostics and no
+    // new version: there is no stage to snapshot, and a `state_changed` naming
+    // a version no snapshot will carry would strand every client.
+    scratch.write("[stage\ndefault_prim = \"/World\"\n");
+    let diagnostics = loop {
+        let msg = client.notification();
+        if msg["method"].as_str() == Some("diagnostics") {
+            break msg["params"].clone();
+        }
+        assert_ne!(
+            msg["method"].as_str(),
+            Some("state_changed"),
+            "a failed reload must not publish a version: {msg}"
+        );
+    };
+    assert!(
+        !diagnostics["items"].as_array().unwrap().is_empty(),
+        "the failure is reported: {diagnostics}"
+    );
+    assert_eq!(mirror.version, v1, "the client's version did not move");
+}
+
+#[test]
+fn opening_by_content_leaves_no_watch_behind() {
+    // `open{content}` has no file, so a later write to a file of the same name
+    // must not resurrect it as a reload.
+    let scratch = Scratch::new("content.rusd", CITY);
+    let (_server, mut client, mut mirror) = subscribed();
+    let (_, snapshot, _) = client.mutate("open", json!({"path": scratch.spec()}));
+    assert!(mirror.apply(&snapshot));
+    let (_, snapshot, _) = client.mutate("open", json!({"content": CITY}));
+    assert!(mirror.apply(&snapshot));
+    let version = mirror.version;
+
+    scratch.write(&CITY.replace("blocks_x = 6", "blocks_x = 2"));
+
+    // The next line after a request is that request's response, so a reload
+    // would have shown up ahead of it.
+    let id = client.send("query", json!({}));
+    let mut msg = client.read_line();
+    if msg["method"].as_str() == Some("diagnostics") {
+        msg = client.read_line();
+    }
+    assert_eq!(msg["id"].as_u64(), Some(id), "nothing was published: {msg}");
+    assert_eq!(mirror.version, version);
+}
