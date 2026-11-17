@@ -258,3 +258,21 @@ API 可读，不依赖 pcp 内部），序列化后供 client 画树。Tier B �
   arcs 含 reference 到 prototypes，prim_nodes 的 authored_in 强度序正确；
 - comp_node 四类详情各一测试；overrides 覆盖过的 prim 的 opinions 首条 = session layer；
 - 未知 id -32602。
+## v1.3 增补（D13 UI 裁定：合成树面板不画 prim 列表；2026-11-17 用户裁定）
+
+**用户裁定：「不要显示 prim tree，太多了没有用。」** 合成树面板只画**合成结构**：
+layers（strength 序，session 最强）+ arcs（边/命名行指向目标层）+ variant_sets/variants。
+**不画 prim 节点列表**（city 475 行是噪声）。
+
+- prim 的检视入口 = **viewport 点选**：pick 得 path → 按 path 查 `composition_tree`
+  payload 里 prim_nodes 的 id → `comp_node{id}` 详情面板（逐层 opinions 强度序）。
+  点选仍自动拷贝 prim path 到剪切板 + toast（v1.1 条款不变）。
+- `composition_tree` / `comp_node` **payload 不变**（server 不动）；prim_nodes 仍返回
+  供 path→id 映射与 provenance，只是不上树。
+- 面板因此变窄，viewport 可用空间变大（与 v1.2 布局修复同轮交付）。
+
+### 验收（client 侧）
+
+- tree 模型/面板回归：断言渲染行只含 layer/arc/variant 三类，**无 prim 行**；
+- pick→path→id→comp_node 详情链路测试（mock server）；
+- 剪切板条款回归保持。
