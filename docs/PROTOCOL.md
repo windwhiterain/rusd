@@ -26,6 +26,24 @@ render/pick**——它在本地合成、本地渲染、本地拾取（D12 核心
 - `opinion{ops:[{path, field, value, op:"set"|"remove"}]}` → `{version}`。
   落点 = server 的 **overrides session layer**（D12 §3 第三编辑面），不是文档 CST。
   gizmo 拖动节流 ≤30Hz 发 opinion；server 作者后重合成并广播。
+  **`value` 的形状由字段的 Sdf 类型决定**（本协议不另定壳）；`remove` 不带 `value`。
+  v1 client 只发一种：`field="xformOp:translate"`、`value=[x,y,z]` 三个数的 JSON 数组。
+
+### `opinion` 的 `value` 语义（父会话裁定，2026-11-17，第二轮）
+
+`value` = **该 field 的 Sdf 值原样**，由 server 按合成的属性声明类型写进 overrides
+session layer 的同名 op（实现见 `rusd-agent` 的 `apply_opinion`/`json_to_sdf`）。因此：
+
+- **`xformOp:translate` 的 `value` 是 prim 的局部坐标**（父坐标系下的 op 值），**不是**世界坐标。
+  server 现状即原样写入；集成测试断言写进去的 translate 等于覆盖值。
+- **世界 → 局部的转换归 client**：gizmo 的世界目标须经**父 prim 世界矩阵之逆**变换后再发
+  （旋转/缩放的一般情形也是逆矩阵，不只是减平移）。client 实现：`rusd-viewer` 的
+  `gizmo::drag_translate`（delta 形，按压瞬间不加漂移）/ `gizmo::world_to_local`（绝对形），
+  锚点由 `anchor::Anchor` 从合成 stage 读（子代 local translate + 父世界矩阵）。
+- **理由**：lot 挂在带 translate 的 block 下，直接写世界直会重演「原点加两遍」类错误
+  （M6 `fix/ground-size` 的根因）。
+- client 若持有绝对世界目标，用绝对形；拖拽本身用 delta 形，使几何中心不在局部原点的 prim
+  不会在按下瞬间跳动。
 - `undo`/`redo` 覆盖文档 CST 与 overrides 两个编辑面（D11 + D12 §3）。
 
 ## 通知（server → 订阅者）

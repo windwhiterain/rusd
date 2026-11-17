@@ -20,6 +20,7 @@ const DEFAULT_HEIGHT: u32 = 540;
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let code = match args.first().map(String::as_str) {
+        Some("view") => view_cmd(&args[1..]),
         Some("snapshot") => snapshot_cmd(&args),
         Some("compose") => compose_cmd(&args),
         Some("help") | Some("--help") | Some("-h") => {
@@ -37,9 +38,25 @@ fn main() {
 fn usage() {
     eprintln!(
         "usage:\n  \
+         rusd-viewer view     --connect <addr:port> [--usdc <fallback>]\n  \
          rusd-viewer snapshot --usdc <path> --out <png> [--width {DEFAULT_WIDTH} --height {DEFAULT_HEIGHT}]\n  \
          rusd-viewer compose  --manifest <json> --out <png> [--width {DEFAULT_WIDTH} --height {DEFAULT_HEIGHT}]"
     );
+}
+
+/// `view`: the interactive client (D12, `docs/REMOTE.md`): a winit + egui window
+/// that connects to a server, shows its snapshots, and keeps orbit / pan / zoom /
+/// pick / selection local.
+fn view_cmd(args: &[String]) -> i32 {
+    let args = match rusd_viewer::app::ViewArgs::parse(args) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("rusd-viewer view: {e}");
+            usage();
+            return 2;
+        }
+    };
+    rusd_viewer::app::run(args)
 }
 
 /// `snapshot`: a single `.usdc` read from disk, composed in memory, rendered.

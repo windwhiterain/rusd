@@ -87,16 +87,25 @@ peer 构建 scp 分发）。server 不再拥有相机——相机归 client，se
       直接合成逐 opinion 全等（2026-11-17）；跨机器（scp 到用户机本地 GPU）：items 434、
       **bbox min/max 与 peer 逐位相同**、foreground 121073 相同、PNG 均 41752B、逐像素差
       **125/518400 = 0.024%** 全在边缘（双 GPU 光栅容差）。详见 REMOTE §10。
-- [ ] server 传输层（**`m4/serve-transport`**，契约 `docs/PROTOCOL.md` = `67b5522`）：
+- [x] server 传输层（**`m4/serve-transport`**，已并 main `736dc57`）：
       TCP NDJSON JSON-RPC（复用 rusd-agent 工具名）+ `hello`/`subscribe` + `opinion` + 通知
-      `stage_snapshot` / `layers_changed` / `diagnostics` / `state_changed`；默认 loopback
-- [ ] Tier A 推送：change 时推 flattened usdc 快照；client `Layer::from_bytes` 单层栈 →
-      extract → 本地 wgpu 渲染（flatten 丢 arcs ⇒ 匿名安全）
+      `stage_snapshot` / `layers_changed` / `diagnostics` / `state_changed`；默认 loopback；
+      v1 实现语义见 PROTOCOL「v1 实现语义补记」
+- [x] Tier A 推送：change 时推 flattened usdc 快照；client `Layer::from_bytes` 单层栈 →
+      extract → 本地 wgpu 渲染（flatten 丢 arcs ⇒ 匿名安全）——client 半边即 `rusd-viewer`
 - [ ] Tier B 镜像：命名 identifier layer stack 逐层推送（usda 文本 / usdc 字节）+ client 自定义
       `ar::Resolver` + `Stage::builder().resolver().session_layer().open()`；层变更 = 重建 stage
-- [ ] `rusd-viewer` crate：winit + egui 壳，本地 orbit/zoom/pick/annotate（零网络往返），
-      相机归 client（每次 render 带全 RenderConfig）——**`m4/viewer-egui`**
-- [ ] spike ③：egui 壳 + gizmo → override opinion 闭环（②已过，可开；归 `m4/viewer-egui`）
+- [x] `rusd-viewer` crate：winit + egui 壳，本地 orbit/zoom/pick/annotate（零网络往返），
+      相机归 client（每次 render 带全 RenderConfig）——**`m4/viewer-egui`**：`view --connect`
+      交付（client 线程 hello/subscribe + 快照→单层合成→owned 几何→渲染线程；orbit/pan/zoom/
+      pick/描边全本地；status 栏 version/连接态 + `reload` 徽标）；**94 测试**（含 mock server
+      协议集成 15 项），egui 0.37 / egui-wgpu 0.37 / egui-winit 0.37 / winit 0.30.13 / wgpu 30.0.2
+      同栈编译通过；persistent-device viewport 与 `rusd_render` **逐字节同图**（设备创建实测 ~250ms，
+      每次 render 都建设备无法交互）
+- [x] spike ③：egui 壳 + gizmo → override opinion 闭环（归 `m4/viewer-egui`）：拖动选中 prim →
+      `opinion{ops:[{path, field:"xformOp:translate", value:[x,y,z], op:"set"}]}` 节流 ≤30Hz + 拖尾保底，
+      本地先预览（re-bake 单 prim），undo/redo 发 server。**`value` = prim 局部坐标**（父会话裁定，
+      2026-11-17 第二轮；世界→局部逆变换归 client：`gizmo::drag_translate` + `anchor::Anchor`）
 - [ ] SSH 隧道文档（`ssh -L`）与分发说明（peer 构建 → scp，同 win-x64）
 - [ ] 后置：`Diff`/`apply_diff` 细粒度增量（`sdf::Value`/`Diff` 无 serde，需自定义 codec）；
       `--bind LAN`

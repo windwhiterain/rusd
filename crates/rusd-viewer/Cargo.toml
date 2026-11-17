@@ -1,6 +1,6 @@
 [package]
 name = "rusd-viewer"
-description = "Spike: memory-only composite stacks (MemResolver) rendered headless — USD-layer remote, no network, no egui"
+description = "Rusd remote viewer client (D12): memory composite, persistent-device viewport, egui shell, wire protocol"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,6 +18,13 @@ rusd-scene.workspace = true
 rusd-render.workspace = true
 openusd.workspace = true
 serde_json = "1"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+wgpu = "30.0.2"
+egui = "0.37"
+egui-wgpu = { version = "0.37", features = ["winit"] }
+egui-winit = { version = "0.37", default-features = false, features = ["wayland", "x11"] }
+winit = "0.30"
+pollster = "1.0.1"
 
 [dev-dependencies]
 rusd-proc.workspace = true

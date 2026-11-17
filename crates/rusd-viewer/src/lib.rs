@@ -1,25 +1,46 @@
-//! # rusd-viewer (spike ②)
+//! # rusd-viewer
 //!
-//! Client-side, headless proof of the USD-layer remote design (SPEC D12 v2):
-//! a composite USD stack that exists **only in memory** — a root layer, its
-//! sublayers and a session layer, all handed over as bytes — composes and
-//! renders exactly like the same stack on disk.
+//! The client side of SPEC decision D12 (`docs/REMOTE.md`): the *scene* crosses
+//! the network, never the pixels. A composite USD stack arrives as bytes,
+//! composes in memory, renders locally, and every camera move, click and
+//! selection after that costs no round trip.
 //!
 //! - [`memresolver`]: [`MemResolver`], an [`openusd::ar::Resolver`] serving
 //!   layer bytes keyed by virtual path. Relative `subLayers` / reference paths
 //!   anchor inside the mirror, so composition sees a real layer graph.
-//! - [`scene`]: geometry extraction + a bbox-fit look-at camera (focal 35,
-//!   aperture 36×20.25) and the offscreen render to PNG, sharing `rusd-cli
-//!   render`'s default [`RenderConfig`] so images are comparable.
 //! - [`compose`]: the manifest → mirror → stage path (`session_layer` +
-//!   `open`), the shape a remote client would run.
-//!
-//! No network, no egui, no filesystem beyond the one `.usdc` read and the PNG
-//! written: everything between is memory.
+//!   `open`), and the base64 the wire uses.
+//! - [`scene`]: geometry extraction + a bbox-fit look-at camera (focal 35,
+//!   aperture 36×20.25) and the one-shot offscreen render to PNG.
+//! - [`gpu`]: the interactive viewport — the same beauty/prim-id passes as
+//!   `rusd_render`, on a device created **once**, so a camera move is a redraw
+//!   rather than a new GPU.
+//! - [`protocol`]: D12 wire protocol v1's client half: request lines
+//!   (`hello` / `subscribe` / `opinion` / `undo` / `redo`), the notification
+//!   parser, the monotonic-version discard rule, and the gizmo throttle.
+//! - [`camera`]: the client's own orbit / pan / zoom and the screen↔world
+//!   mapping a pick needs.
+//! - [`gizmo`]: the client's world→local conversion for a drag — an opinion's
+//!   `value` is the field's own op, so a local translation is what a move means.
+//! - [`anchor`]: the drag anchor read from the composed stage (authored local
+//!   translate, parent world matrix, world centre).
+//! - [`session`]: the snapshot pipeline — bytes → base64 → single-layer stack
+//!   → fitted geometry — plus the pure [`session::ClientModel`] the view drives.
+//! - [`net`]: the TCP client thread (owner of `hello`/`subscribe`/outgoing
+//!   edits) and the render thread that owns the GPU.
+//! - [`app`]: the winit + egui shell that ties them together (`view`).
 
+pub mod anchor;
+pub mod app;
+pub mod camera;
 pub mod compose;
+pub mod gizmo;
+pub mod gpu;
 pub mod memresolver;
+pub mod net;
+pub mod protocol;
 pub mod scene;
+pub mod session;
 
 use rusd_core::Diagnostic;
 
