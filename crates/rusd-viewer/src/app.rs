@@ -199,6 +199,12 @@ impl Shell {
         );
 
         let style = Style::default();
+        // `Window::inner_size` is in **physical pixels**, which is exactly what the
+        // render thread's viewport must be: the frame is later painted into a
+        // point-space rect, and one frame texel must land on one device pixel
+        // (`crate::viewport::render_texel_size`, `texel_scale`). A viewport in
+        // points here would be resampled by the sampler at any `pixels_per_point`
+        // above 1 — the picture magnified out of its top-left corner.
         let render = RenderWorker::spawn(
             render_state.device.clone(),
             render_state.queue.clone(),
@@ -490,10 +496,21 @@ impl Shell {
             let avail = ui.available_size();
             let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
             match &self.frame {
-                Some((_, texture)) => {
+                Some((frame, texture)) => {
+                    // The one place a texture of fixed texel size meets egui's
+                    // point-space layout: `crate::viewport` decides the rect and the
+                    // UV, so the frame covers the viewport 1:1 at any ppp instead of
+                    // being resampled out of the top-left corner.
+                    let image = crate::viewport::viewport_image(
+                        rect,
+                        (frame.width, frame.height),
+                        ui.pixels_per_point(),
+                    );
+                    let uv = crate::viewport::viewport_uv();
                     egui::Image::new(texture)
-                        .fit_to_exact_size(avail)
-                        .paint_at(ui, rect);
+                        .fit_to_exact_size(image.size())
+                        .uv(uv)
+                        .paint_at(ui, image);
                 }
                 None => {
                     ui.painter()
@@ -884,6 +901,9 @@ impl ApplicationHandler<AppEvent> for App {
             }
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {
+                    // winit reports a physical size here (as `inner_size` does), so
+                    // this keeps the render viewport in the same space the texture is
+                    // painted from. No `pixels_per_point` conversion belongs here.
                     shell.render.send(RenderCommand::Resize {
                         width: size.width,
                         height: size.height,

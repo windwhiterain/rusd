@@ -34,6 +34,8 @@
 //! - [`view`]: the view's own decisions (which scene frames the camera, and how a
 //!   frame's corners are judged), so the window and its tests run one copy of the
 //!   logic instead of two that can drift.
+//! - [`viewport`]: where the render thread's frame lands on screen — pure rect/UV
+//!   arithmetic, so the image covers the viewport 1:1 at any `pixels_per_point`.
 //! - [`app`]: the winit + egui shell that ties them together (`view`).
 
 pub mod anchor;
@@ -49,6 +51,7 @@ pub mod protocol;
 pub mod scene;
 pub mod session;
 pub mod view;
+pub mod viewport;
 pub mod window;
 
 use rusd_core::Diagnostic;
