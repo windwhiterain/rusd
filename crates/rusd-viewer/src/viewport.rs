@@ -164,6 +164,331 @@ impl PanelBudget {
     }
 }
 
+/// The window's **screen space**: the three numbers that either agree or do not.
+///
+/// A DPI defect is never a mystery once these three are printed beside each other,
+/// because the contract every egui integration relies on is one equation:
+///
+/// ```text
+/// screen_points == inner_physical / scale_factor
+/// ```
+///
+/// and the ways it can fail are the ways that equation can be broken:
+///
+/// | `screen_points` | what it means |
+/// | --- | --- |
+/// | `inner / scale` | correct: points are the window divided by the scale |
+/// | `inner` | the scale was **never applied**: pixels used as points, so every point
+///   is drawn `scale` times too large and the UI overflows the window |
+/// | `inner / scale²` | the scale was applied **twice**: the layout believes the window
+///   is bigger than it is, so its right and bottom edges fall outside the window |
+///
+/// The round that produced this type had a brief saying "the scale is counted
+/// twice"; the numbers in that brief say otherwise — `2240 / 1.75 = 1280.0` and
+/// `2560 / 1.75 = 1462.9` are exactly the `screen_rect` it reported, in both the
+/// default and the maximized state. That is the **correct** row of the table. Only a
+/// printed ratio settles it, which is why it is printed.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreenSpace {
+    /// `Window::inner_size()`: the client area, in **physical** pixels.
+    pub inner_physical: (u32, u32),
+    /// `Window::scale_factor()`: the display's scaling, per monitor.
+    pub scale_factor: f32,
+    /// The `RawInput::screen_rect` size egui laid this pass out in, in **points**.
+    pub screen_points: Vec2,
+    /// The size the egui presenter's back buffer was last told, in **physical**
+    /// pixels: `inner_size()` when it was created, and on every `Resized` since.
+    ///
+    /// It is a separate number on purpose. The back buffer is the window's own
+    /// swapchain, and `egui_wgpu::winit::Painter` configures it only in
+    /// `set_window` and `on_window_resized` — a viewer that never calls the second
+    /// keeps a startup-sized back buffer and asks the compositor to stretch it
+    /// (`DXGI_SCALING_STRETCH`), which magnifies the whole UI by `new / old`. That is
+    /// the same family of defect as a wrong point space, and it is invisible in every
+    /// other number.
+    pub presented_physical: (u32, u32),
+}
+
+/// Which row of [`ScreenSpace`]'s table the platform's numbers are on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenAgreement {
+    /// `screen_points == inner / scale`: the contract holds.
+    Consistent,
+    /// `screen_points == inner`: no division happened, so points are pixels.
+    PixelsAsPoints,
+    /// `screen_points == inner / scale²`: the scale was applied twice.
+    ScaledTwice,
+    /// Neither of the above, so the ratio itself is the only useful statement.
+    Odd,
+}
+
+impl ScreenSpace {
+    /// The point size the platform's own numbers imply: `inner / scale`.
+    ///
+    /// This is the arithmetic the `screen_rect` correction is made of, kept here so
+    /// it is testable without a window. A non-finite or zero scale falls back to
+    /// `1.0`, the same rule [`ViewportSize::new`] applies.
+    pub fn expected_points(&self) -> Vec2 {
+        let s = self.scale();
+        Vec2::new(
+            self.inner_physical.0 as f32 / s,
+            self.inner_physical.1 as f32 / s,
+        )
+    }
+
+    /// The scale factor, or `1.0` when the platform reported something unusable.
+    pub fn scale(&self) -> f32 {
+        if self.scale_factor.is_finite() && self.scale_factor > 0.0 {
+            self.scale_factor
+        } else {
+            1.0
+        }
+    }
+
+    /// `screen_points.width / expected_points.width`: `1.0` is the contract met.
+    pub fn ratio(&self) -> f32 {
+        let e = self.expected_points().x;
+        if !e.is_finite() || e <= 0.0 {
+            return 1.0;
+        }
+        self.screen_points.x / e
+    }
+
+    /// Which row of the table these numbers are on.
+    ///
+    /// Both axes must agree within a point for `Consistent`: a width that is right
+    /// and a height that is not is the shape of a defect that pins the back buffer
+    /// rather than the scale, and it must not pass as consistent.
+    pub fn agreement(&self) -> ScreenAgreement {
+        let e = self.expected_points();
+        let near = |a: f32, b: f32| (a - b).abs() <= 1.0;
+        if near(self.screen_points.x, e.x) && near(self.screen_points.y, e.y) {
+            return ScreenAgreement::Consistent;
+        }
+        let s = self.scale();
+        let r = self.ratio();
+        // `screen = inner / scale²` means `ratio = 1 / scale`. Checked before the
+        // other row because at scale 1 the two coincide, and `Consistent` already won
+        // there.
+        if (r - 1.0 / s).abs() < 0.02 {
+            return ScreenAgreement::ScaledTwice;
+        }
+        if (r - s).abs() < 0.02 {
+            return ScreenAgreement::PixelsAsPoints;
+        }
+        ScreenAgreement::Odd
+    }
+
+    /// The point size the layout must use **instead**, or `None` when the platform
+    /// already has it right.
+    ///
+    /// This is the round's task-2 correction, narrowed to what it can honestly do:
+    /// it rewrites the screen rect only when the ratio says the platform's own
+    /// numbers are off by a whole factor of the scale, and never rewrites a rect the
+    /// contract already agrees with. That matters — the two states this round
+    /// measured were both `Consistent`, so an unconditional override would have
+    /// "corrected" a correct layout, and its arithmetic would then have been blamed
+    /// for whatever the *display* was really doing.
+    ///
+    /// The arithmetic it refuses is the one the brief forbade outright: physical
+    /// pixels used as points. `expected_points` divides by the scale, so that can
+    /// never come back out.
+    pub fn correction(&self) -> Option<Vec2> {
+        match self.agreement() {
+            ScreenAgreement::Consistent => None,
+            // A ratio that is no whole power of the scale is not something this can
+            // repair without knowing which side is wrong; report it instead.
+            ScreenAgreement::Odd => None,
+            ScreenAgreement::PixelsAsPoints | ScreenAgreement::ScaledTwice => {
+                Some(self.expected_points())
+            }
+        }
+    }
+
+    /// Whether the presenter's back buffer is the size of the window it presents.
+    ///
+    /// False means the swapchain is stale: the frame is stretched to the window
+    /// instead of covering it texel for texel.
+    pub fn back_buffer_matches(&self) -> bool {
+        self.presented_physical.0 == self.inner_physical.0
+            && self.presented_physical.1 == self.inner_physical.1
+    }
+
+    /// How far the stale back buffer is magnified to fill the window, per axis.
+    ///
+    /// `(1, 1)` is no magnification. Anything else is the compositor stretching the
+    /// buffer (`DXGI_SCALING_STRETCH`), and the two axes being **different** is the
+    /// signature a screenshot shows and no printed point-space number does: the UI
+    /// is not merely too large, it is the wrong shape.
+    pub fn stretch(&self) -> (f32, f32) {
+        let f = |buf: u32, win: u32| {
+            if buf == 0 {
+                1.0
+            } else {
+                win as f32 / buf as f32
+            }
+        };
+        (
+            f(self.presented_physical.0, self.inner_physical.0),
+            f(self.presented_physical.1, self.inner_physical.1),
+        )
+    }
+
+    /// The overlay's lines for this: what the platform said, what the contract
+    /// expects, and the ratio that names the row.
+    pub fn lines(&self) -> Vec<String> {
+        let e = self.expected_points();
+        let label = match self.agreement() {
+            ScreenAgreement::Consistent => "ok",
+            ScreenAgreement::PixelsAsPoints => "NO pixels as points",
+            ScreenAgreement::ScaledTwice => "NO scaled twice",
+            ScreenAgreement::Odd => "NO not a whole scale",
+        };
+        vec![
+            format!(
+                "screen {:.1}x{:.1} pt · inner {}x{} px · scale {:.2} · expect {:.1}x{:.1} pt",
+                self.screen_points.x,
+                self.screen_points.y,
+                self.inner_physical.0,
+                self.inner_physical.1,
+                self.scale(),
+                e.x,
+                e.y
+            ),
+            format!("scale count {:.3}x (1.000 = ok) · {label}", self.ratio()),
+            match self.correction() {
+                // The layout on this screen used the corrected size, so a `NO` above is
+                // the *platform's* fault and is already repaired: saying so keeps a
+                // screenshot from reading as a live defect.
+                Some(want) => format!(
+                    "layout used {:.1}x{:.1} pt: the screen rect was corrected this pass",
+                    want.x, want.y
+                ),
+                None => "layout used the platform's own screen rect (no correction)".to_owned(),
+            },
+            format!(
+                "back buffer {}x{} px · window inner {}x{} px · matches {}",
+                self.presented_physical.0,
+                self.presented_physical.1,
+                self.inner_physical.0,
+                self.inner_physical.1,
+                if self.back_buffer_matches() {
+                    "yes"
+                } else {
+                    "NO"
+                }
+            ),
+            format!(
+                "present stretch {:.3}x{:.3} (1.000x1.000 = ok) · {}",
+                self.stretch().0,
+                self.stretch().1,
+                if self.back_buffer_matches() {
+                    "blit"
+                } else if (self.stretch().0 - self.stretch().1).abs() > 1e-3 {
+                    "NO anisotropic — the UI is the wrong shape"
+                } else {
+                    "NO magnified"
+                }
+            ),
+        ]
+    }
+}
+
+/// Whether the panels and the viewport **partition** the window, printed as the
+/// numbers that add up.
+///
+/// [`PanelBudget`] states the same property for a test; this type states it for a
+/// screenshot, which is the only instrument that sees the running window. Two
+/// independent anomalies are visible here and nowhere else:
+///
+/// - a viewport rect wider or taller than what the panels leave (the smoke17
+///   defect: `910 × 713 pt` inside an `823 × 457 pt` window);
+/// - a bar that laid out at **zero height** — the numbers then still add up
+///   (`top + 0 + rect == window`), so the identity alone cannot catch it, and the
+///   probe that produced this type reported exactly that: `25 + 702 = 727` with the
+///   controls bar contributing nothing. `bottom` is therefore printed on its own.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Partition {
+    /// The window's client area in points, `inner / scale` — not the rect's size.
+    pub window: Vec2,
+    /// The left panel's width, in points.
+    pub left: f32,
+    /// The status bar's height, in points.
+    pub top: f32,
+    /// The controls bar's height, in points.
+    pub bottom: f32,
+    /// The rect the viewport was allocated, in points.
+    pub rect: Rect,
+}
+
+impl Partition {
+    /// `left + viewport` — must equal the window's width.
+    pub fn width_total(&self) -> f32 {
+        self.left + self.rect.width()
+    }
+
+    /// `top + bottom + viewport` — must equal the window's height.
+    pub fn height_total(&self) -> f32 {
+        self.top + self.bottom + self.rect.height()
+    }
+
+    /// The width identity holds to within a point (the layout's own rounding).
+    pub fn fits_width(&self) -> bool {
+        (self.width_total() - self.window.x).abs() <= 1.0
+    }
+
+    /// The height identity holds to within a point.
+    pub fn fits_height(&self) -> bool {
+        (self.height_total() - self.window.y).abs() <= 1.0
+    }
+
+    /// Whether every panel that is always drawn got a size at all.
+    ///
+    /// The status bar, the composition-tree strip and the controls bar are drawn on
+    /// every pass, so a zero is not a legitimate layout: it is a panel the pass did
+    /// not lay out, and the identity would still hold without it.
+    pub fn bars_present(&self) -> bool {
+        self.left > 0.0 && self.top > 0.0 && self.bottom > 0.0
+    }
+
+    /// The whole property: both identities hold **and** the bars are there.
+    pub fn ok(&self) -> bool {
+        self.fits_width() && self.fits_height() && self.bars_present()
+    }
+
+    /// The overlay's lines: one per identity, with every term printed.
+    pub fn lines(&self) -> Vec<String> {
+        let verdict = if self.ok() {
+            "partition OK"
+        } else {
+            "partition NO"
+        };
+        vec![
+            verdict.to_owned(),
+            format!(
+                "width {:.1} + {:.1} = {:.1} vs window {:.1} (Δ {:.1}) · fits {}",
+                self.left,
+                self.rect.width(),
+                self.width_total(),
+                self.window.x,
+                self.width_total() - self.window.x,
+                if self.fits_width() { "yes" } else { "NO" }
+            ),
+            format!(
+                "height {:.1} + {:.1} + {:.1} = {:.1} vs window {:.1} (Δ {:.1}) · fits {} · bars {}",
+                self.top,
+                self.bottom,
+                self.rect.height(),
+                self.height_total(),
+                self.window.y,
+                self.height_total() - self.window.y,
+                if self.fits_height() { "yes" } else { "NO" },
+                if self.bars_present() { "yes" } else { "NO" }
+            ),
+        ]
+    }
+}
+
 /// A viewport whose size is known only as a **window** size, for the frames before
 /// the first layout and for tests: the rect is taken as the whole window.
 ///
@@ -517,5 +842,324 @@ mod tests {
             assert_eq!(vp.pixels_per_point(), 1.0, "scale {bad} is not usable");
             assert_eq!(vp.texels(), (100, 50));
         }
+    }
+
+    /// The machine the DPI round ran on: a 1.75 scale factor, and a default window
+    /// whose client area is 2240×1216 physical.
+    const MACHINE_SCALE: f32 = 1.75;
+    const DEFAULT_INNER: (u32, u32) = (2240, 1216);
+
+    #[test]
+    fn the_screen_space_the_round_measured_is_the_consistent_row() {
+        // The probe's own numbers, in both states it reported. `2240 / 1.75 =
+        // 1280.0` and `2560 / 1.75 = 1462.9`: the screen rect was the inner size
+        // **divided by the scale, once** — which is the contract being met, not
+        // broken. If the scale had been counted twice these would have been
+        // 731.4 and 836.0 pt wide.
+        let default = ScreenSpace {
+            inner_physical: DEFAULT_INNER,
+            scale_factor: MACHINE_SCALE,
+            screen_points: egui::vec2(1280.0, 694.9),
+            presented_physical: DEFAULT_INNER,
+        };
+        assert_eq!(default.agreement(), ScreenAgreement::Consistent);
+        assert!((default.ratio() - 1.0).abs() < 1e-3, "{}", default.ratio());
+        assert!(default.back_buffer_matches());
+
+        let maximized = ScreenSpace {
+            inner_physical: (2560, 1272),
+            scale_factor: MACHINE_SCALE,
+            screen_points: egui::vec2(1462.9, 726.9),
+            presented_physical: (2560, 1272),
+        };
+        assert_eq!(maximized.agreement(), ScreenAgreement::Consistent);
+        assert!(
+            (maximized.ratio() - 1.0).abs() < 1e-3,
+            "{}",
+            maximized.ratio()
+        );
+        assert!(maximized.back_buffer_matches());
+    }
+
+    #[test]
+    fn a_scale_counted_twice_is_named_as_such_and_not_as_odd() {
+        // The defect the brief described, made real in numbers: the scale applied
+        // twice gives `inner / scale²` = 731.4 pt for the same 2240-px window.
+        let twice = ScreenSpace {
+            inner_physical: DEFAULT_INNER,
+            scale_factor: MACHINE_SCALE,
+            screen_points: egui::vec2(731.4, 397.1),
+            presented_physical: DEFAULT_INNER,
+        };
+        assert_eq!(twice.agreement(), ScreenAgreement::ScaledTwice);
+        assert!((twice.ratio() - 1.0 / MACHINE_SCALE).abs() < 1e-2);
+        let lines = twice.lines().join(" | ");
+        assert!(lines.contains("scaled twice"), "{lines}");
+        // …and the ratio is printed, so a screenshot of this state names it too.
+        assert!(lines.contains("scale count 0.571x"), "{lines}");
+        // …and the line below says the layout was handed the corrected size, so the
+        // `NO` reads as "the platform was wrong and is repaired", not as a live fault.
+        assert!(lines.contains("was corrected this pass"), "{lines}");
+        assert!(lines.contains("layout used 1280.0x694.9 pt"), "{lines}");
+    }
+
+    #[test]
+    fn a_scale_never_applied_is_named_as_pixels_used_for_points() {
+        // The other failure this must never be confused with, and the one task 2 of
+        // the brief forbids as a "fix": screen_rect left in physical pixels.
+        let leaked = ScreenSpace {
+            inner_physical: DEFAULT_INNER,
+            scale_factor: MACHINE_SCALE,
+            screen_points: egui::vec2(2240.0, 1216.0),
+            presented_physical: DEFAULT_INNER,
+        };
+        assert_eq!(leaked.agreement(), ScreenAgreement::PixelsAsPoints);
+        assert!((leaked.ratio() - MACHINE_SCALE).abs() < 1e-2);
+        assert!(leaked.lines().join(" | ").contains("pixels as points"));
+    }
+
+    #[test]
+    fn at_scale_one_every_row_coincides_and_that_is_consistent() {
+        // No scale means no arithmetic to get wrong: the two failure rows are the
+        // same row as the right one, so nothing may report a defect.
+        let plain = ScreenSpace {
+            inner_physical: (1280, 720),
+            scale_factor: 1.0,
+            screen_points: egui::vec2(1280.0, 720.0),
+            presented_physical: (1280, 720),
+        };
+        assert_eq!(plain.agreement(), ScreenAgreement::Consistent);
+        assert!(plain.lines().join(" | ").contains("ok"));
+        // A correct space is not corrected, and the line says so rather than staying
+        // silent about it.
+        assert!(
+            plain.lines().join(" | ").contains("no correction"),
+            "{}",
+            plain.lines().join(" | ")
+        );
+    }
+
+    #[test]
+    fn a_stale_back_buffer_is_reported_even_when_the_point_space_is_right() {
+        // The second, independent defect the same screenshot can show: the layout
+        // believes the window is 1462.9 pt while the swapchain still holds the
+        // size the window had at startup, so the compositor stretches it. Every
+        // point-space number is correct here; only the back buffer disagrees.
+        let stale = ScreenSpace {
+            inner_physical: (2560, 1272),
+            scale_factor: MACHINE_SCALE,
+            screen_points: egui::vec2(1462.9, 726.9),
+            presented_physical: DEFAULT_INNER,
+        };
+        assert_eq!(stale.agreement(), ScreenAgreement::Consistent);
+        assert!(!stale.back_buffer_matches());
+        let lines = stale.lines().join(" | ");
+        assert!(lines.contains("back buffer 2240x1216 px"), "{lines}");
+        assert!(lines.contains("matches NO"), "{lines}");
+    }
+
+    fn partition(window: Vec2, left: f32, top: f32, bottom: f32, rect: Rect) -> Partition {
+        Partition {
+            window,
+            left,
+            top,
+            bottom,
+            rect,
+        }
+    }
+
+    #[test]
+    fn the_partition_the_round_measured_is_not_ok_because_a_bar_has_no_height() {
+        // The probe's default state: `516.2 + 763.8 = 1280` and `25 + 0 + 670 = 695`
+        // both add up, so the identity alone passes — and the controls bar is
+        // **absent from the sum**. This is the case `fits()` cannot see and
+        // `bars_present()` exists for.
+        let p = partition(
+            egui::vec2(1280.0, 694.9),
+            516.2,
+            24.9,
+            0.0,
+            Rect::from_min_size(egui::pos2(516.2, 24.9), egui::vec2(763.8, 670.0)),
+        );
+        assert!(p.fits_width(), "the width identity holds");
+        assert!(
+            p.fits_height(),
+            "the height identity holds too — without a bar"
+        );
+        assert!(
+            !p.bars_present(),
+            "the controls bar laid out at zero height"
+        );
+        assert!(!p.ok());
+        let lines = p.lines().join(" | ");
+        assert!(lines.contains("partition NO"), "{lines}");
+        assert!(lines.contains("bars NO"), "{lines}");
+    }
+
+    #[test]
+    fn a_correct_partition_at_the_probe_machine_is_ok() {
+        // What the same window must look like once the controls bar is laid out:
+        // its height comes out of the viewport's, and every term is printed.
+        let bottom = 24.0;
+        let p = partition(
+            egui::vec2(1280.0, 694.9),
+            516.2,
+            24.9,
+            bottom,
+            Rect::from_min_size(
+                egui::pos2(516.2, 24.9),
+                egui::vec2(763.8, 694.9 - 24.9 - bottom),
+            ),
+        );
+        assert!(p.ok(), "{}", p.lines().join(" | "));
+        assert!(p.lines().join(" | ").contains("partition OK"));
+    }
+
+    #[test]
+    fn the_smoke17_rect_wider_than_its_window_is_a_partition_failure() {
+        // The counter-example the earlier round made executable: a 910×713 viewport
+        // inside an 823×457 window. Both identities fail, and the printed delta is
+        // the size of the overshoot.
+        let p = partition(
+            egui::vec2(823.0, 457.0),
+            488.0,
+            25.0,
+            24.0,
+            Rect::from_min_size(egui::pos2(488.0, 25.0), egui::vec2(910.0, 713.0)),
+        );
+        assert!(!p.fits_width(), "488 + 910 = 1398 against 823");
+        assert!(!p.fits_height(), "25 + 24 + 713 = 762 against 457");
+        assert!(!p.ok());
+        let lines = p.lines().join(" | ");
+        assert!(lines.contains("= 1398.0 vs window 823.0"), "{lines}");
+        assert!(lines.contains("fits NO"), "{lines}");
+    }
+
+    #[test]
+    fn a_maximized_window_whose_rect_was_not_shrunk_is_caught_by_the_identity() {
+        // If the "actual physical inner ~1463×784" in the round's brief were real,
+        // the maximized window would be 836.0×448.0 pt and the 946.7-pt rect would
+        // not fit. Printing the terms makes that a `Δ` rather than a story — which
+        // is the whole reason the brief's claim had to be checked by an instrument.
+        let p = partition(
+            egui::vec2(1463.0 / MACHINE_SCALE, 784.0 / MACHINE_SCALE),
+            516.2,
+            24.9,
+            24.0,
+            Rect::from_min_size(egui::pos2(516.2, 24.9), egui::vec2(946.7, 702.0)),
+        );
+        assert!(!p.fits_width(), "516.2 + 946.7 overflows 836.0");
+        assert!(
+            (p.width_total() - p.window.x) > 600.0,
+            "the overshoot is the window's own width: {}",
+            p.width_total() - p.window.x
+        );
+    }
+
+    #[test]
+    fn a_zero_window_is_consistent_because_there_is_nothing_to_correct() {
+        // A minimized window has no client area: `inner_size()` is 0×0 and
+        // egui-winit leaves `screen_rect` `None`, which this reads as a zero point.
+        // Both sides are then zero, so the contract holds trivially and the honest
+        // answer is "nothing to say" — not a defect, and above all not a correction
+        // that would hand the layout a non-zero rect for a window with no area.
+        let zero = ScreenSpace {
+            inner_physical: (0, 0),
+            scale_factor: MACHINE_SCALE,
+            screen_points: Vec2::ZERO,
+            presented_physical: (0, 0),
+        };
+        assert_eq!(zero.agreement(), ScreenAgreement::Consistent);
+        assert_eq!(zero.correction(), None, "a zero window is left alone");
+        assert!(zero.ratio().is_finite());
+        assert!(zero.back_buffer_matches(), "both are zero, so they agree");
+    }
+
+    #[test]
+    fn a_stale_back_buffer_prints_its_magnification_per_axis() {
+        // The startup back buffer (2240×1216) presented into a maximized window
+        // (2560×1272) is magnified by a **different** factor on each axis, because
+        // the two sizes are not the same shape. That is the number a screenshot
+        // shows as a slightly stretched UI and no point-space line can see.
+        let stale = ScreenSpace {
+            inner_physical: (2560, 1272),
+            scale_factor: MACHINE_SCALE,
+            screen_points: egui::vec2(1462.9, 726.9),
+            presented_physical: DEFAULT_INNER,
+        };
+        let (sx, sy) = stale.stretch();
+        assert!((sx - 2560.0 / 2240.0).abs() < 1e-4, "{sx}");
+        assert!((sy - 1272.0 / 1216.0).abs() < 1e-4, "{sy}");
+        assert!((sx - sy).abs() > 1e-3, "the two axes differ: {sx} vs {sy}");
+        let lines = stale.lines().join(" | ");
+        assert!(lines.contains("present stretch 1.143x1.046"), "{lines}");
+        assert!(lines.contains("anisotropic"), "{lines}");
+
+        // A synced back buffer is a blit, and prints as one.
+        let synced = ScreenSpace {
+            presented_physical: (2560, 1272),
+            ..stale
+        };
+        assert_eq!(synced.stretch(), (1.0, 1.0));
+        assert!(synced.lines().join(" | ").contains("blit"));
+    }
+
+    #[test]
+    fn the_correction_is_silent_on_a_consistent_space_and_never_returns_pixels() {
+        // The rule task 2 of the brief set: correct the point size, **never** fall
+        // back to physical pixels used as points. Checked over every scale the
+        // machine could report, for every row of the table.
+        for scale in [1.0f32, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0] {
+            let inner = (2240u32, 1216u32);
+            let right = ScreenSpace {
+                inner_physical: inner,
+                scale_factor: scale,
+                screen_points: ScreenSpace {
+                    inner_physical: inner,
+                    scale_factor: scale,
+                    screen_points: Vec2::ZERO,
+                    presented_physical: inner,
+                }
+                .expected_points(),
+                presented_physical: inner,
+            };
+            assert_eq!(
+                right.correction(),
+                None,
+                "scale {scale}: a correct space must not be rewritten"
+            );
+
+            // Broken by a whole factor of the scale: the correction is the divided
+            // size, and it is never the physical size.
+            let mut broken = right;
+            broken.screen_points = right.expected_points() * scale;
+            // At scale 1 the "broken" space *is* the correct one, so there is
+            // nothing to correct and that is the honest answer.
+            if scale > 1.0 {
+                assert_eq!(broken.agreement(), ScreenAgreement::PixelsAsPoints);
+                assert_eq!(broken.correction(), Some(right.expected_points()));
+                assert_ne!(
+                    broken.correction().map(|v| v.x),
+                    Some(inner.0 as f32),
+                    "scale {scale}: the correction is never the pixel count"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_screen_rect_off_by_no_whole_scale_is_reported_not_rewritten() {
+        // Some other factor entirely: the two sides disagree and this code has no
+        // way to know which is wrong, so it changes nothing and says `odd`. A
+        // rewrite here would be guessing, and a wrong guess is a second defect.
+        let odd = ScreenSpace {
+            inner_physical: DEFAULT_INNER,
+            scale_factor: MACHINE_SCALE,
+            screen_points: egui::vec2(1000.0, 543.0),
+            presented_physical: DEFAULT_INNER,
+        };
+        assert_eq!(odd.agreement(), ScreenAgreement::Odd);
+        assert_eq!(odd.correction(), None);
+        assert!(odd.lines().join(" | ").contains("not a whole scale"));
     }
 }
