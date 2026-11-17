@@ -106,6 +106,63 @@ client: Layer::from_bytes → 单层栈 → extract → 本地 wgpu 渲染
   数据（不是 `Stage` 的引用），渲染线程因此可以是独立的 wgpu 线程。
 - 这条边界是硬边界：任何"把 `Stage` 挪到渲染线程"的想法都编译不过，方向是对的。
 
+### 7.1 DPI：窗口的三种尺寸，和一个必须成立的等式
+
+client 侧一个窗口同时有三种尺寸，它们**不是同一个数**：
+
+| 尺寸 | 来源 | 单位 |
+| --- | --- | --- |
+| client area | `Window::inner_size()` | **物理**像素 |
+| 布局空间（screen rect） | `RawInput::screen_rect` | **point** |
+| presenter 的 back buffer | `egui_wgpu::winit::Painter` 的 swapchain | **物理**像素 |
+
+三者只有一个约束：`screen_points == inner_physical / scale_factor`，**一次**。破坏它只有
+三种方式，`crate::viewport::ScreenSpace` 把比值打印出来，让截图自己说明是哪一种：
+
+| 比值 | 含义 |
+| --- | --- |
+| `1.000` | 正确 |
+| `scale` | scale 从未除过：物理像素当 point 用，整个 UI 放大 `scale` 倍 |
+| `1 / scale` | scale 除了两次：布局以为窗口更大，右/下边缘落在窗外 |
+
+**第四条约束在 presenter 上**：swapchain 必须与当前 `inner_size()` 同尺寸，否则合成器
+按 `DXGI_SCALING_STRETCH`（`wgpu-hal` 在 DX12 上请求的唯一 scaling 模式）把旧尺寸的
+back buffer 拉伸铺满窗口，两轴系数不同时 UI 连形状都是错的。`Painter` 只在 `set_window`
+和 `on_window_resized` 里配置它，**所以每次 `Resized` 都必须调用后者**；这也是
+egui-winit 自己的集成的做法。
+
+两条都是**数据可验**的，不靠叙事：`--debug-ui` 叠加层逐行打印
+
+```
+screen <w>x<h> pt · inner <w>x<h> px · scale <s> · expect <w>x<h> pt
+scale count <r>x (1.000 = ok) · <ok | NO pixels as points | NO scaled twice | NO not a whole scale>
+layout used <w>x<h> pt: the screen rect was corrected this pass | layout used the platform's own screen rect (no correction)
+back buffer <w>x<h> px · window inner <w>x<h> px · matches <yes|NO>
+present stretch <sx>x<sy> (1.000x1.000 = ok) · <blit | NO magnified | NO anisotropic ...>
+swapchain resized this pass <w>x<h> → <w>x<h> px          (仅修复那一帧出现)
+partition OK|NO
+width <left> + <rect> = <sum> vs window <w> (Δ <d>) · fits <yes|NO>
+height <top> + <bottom> + <rect> = <sum> vs window <h> (Δ <d>) · fits <yes|NO> · bars <yes|NO>
+```
+
+`back buffer` 报的是**这一趟继承到的**尺寸，不是这一趟装上去的：否则修好的那一帧会永远
+读成 `matches yes`，唯一能看见"UI 被拉伸"的仪表就自己闭眼了。修复本身由 `swapchain
+resized this pass` 单独一行说明。
+
+`partition` 的两条恒等式与 `tests/panel_layout.rs` 断言的是**同一段算术**
+（`crate::viewport::Partition`），所以截图上的 OK 和测试里的绿是同一句话。`bars` 单独
+一行是因为一条零高度的控件栏仍然让两条恒等式成立——上上轮探针报的
+`25 + 0 + 702 = 727` 正是这种情形，只有把 `bottom` 单独打印才看得见。
+
+修正本身（`ScreenSpace::correction`）是**有条件**的：只在比值恰好是 scale 的整数幂时
+改写 `screen_rect`，比值 `1.000` 时一个字节都不动。理由是那次探针的两个状态
+（`2240/1.75 = 1280.0`、`2560/1.75 = 1462.9`）都属于正确行，无条件覆盖会改写一个本来就
+对的布局，再把自己的算术当成"修好了"。比值既不是 `1` 也不是整数幂时报 `odd` 且不改写：
+两个数都在说谎，而代码没有依据判定哪一边错，猜一次就是第二个缺陷。
+
+窗口缩放**不重新 fit 相机**（§6：相机是 client 的）；这条约束与前两条无关——DPR 只决定
+"一个 point 有几个像素"，不决定"看多远"。
+
 ## 8. 确定性约束
 
 远程两端各跑一份 openusd、各跑一个 wgpu，要做到"同一场景两端看到的几何一致"：

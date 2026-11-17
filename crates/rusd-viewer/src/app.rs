@@ -24,6 +24,7 @@
 //! nor a slow frame can freeze the window.
 
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -157,6 +158,37 @@ pub struct Shell {
     /// from (`crate::viewport::ViewportSize`). Updated by the layout each frame;
     /// the render thread is told only when the texel size changes.
     viewport: crate::viewport::ViewportSize,
+    /// The size the **presenter's** swapchain is configured at, in physical pixels.
+    ///
+    /// This is a second size on purpose, and it is not the render thread's: the
+    /// render thread draws the scene into a texture of the *viewport rect's* texels,
+    /// while `egui_wgpu::winit::Painter` owns the window's own back buffer. The
+    /// painter configures that back buffer only in `set_window` and
+    /// `on_window_resized`, and this shell was calling neither after startup — so
+    /// the swapchain kept the size the window had at 1280×720 logical, and every
+    /// later window size was presented by having the compositor **stretch** it
+    /// (`DXGI_SCALING_STRETCH`). On a 1.75 scale that is exactly the class of defect
+    /// this round was sent to fix: the whole UI drawn at one size and magnified to
+    /// another, panels included.
+    presented: (u32, u32),
+    /// The three numbers that must agree: inner physical, scale, and the point size
+    /// the pass was handed. Measured at the start of each pass, before the layout
+    /// runs, so the overlay prints the platform's own numbers rather than the
+    /// layout's result — the two agreeing is the whole point, and one number alone
+    /// cannot show it.
+    ///
+    /// Its `presented_physical` is the swapchain size from **before** this pass's
+    /// [`Shell::sync_presenter`] — the defect the pass inherited, not the size it
+    /// installed. That is what makes a screenshot of the repairing frame show what
+    /// was wrong, instead of always reading `matches yes` by construction.
+    screen: crate::viewport::ScreenSpace,
+    /// The bars' sizes from **this** pass: `(left, top, bottom)` in points.
+    ///
+    /// The layout is what knows them, and the overlay draws **inside** the layout, so
+    /// they cannot be re-measured where the overlay runs. The pass records them into a
+    /// local as it lays each panel out and hands them over just before the overlay
+    /// asks, so the three numbers a screenshot shows are the ones on that screen.
+    bars: (f32, f32, f32),
     /// A frame counter for the debug overlay: how many frames the render thread has
     /// handed over, and which one is on screen. A stale window shows a smaller
     /// `shown` than `received`, which is what makes "displaying an old frame"
@@ -320,6 +352,16 @@ impl Shell {
             // It is replaced by `publish_viewport` before anything is drawn, and the
             // render thread's first `Resize` comes from there.
             viewport: crate::viewport::whole_window(window_points, scale),
+            // What the presenter's swapchain was configured at: `set_window` above
+            // used exactly this size, and every `Resized` since updates both.
+            presented: (size.width, size.height),
+            screen: crate::viewport::ScreenSpace {
+                inner_physical: (size.width, size.height),
+                scale_factor: scale,
+                screen_points: window_points,
+                presented_physical: (size.width, size.height),
+            },
+            bars: (0.0, 0.0, 0.0),
             frames_received: 0,
             tex_size: (0, 0),
             drag: None,
@@ -689,7 +731,10 @@ impl Shell {
 
     fn ui(&mut self, root: &mut egui::Ui) {
         let ctx = root.ctx().clone();
-        egui::Panel::top("status").show(root, |ui| {
+        // The bars' sizes are recorded as the pass lays them out, because the
+        // overlay draws *inside* the layout and cannot re-measure them there.
+        let mut bars = (0.0f32, 0.0f32, 0.0f32);
+        let top_bar = egui::Panel::top("status").show(root, |ui| {
             ui.horizontal(|ui| {
                 ui.strong("rusd-viewer");
                 ui.separator();
@@ -721,6 +766,11 @@ impl Shell {
                 }
             });
         });
+        // `Panel::show` returns the rect it took: the top bar's height, the left
+        // panel's width and the controls bar's height are the three terms the
+        // partition identity is made of. They are recorded here because the overlay
+        // draws inside the layout, where re-measuring them is impossible.
+        bars.1 = top_bar.response.rect.height();
 
         // The composition-tree panel: **resizable and collapsible**, and when either
         // happens the viewport re-derives its rect from `ui.available_size()` on the
@@ -728,7 +778,7 @@ impl Shell {
         // constant (`tests/panel_layout.rs` pins the partition). A resize does **not**
         // re-fit the camera (REMOTE §6: the camera is the client's; only the first
         // scene and the Fit button fit).
-        if self.tree_open {
+        let left_bar = if self.tree_open {
             egui::Panel::left("composition-tree")
                 .resizable(true)
                 .default_size(280.0)
@@ -746,7 +796,7 @@ impl Shell {
                     }
                     ui.separator();
                     crate::panel::detail_panel(ui, &self.tree);
-                });
+                })
         } else {
             // Collapsed: a strip that reopens it. The viewport takes the width back on
             // the next pass, which is the same path a drag-resize takes.
@@ -757,10 +807,11 @@ impl Shell {
                     if ui.small_button("⟩").on_hover_text("展开合成树").clicked() {
                         self.tree_open = true;
                     }
-                });
-        }
+                })
+        };
+        bars.0 = left_bar.response.rect.width();
 
-        egui::Panel::bottom("controls").show(root, |ui| {
+        let bottom_bar = egui::Panel::bottom("controls").show(root, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("Undo").clicked() {
                     self.send_net(NetCommand::Undo);
@@ -801,6 +852,7 @@ impl Shell {
                 });
             });
         });
+        bars.2 = bottom_bar.response.rect.height();
 
         egui::CentralPanel::no_frame().show(root, |ui| {
             let avail = ui.available_size();
@@ -834,6 +886,9 @@ impl Shell {
                 }
             }
             self.handle_input(ui, &resp, rect);
+            // The overlay's partition terms: the three bars recorded above and this
+            // pass's rect, handed over before the overlay asks for them.
+            self.bars = bars;
             if self.debug_ui {
                 self.paint_debug_overlay(ui, rect);
             }
@@ -1204,7 +1259,28 @@ impl Shell {
             drawn_distance: drawn.map(|c| crate::camera::Orbit::from_camera(&c).distance),
             drawn_target: drawn.map(|c| c.look_at),
         };
-        let lines = report.lines();
+        let mut lines = report.lines();
+        // The two groups that name a DPI defect as a number rather than a story:
+        // what the platform said against what the contract expects, and whether the
+        // panels and the viewport partition the window. A screenshot of a settled
+        // window then answers both questions on its own.
+        lines.extend(self.screen.lines());
+        if let Some(fix) = self.presenter_fix_line() {
+            lines.push(fix);
+        }
+        lines.extend(
+            crate::viewport::Partition {
+                // The window in the same point space the layout used — the *expected*
+                // size, so a broken screen rect cannot make the identity pass by
+                // agreeing with itself.
+                window: self.screen.expected_points(),
+                left: self.bars.0,
+                top: self.bars.1,
+                bottom: self.bars.2,
+                rect: vp.rect(),
+            }
+            .lines(),
+        );
         let font = egui::FontId::monospace(12.0);
         let pad = 6.0;
         let painter = ui.painter().clone();
@@ -1281,8 +1357,97 @@ impl Shell {
         self.window.request_redraw();
     }
 
+    /// Measure the window's screen space and, when the platform's own numbers
+    /// disagree with the one equation an egui layout relies on, put the right point
+    /// size into the pass **before** the layout runs.
+    ///
+    /// `screen_points == inner_physical / scale_factor`, once — that is the whole
+    /// contract, and [`crate::viewport::ScreenSpace::agreement`] names which way it
+    /// is broken when it is (`pixels as points`, `scaled twice`, or a ratio that is
+    /// not a whole scale and which this therefore does not touch).
+    ///
+    /// The correction is deliberately **conditional**. Both states this round
+    /// measured (`2240×1216 / 1.75 = 1280.0` and `2560×1272 / 1.75 = 1462.9`) are
+    /// the correct row, so an unconditional override would have rewritten a layout
+    /// that was already right and hidden the real defect behind its own arithmetic.
+    /// When the ratio is `1.000` this method changes nothing but the record.
+    ///
+    /// It also refreshes the presenter's back buffer to the window's size, which is
+    /// the other half of the same class of defect and is described on
+    /// [`Shell::presented`].
+    fn correct_screen_space(&mut self, mut raw: egui::RawInput) -> egui::RawInput {
+        let inner = self.window.inner_size();
+        let scale = self.window.scale_factor() as f32;
+        // What egui-winit put in the pass, so the ratio is measured rather than
+        // assumed. The `None` case is a zero-sized window (minimized); there is
+        // nothing to correct then, and egui skips the pass itself.
+        let screen_points = raw.screen_rect.map_or(egui::Vec2::ZERO, |r| r.size());
+        // Built with the size the pass **inherited**; `sync_presenter` below may
+        // change `self.presented`, which leaves this record as the defect to report.
+        self.screen = crate::viewport::ScreenSpace {
+            inner_physical: (inner.width, inner.height),
+            scale_factor: scale,
+            screen_points,
+            presented_physical: self.presented,
+        };
+        if let Some(want) = self.screen.correction() {
+            // The rect egui lays out in, replaced by the size the window's own
+            // numbers imply. `raw.screen_rect` is the whole input: no offset, no
+            // clip rect, so this is the one field a correction may touch.
+            raw.screen_rect = Some(egui::Rect::from_min_size(egui::Pos2::ZERO, want));
+        }
+        self.sync_presenter(inner);
+        raw
+    }
+
+    /// Keep the presenter's swapchain the size of the window it presents.
+    ///
+    /// `egui_wgpu::winit::Painter` owns the window's back buffer and reconfigures it
+    /// only when told: `set_window` once, then `on_window_resized` per resize. This
+    /// shell called neither after startup, so the swapchain stayed at the size the
+    /// window was created with; a later window size was presented by the compositor
+    /// **stretching** that back buffer (`DXGI_SCALING_STRETCH`, the only scaling
+    /// mode `wgpu-hal` requests on DX12), which magnifies everything drawn into it —
+    /// panels included — by `new / old`. egui-winit's own integrations call this
+    /// from the same `Resized` arm that this one skipped.
+    ///
+    /// Done here rather than in the event arm so the size is taken once, from the
+    /// window as it is at draw time, and so a scale change (which arrives as a
+    /// `ScaleFactorChanged` and a `Resized` together) cannot leave the two disagreeing.
+    fn sync_presenter(&mut self, inner: winit::dpi::PhysicalSize<u32>) {
+        if (inner.width, inner.height) == self.presented {
+            return;
+        }
+        let (Some(w), Some(h)) = (NonZeroU32::new(inner.width), NonZeroU32::new(inner.height))
+        else {
+            // A zero-sized window (minimized): the old back buffer is the correct
+            // thing to keep, and the next real size will sync it.
+            return;
+        };
+        self.painter.on_window_resized(egui::ViewportId::ROOT, w, h);
+        self.presented = (inner.width, inner.height);
+    }
+
+    /// The overlay line for a swapchain this pass **repaired**, or nothing.
+    ///
+    /// `self.screen.presented_physical` is deliberately the size from *before* the
+    /// sync, so [`crate::viewport::ScreenSpace::lines`] reports the defect the pass
+    /// inherited rather than the size it just installed. This adds the one thing that
+    /// line cannot say: that the pass also fixed it, so a screenshot of the repairing
+    /// frame reads "stale, and resized this pass" instead of looking like a live fault.
+    fn presenter_fix_line(&self) -> Option<String> {
+        let was = self.screen.presented_physical;
+        (was != self.presented).then(|| {
+            format!(
+                "swapchain resized this pass {}x{} → {}x{} px",
+                was.0, was.1, self.presented.0, self.presented.1
+            )
+        })
+    }
+
     fn paint(&mut self) {
         let raw = self.egui_state.take_egui_input(&self.window);
+        let raw = self.correct_screen_space(raw);
         let ctx = self.egui_ctx.clone();
         let full = ctx.run_ui(raw, |root| self.ui(root));
         // A copy asked for during the pass goes out with the pass's own platform

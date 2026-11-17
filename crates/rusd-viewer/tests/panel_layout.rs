@@ -25,7 +25,7 @@
 //! or a stale one) and `the_panels_and_the_viewport_partition_the_window` fails.
 
 use rusd_viewer::panel::TreePanel;
-use rusd_viewer::viewport::{PanelBudget, ViewportSize};
+use rusd_viewer::viewport::{PanelBudget, Partition, ScreenAgreement, ScreenSpace, ViewportSize};
 
 /// What one pass laid out.
 struct Laid {
@@ -282,6 +282,150 @@ fn a_dragged_panel_width_still_partitions_the_window() {
         );
         assert!(b.remaining().x > 0.0, "the viewport never disappears");
     }
+}
+
+#[test]
+fn the_partition_line_the_overlay_prints_is_true_at_every_scale() {
+    // The same property as above, asserted through the type the `--debug-ui`
+    // overlay prints — so the line a screenshot shows and the line a test checks
+    // are one function. If `ok()` ever disagrees with the assertions above, the
+    // overlay is lying to the person reading the screenshot.
+    for ppp in PPPS {
+        for window in windows(ppp) {
+            let laid = lay_out(ppp, window);
+            let p = Partition {
+                window,
+                left: laid.left,
+                top: laid.top,
+                bottom: laid.bottom,
+                rect: laid.viewport,
+            };
+            assert!(
+                p.ok(),
+                "ppp {ppp}, window {window:?}: {}",
+                p.lines().join(" | ")
+            );
+            // And the bars are really there: a zero-height controls bar would keep
+            // both identities true and still be the defect a screenshot shows.
+            assert!(
+                p.bars_present(),
+                "ppp {ppp}: left {:.1}, top {:.1}, bottom {:.1}",
+                laid.left,
+                laid.top,
+                laid.bottom
+            );
+            let lines = p.lines().join(" | ");
+            assert!(lines.contains("partition OK"), "{lines}");
+        }
+    }
+}
+
+#[test]
+fn a_window_resized_the_way_the_round_did_keeps_its_point_space() {
+    // The DPI round's arithmetic, executable: the window is resized from its startup
+    // client area to a maximized one, at the machine's 1.75 scale, and the point
+    // space the layout is given must stay `inner / scale` at **both** sizes. The
+    // failure rows are the ones a wrong fix produces: physical pixels as points
+    // (never allowed) and the scale counted twice.
+    let scale = 1.75f32;
+    for inner in [(2240u32, 1216u32), (2560, 1272), (1920, 1080), (1463, 784)] {
+        let mut space = ScreenSpace {
+            inner_physical: inner,
+            scale_factor: scale,
+            screen_points: egui::Vec2::ZERO,
+            presented_physical: inner,
+        };
+        let points = space.expected_points();
+        assert!(
+            (points.x - inner.0 as f32 / scale).abs() < 1e-3
+                && (points.y - inner.1 as f32 / scale).abs() < 1e-3,
+            "inner {inner:?}: the point size is the physical size divided by the scale"
+        );
+        // What egui-winit hands the pass, when the platform is not broken.
+        space.screen_points = points;
+        assert_eq!(space.agreement(), ScreenAgreement::Consistent);
+        assert_eq!(space.correction(), None, "a correct space is left alone");
+
+        // And the layout run in that space partitions it: every window size, one
+        // scale, the production panels.
+        let laid = lay_out(scale, points);
+        let p = Partition {
+            window: points,
+            left: laid.left,
+            top: laid.top,
+            bottom: laid.bottom,
+            rect: laid.viewport,
+        };
+        assert!(p.ok(), "inner {inner:?}: {}", p.lines().join(" | "));
+    }
+}
+
+#[test]
+fn the_scale_counted_twice_would_push_the_viewport_out_of_the_window() {
+    // Red-green for the correction: the same production layout run in a point space
+    // that is `inner / scale²` produces a rect that does not partition the window,
+    // and `Partition` says so. Then the correction hands the layout the right size
+    // and the same layout partitions it again.
+    let scale = 1.75f32;
+    let inner = (2240u32, 1216u32);
+    let right = inner.0 as f32 / scale;
+    let mut space = ScreenSpace {
+        inner_physical: inner,
+        scale_factor: scale,
+        screen_points: egui::vec2(right / scale, inner.1 as f32 / scale / scale),
+        presented_physical: inner,
+    };
+    assert_eq!(space.agreement(), ScreenAgreement::ScaledTwice);
+    let want = space
+        .correction()
+        .expect("the correction is the divided size");
+
+    // The wrong space: the layout believes the window is 731 pt wide, so its panels
+    // and its viewport are laid out inside that — while the window really is
+    // 1280 pt. Checked against the **real** window, the identity fails on the width,
+    // and it fails by the whole of the scale's error: that is exactly how a
+    // double-counted scale pushes the viewport's right-hand half off the window.
+    let laid = lay_out(scale, space.screen_points);
+    let wrong = Partition {
+        window: space.expected_points(),
+        left: laid.left,
+        top: laid.top,
+        bottom: laid.bottom,
+        rect: laid.viewport,
+    };
+    assert!(
+        !wrong.fits_width(),
+        "red: laid out in `inner / scale²` against the real window, the partition \
+         must fail — but it read {} ({:.1} + {:.1} vs {:.1})",
+        "fits",
+        wrong.left,
+        wrong.rect.width(),
+        wrong.window.x
+    );
+    assert!(
+        (wrong.window.x - wrong.width_total()) > 500.0,
+        "and the shortfall is the scale's error, not a pixel: {:.1}",
+        wrong.window.x - wrong.width_total()
+    );
+    assert!(
+        laid.viewport.width() < want.x - 500.0,
+        "the too-small window leaves a viewport short by the same amount: {:.1} vs {:.1}",
+        laid.viewport.width(),
+        want.x
+    );
+
+    // After the correction the layout is handed the right space, and it partitions.
+    space.screen_points = want;
+    assert_eq!(space.agreement(), ScreenAgreement::Consistent);
+    let laid = lay_out(scale, want);
+    let ok = Partition {
+        window: want,
+        left: laid.left,
+        top: laid.top,
+        bottom: laid.bottom,
+        rect: laid.viewport,
+    };
+    assert!(ok.ok(), "{}", ok.lines().join(" | "));
 }
 
 #[test]
