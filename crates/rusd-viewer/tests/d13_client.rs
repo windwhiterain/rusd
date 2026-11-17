@@ -289,17 +289,18 @@ fn composition_tree_is_asked_with_no_params_and_becomes_the_panels_rows() {
     panel.apply_tree(Ok(reply));
     assert!(!panel.model.is_unavailable(), "{}", panel.model.status_zh());
     let rows = flatten(&panel.roots());
-    // The rows, counted from the shape rather than from the tree's own idea of it:
+    // The rows, counted from the shape rather than from the tree's own idea of it.
+    // v1.3 draws **no prim rows** (a prim is inspected by picking it), so:
     //   three layer roots
-    //   session layer: 1 prim                                        = 1
-    //   root layer:    the arc, its naming row, 1 prim               = 3
-    //   prototypes:    1 prim, its variant set, the set's 2 variants = 4
+    //   session layer: nothing of its own                         = 0
+    //   root layer:    the arc, its naming row                    = 2
+    //   prototypes:    the variant set and its 2 variants          = 3
     // No branch is duplicated, so no row appears twice for one reason.
-    let root_layer_rows = 1 /* arc */ + 1 /* naming row */ + 1 /* prim */;
-    let prototypes_rows = 1 /* prim */ + 1 /* vset */ + 2 /* variants */;
+    let root_layer_rows = 1 /* arc */ + 1 /* naming row */;
+    let prototypes_rows = 1 /* vset */ + 2 /* variants */;
     assert_eq!(
         rows.len(),
-        3 + 1 + root_layer_rows + prototypes_rows,
+        3 + root_layer_rows + prototypes_rows,
         "rows: {:?}",
         rows.iter().map(|(_, n)| n.id.as_str()).collect::<Vec<_>>()
     );
@@ -309,14 +310,11 @@ fn composition_tree_is_asked_with_no_params_and_becomes_the_panels_rows() {
         "the session layer is the first root"
     );
     assert!(ids.contains(&"arc:0"), "the arc is a row: {ids:?}");
-    assert!(ids.contains(&"prim:/Prototypes/Block"), "{ids:?}");
     assert!(ids.contains(&"vset:0"), "{ids:?}");
-    assert_eq!(
-        ids.iter()
-            .filter(|id| **id == "prim:/Prototypes/Block")
-            .count(),
-        1,
-        "the prototype's prim is drawn once, under its own layer: {ids:?}"
+    // v1.3: and the prim rows are gone.
+    assert!(
+        !rows.iter().any(|(_, n)| n.kind == TreeNodeKind::Prim),
+        "no prim rows: {ids:?}"
     );
 }
 
@@ -705,15 +703,18 @@ fn an_idle_read_is_not_a_closed_connection() {
 // --- 5. the copies ----------------------------------------------------------
 
 #[test]
-fn a_prim_row_copies_its_path_and_there_is_no_other_copy() {
+fn a_picked_prim_copies_its_path_and_there_is_no_other_copy() {
+    // v1.3: the prim row is gone from the tree, so the clipboard's prim source is the
+    // viewport pick. The rule itself is v1.1's and unchanged: a prim copies its path.
     let tree = CompositionTree::parse(&city_tree()).expect("the tree parses");
     let rows = flatten(&rusd_viewer::tree::roots(&tree));
-    let prim = rows
-        .iter()
-        .find(|(_, n)| n.kind == TreeNodeKind::Prim && n.label == "/World/City/Block_01")
-        .expect("the block's prim row");
+    let picked = TreeSelection {
+        id: tree.prim_id("/World/City/Block_01").unwrap().to_owned(),
+        kind: TreeNodeKind::Prim,
+        prim: Some("/World/City/Block_01".to_owned()),
+    };
     assert_eq!(
-        clipboard_for(&TreeSelection::of(&prim.1)).as_deref(),
+        clipboard_for(&picked).as_deref(),
         Some("/World/City/Block_01")
     );
     assert_eq!(

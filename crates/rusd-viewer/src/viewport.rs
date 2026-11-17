@@ -120,6 +120,50 @@ impl ViewportSize {
     }
 }
 
+/// What the panels leave for the viewport: the window's point size, minus the left
+/// panel's width, the top bar's height and the bottom bar's height.
+///
+/// This is the arithmetic a screenshot caught being violated: smoke17 reported a
+/// viewport rect of 910×713 pt inside a window of 823×457 pt — a rect *bigger than
+/// the window it sits in*, which pushed the city off the right-hand edge. The rect
+/// must be what the layout has left after the panels, so the sizes must add up:
+/// `left + viewport == window (width)` and `top + bottom + viewport == window
+/// (height)`. Stated as a function so a headless test can assert it at every scale.
+pub struct PanelBudget {
+    /// The window's client area, in points.
+    pub window: Vec2,
+    /// The left panel's width, in points.
+    pub left: f32,
+    /// The top bar's height, in points.
+    pub top: f32,
+    /// The controls bar's height, in points.
+    pub bottom: f32,
+}
+
+impl PanelBudget {
+    /// The space the panels leave for the viewport.
+    pub fn remaining(&self) -> Vec2 {
+        Vec2::new(
+            (self.window.x - self.left).max(1.0),
+            (self.window.y - self.top - self.bottom).max(1.0),
+        )
+    }
+
+    /// Whether `rect` is exactly that space — the property the viewport's allocation
+    /// must have, and the one whose absence produced a rect wider than the window.
+    pub fn fits(&self, rect: Rect) -> bool {
+        let want = self.remaining();
+        // A whole device pixel's worth of slack, for the layout's own rounding.
+        (rect.width() - want.x).abs() <= 1.0 && (rect.height() - want.y).abs() <= 1.0
+    }
+
+    /// Whether `rect` could be a *stale* or *window-derived* rect: bigger than the
+    /// space the panels leave, which is the defect this type exists to name.
+    pub fn overflows(&self, rect: Rect) -> bool {
+        rect.width() > self.remaining().x + 1.0 || rect.height() > self.remaining().y + 1.0
+    }
+}
+
 /// A viewport whose size is known only as a **window** size, for the frames before
 /// the first layout and for tests: the rect is taken as the whole window.
 ///
