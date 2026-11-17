@@ -16,8 +16,18 @@
 //!   `rusd_render`, on a device created **once**, so a camera move is a redraw
 //!   rather than a new GPU.
 //! - [`protocol`]: D12 wire protocol v1's client half: request lines
-//!   (`hello` / `subscribe` / `opinion` / `undo` / `redo`), the notification
-//!   parser, the monotonic-version discard rule, and the gizmo throttle.
+//!   (`hello` / `subscribe` / `opinion` / `undo` / `redo`, plus any other method a
+//!   panel needs), the notification parser, the monotonic-version discard rule,
+//!   and the gizmo throttle.
+//! - [`tree`]: the composition tree (`docs/PROTOCOL.md` v1.2) as data — the layer
+//!   stack, its arcs, its prim nodes and its variant sets, the panel's row model,
+//!   and the four `comp_node` details.
+//! - [`capture`]: a visual-reference capture (v1.1) built on this side: the drag's
+//!   rectangle, the mask at the frame's own size, the PNG encoding, the camera the
+//!   frame was drawn with, and the clipboard payloads.
+//! - [`panel`]: the tree and capture panels' widgets, which only draw and report —
+//!   the shell carries out what they ask.
+
 //! - [`camera`]: the client's own orbit / pan / zoom and the screen↔world
 //!   mapping a pick needs.
 //! - [`gizmo`]: the client's world→local conversion for a drag — an opinion's
@@ -41,15 +51,18 @@
 pub mod anchor;
 pub mod app;
 pub mod camera;
+pub mod capture;
 pub mod compose;
 pub mod fonts;
 pub mod gizmo;
 pub mod gpu;
 pub mod memresolver;
 pub mod net;
+pub mod panel;
 pub mod protocol;
 pub mod scene;
 pub mod session;
+pub mod tree;
 pub mod view;
 pub mod viewport;
 pub mod window;

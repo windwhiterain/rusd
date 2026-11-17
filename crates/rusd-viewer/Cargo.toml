@@ -19,6 +19,9 @@ rusd-render.workspace = true
 openusd.workspace = true
 serde_json = "1"
 bytemuck = { version = "1.25.2", features = ["derive"] }
+# Encoding a capture's image and mask in memory (`crate::capture`); the same
+# crate `rusd-render` writes PNGs with, so one version of the encoder.
+png = "0.18.1"
 wgpu = "30.0.2"
 egui = { version = "0.37", features = ["default_fonts"] }
 egui-wgpu = { version = "0.37", features = ["winit"] }
@@ -29,4 +32,3 @@ pollster = "1.0.1"
 [dev-dependencies]
 rusd-proc.workspace = true
 rusd-usd.workspace = true
-png = "0.18.1"

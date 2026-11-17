@@ -34,11 +34,36 @@ use crate::gpu::Viewport;
 use crate::protocol::{self, Notification, OpinionOp, Response, Wire};
 use rusd_scene::geometry::SceneGeometry;
 
+/// The code a read that found nothing to say returns when the caller asked with a
+/// deadline ([`ProtocolClient::read_within`]). It is **not** an error: the caller's
+/// loop uses it to go round again and drain the commands it has been given. Every
+/// other error code means the connection is over.
+pub const E_WIRE_IDLE: &str = "E_WIRE_IDLE";
+
 /// The synchronous wire client: one connection, one request id counter.
+///
+/// ## Why a reader thread
+///
+/// Reading is done by a **thread of its own**, which pushes whole lines into a
+/// channel; this type only writes and consumes. The reason is not throughput: a
+/// client that read on the calling thread could not send while it read, so a
+/// command handed to it during a quiet moment — an `undo`, a camera drag's
+/// `opinion`, a `composition_tree` request — waited for the server to say something
+/// unrelated first. That starved the window and deadlocked the tests.
+///
+/// A read timeout on the socket would have been the other way out, and it is
+/// **wrong** here: a `stage_snapshot` line is ~58 KB and arrives in pieces, so a
+/// timeout that fires mid-line would truncate it (or, with `read_line`, silently
+/// swallow the fragments up to the next newline). A thread that blocks on the
+/// socket as long as it likes and hands over complete lines loses nothing.
 pub struct ProtocolClient {
-    reader: BufReader<TcpStream>,
     writer: TcpStream,
+    /// Complete lines from the reader thread, or the reason it stopped.
+    lines: std::sync::mpsc::Receiver<Result<String, String>>,
     next_id: u64,
+    /// Notifications that arrived while a request was waiting for its reply
+    /// ([`ProtocolClient::take_early`]).
+    early: Vec<Notification>,
     /// The peer address, for messages.
     pub addr: String,
 }
@@ -63,10 +88,35 @@ impl ProtocolClient {
                 .try_clone()
                 .map_err(|e| vec![diag("E_CONNECT", format!("{addr}: {e}"))])?,
         );
+        let (tx, lines) = std::sync::mpsc::channel();
+        // The reader thread: blocks on the socket for as long as it takes, and hands
+        // over whole lines. A connection that closes ends it with one final error.
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        let _ = tx.send(Err("the server closed the connection".to_owned()));
+                        return;
+                    }
+                    Ok(_) => {
+                        if tx.send(Ok(line)).is_err() {
+                            return; // nobody is reading any more
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("read failed: {e}")));
+                        return;
+                    }
+                }
+            }
+        });
         let mut client = Self {
-            reader,
             writer: stream,
+            lines,
             next_id: 1,
+            early: Vec::new(),
             addr: addr.to_owned(),
         };
         let mut early = Vec::new();
@@ -128,19 +178,49 @@ impl ProtocolClient {
     }
 
     /// Block until one line arrives (a notification or a reply) and parse it.
+    ///
+    /// With an idle timeout set ([`ProtocolClient::set_idle_timeout`]) a silent
+    /// server makes this return `Err` with the code [`E_WIRE_IDLE`] instead of
+    /// parking; every other error means the connection is over. `read_line` keeps a
+    /// half-read line in its buffer across the timeout, so nothing is lost when the
+    /// line arrives late.
     pub fn read_wire(&mut self) -> Result<Wire, Vec<Diagnostic>> {
-        let mut line = String::new();
-        let n = self
-            .reader
-            .read_line(&mut line)
-            .map_err(|e| vec![diag("E_IO", format!("{}: read failed: {e}", self.addr))])?;
-        if n == 0 {
-            return Err(vec![diag(
+        match self.lines.recv() {
+            Ok(Ok(line)) => {
+                protocol::parse_line(line.trim_end_matches(['\r', '\n'])).map_err(|d| vec![d])
+            }
+            Ok(Err(why)) => Err(vec![diag("E_IO", format!("{}: {why}", self.addr))]),
+            // The reader thread is gone without a reason: the socket is no more.
+            Err(_) => Err(vec![diag(
                 "E_IO",
-                format!("{}: the server closed the connection", self.addr),
-            )]);
+                format!("{}: the connection ended", self.addr),
+            )]),
         }
-        protocol::parse_line(line.trim_end_matches(['\r', '\n'])).map_err(|d| vec![d])
+    }
+
+    /// Wait up to `timeout` for one line, answering [`E_WIRE_IDLE`] when the server
+    /// had nothing to say.
+    ///
+    /// This is what lets a caller keep sending while the server is quiet: the
+    /// **reading** is on its own thread ([`ProtocolClient`]), so the wait is a
+    /// timeout on a channel rather than on the socket — no line can be truncated by
+    /// it, and a command the caller queued in the meantime goes out on the next
+    /// round.
+    pub fn read_within(&mut self, timeout: Duration) -> Result<Wire, Vec<Diagnostic>> {
+        match self.lines.recv_timeout(timeout) {
+            Ok(Ok(line)) => {
+                protocol::parse_line(line.trim_end_matches(['\r', '\n'])).map_err(|d| vec![d])
+            }
+            Ok(Err(why)) => Err(vec![diag("E_IO", format!("{}: {why}", self.addr))]),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(vec![diag(
+                E_WIRE_IDLE,
+                format!("{}: nothing arrived", self.addr),
+            )]),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(vec![diag(
+                "E_IO",
+                format!("{}: the connection ended", self.addr),
+            )]),
+        }
     }
 
     /// Send `opinion{ops}`, waiting for the server's `{version}`. Any
@@ -165,6 +245,32 @@ impl ProtocolClient {
             id: self.next_id - 1,
             result,
         })
+    }
+
+    /// Send any request and answer with the server's JSON-RPC result or error.
+    ///
+    /// This is what `composition_tree` / `comp_node` / `capture` go through: they
+    /// are ordinary requests whose failure is part of their answer (a `-32601`
+    /// from a server without the method must reach the caller, not become a
+    /// diagnostic about a closed connection). Notifications that raced the reply
+    /// are returned with it, so a caller that got a snapshot on the way is not
+    /// made to wait for the next read.
+    pub fn request(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<Result<serde_json::Value, protocol::RpcError>, Vec<Diagnostic>> {
+        let line = protocol::request_line(self.next_id, method, params);
+        let Call { result, early } = self.call(&line)?;
+        self.next_id += 1;
+        self.early.extend(early);
+        Ok(result)
+    }
+
+    /// Take any notification that arrived while a [`ProtocolClient::request`] was
+    /// waiting for its reply.
+    pub fn take_early(&mut self) -> Vec<Notification> {
+        std::mem::take(&mut self.early)
     }
 }
 
@@ -231,6 +337,19 @@ pub enum NetCommand {
     Opinion(Vec<OpinionOp>),
     Undo,
     Redo,
+    /// Any other request of the protocol, answered as [`NetEvent::Reply`] under
+    /// the caller's own `tag`: the viewer's tree panel (`composition_tree`,
+    /// `comp_node`) and its capture (`capture`) are not edits, so they must not
+    /// be reported as [`NetEvent::Applied`] — a capture does not move the scene
+    /// version (`docs/PROTOCOL.md` v1.1).
+    ///
+    /// `tag` is opaque to the worker: it goes back with the reply so the caller
+    /// can tell which of its own requests this is, without a second table.
+    Call {
+        tag: String,
+        method: String,
+        params: serde_json::Value,
+    },
 }
 
 /// What the network thread reports back.
@@ -245,6 +364,14 @@ pub enum NetEvent {
     },
     /// A command failed; the connection stays up unless it was an IO error.
     Failed(Vec<Diagnostic>),
+    /// A [`NetCommand::Call`] was answered. `Err` is the server's JSON-RPC error,
+    /// **code included**, because the tree panel has to tell `-32601 method not
+    /// found` (a server from before v1.2, which degrades) from every other
+    /// failure (which is reported).
+    Reply {
+        tag: String,
+        result: Result<serde_json::Value, protocol::RpcError>,
+    },
     /// The connection is over (the server closed it, or IO broke).
     Closed(Vec<Diagnostic>),
     /// `hello`+`subscribe` succeeded: the client knows it is live.
@@ -287,6 +414,12 @@ impl NetWorker {
             for n in early {
                 let _ = ev_tx.send(NetEvent::Notification(n));
             }
+            // **The read below waits only briefly.** With no deadline this loop
+            // parked until the server spoke, so a command handed over while the
+            // server was quiet — an `undo`, a camera drag's opinion, the tree
+            // request — waited for an unrelated notification. A channel timeout is
+            // what lets the commands be drained every round; the socket itself is
+            // read on the reader thread and is never truncated by this.
             wake();
             loop {
                 // Commands first: a gizmo drag's samples are drained in order, so
@@ -299,7 +432,28 @@ impl NetWorker {
                         Err(TryRecvError::Disconnected) => return,
                     };
                     sent_any = true;
+                    // A `Call` is not an edit: its answer goes back as `Reply`
+                    // under the caller's tag. A `-32601` (a server without the
+                    // method) is a *reply*, not a failure of the connection: the
+                    // caller decides whether it degrades (the tree panel does).
                     let (what, sent) = match cmd {
+                        NetCommand::Call {
+                            tag,
+                            method,
+                            params,
+                        } => {
+                            match client.request(&method, params) {
+                                Ok(result) => {
+                                    let _ = ev_tx.send(NetEvent::Reply { tag, result });
+                                }
+                                Err(diags) => {
+                                    let _ = ev_tx.send(NetEvent::Closed(diags));
+                                    wake();
+                                    return;
+                                }
+                            }
+                            continue;
+                        }
                         NetCommand::Opinion(ops) => ("opinion", client.opinion(&ops)),
                         NetCommand::Undo => ("undo", client.edit(false)),
                         NetCommand::Redo => ("redo", client.edit(true)),
@@ -326,12 +480,19 @@ impl NetWorker {
                         }
                     }
                 }
+                // **Wake before the blocking read.** The events of this batch — a
+                // `Reply` above all — are what the UI must act on, and the read
+                // below parks until the server says something else. Waking after it
+                // would leave a reply sitting in the channel until an unrelated
+                // notification arrived: the tree panel would stay on "请求中…" while
+                // its answer was already in hand.
                 if sent_any {
                     wake();
                 }
-                // Then whatever the server pushed. This read blocks, which is
-                // what parks the thread when nothing is happening.
-                match client.read_wire() {
+                // Then whatever the server pushed. `read_within` returns after a
+                // short wait even when the server says nothing, so the loop gets back
+                // to the command drain above instead of starving it.
+                match client.read_within(Duration::from_millis(20)) {
                     Ok(Wire::Notification(n)) => {
                         let _ = ev_tx.send(NetEvent::Notification(n));
                     }
@@ -342,6 +503,10 @@ impl NetWorker {
                             "E_WIRE",
                             format!("an unsolicited reply to id {}", r.id),
                         )]));
+                    }
+                    Err(diags) if diags.iter().all(|d| d.code == E_WIRE_IDLE) => {
+                        // Nothing arrived: go round and send what the UI queued.
+                        continue;
                     }
                     Err(diags) => {
                         let _ = ev_tx.send(NetEvent::Closed(diags));
@@ -418,6 +583,10 @@ pub enum RenderCommand {
 
 /// One finished frame, as the UI needs it.
 pub struct Frame {
+    /// Monotonic count of the frame this is: 1 for the first the thread ever drew.
+    /// A UI that shows frame `n` while the thread has produced `m > n` is showing
+    /// a stale picture, which is the one question a screenshot cannot answer.
+    pub seq: u64,
     pub width: u32,
     pub height: u32,
     /// RGBA8, gamma-encoded (sRGB target), with the selection outline drawn.
@@ -428,13 +597,26 @@ pub struct Frame {
     pub paths: Vec<String>,
     /// How long this frame took to draw and read back.
     pub millis: f64,
+    /// The camera this frame was **drawn with**. Carried because it is the only
+    /// way to tell "the view holds the fitted camera" from "the picture on screen
+    /// was drawn with an older one": the orbit the UI reports is the one it
+    /// *sent*, not necessarily the one the last frame used.
+    pub camera: Camera,
 }
+
+/// How many produced frames a [`RenderWorker`] remembers for a test or the debug
+/// overlay. Bounded, newest last: a long session must not grow a log.
+const FRAME_LOG: usize = 32;
 
 /// The render thread: owns the [`Viewport`] and the last scene.
 pub struct RenderWorker {
     cmds: Sender<RenderCommand>,
     frames: std::sync::Arc<Latest<Frame>>,
     errors: std::sync::Arc<Latest<Vec<Diagnostic>>>,
+    /// Every frame the thread has produced, as `(seq, camera)`, newest last and
+    /// bounded by [`FRAME_LOG`]. A test asks it which camera each frame used, and
+    /// how many there were — `Latest` alone keeps one and hides the rest.
+    produced: std::sync::Arc<std::sync::Mutex<Vec<(u64, Camera)>>>,
     tid: Option<thread::JoinHandle<()>>,
 }
 
@@ -456,8 +638,10 @@ impl RenderWorker {
         let (cmd_tx, cmd_rx) = channel::<RenderCommand>();
         let frames = std::sync::Arc::new(Latest::new());
         let errors = std::sync::Arc::new(Latest::new());
+        let produced = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let f = frames.clone();
         let e = errors.clone();
+        let p = produced.clone();
         let primes_wake = Some(wake);
         let tid = thread::spawn(move || {
             let mut viewport = Viewport::new(device, queue, width, height);
@@ -466,11 +650,20 @@ impl RenderWorker {
             let mut orbit: Option<Orbit> = None;
             let mut selection: Option<String> = None;
             let mut bounds: ([f64; 3], [f64; 3]) = ([0.0; 3], [0.0; 3]);
+            // `dirty` says the display arguments changed since the last frame;
+            // `uploaded` says the scene on the GPU is the one in `scene` (it is
+            // not after a `Preview`, which re-bakes the same geometry).
             let mut dirty = false;
+            let mut seq: u64 = 0;
             loop {
-                // Commands may pile up while a frame is in flight; every one is
-                // applied, and only the last camera survives, so a fast drag
-                // never builds a backlog of stale views.
+                // **Every pending command is applied before the frame is drawn.**
+                // One batch, one render: the app sends `Scene` and then `View`
+                // (`app::adopt_scene`) within microseconds, and a loop that
+                // rendered between the two would draw the scene's own camera and
+                // then wait for an input event to draw the fitted one — the
+                // "correct fit, stale picture" the window showed with a single
+                // frame on screen. Draining first makes the batch's final camera
+                // the one that reaches the frame.
                 let mut got = false;
                 loop {
                     let cmd = if got {
@@ -536,13 +729,17 @@ impl RenderWorker {
                         }
                     }
                 }
-                if !got && !dirty {
-                    continue;
-                }
-                let Some(o) = orbit else { continue };
+                // A batch that changed nothing (a timeout with no work) draws
+                // nothing: an idle viewer must not burn a core.
                 if !dirty {
                     continue;
                 }
+                // **A batch that changed something always produces a frame** —
+                // the `wake` below is what gets it on screen with no input event
+                // to follow. Only a camera that does not exist yet (`Scene` with
+                // no camera and no `View`) postpones it: `dirty` then stays true
+                // and the next `View` renders.
+                let Some(o) = orbit else { continue };
                 let cfg = rusd_render::RenderConfig {
                     width: viewport.size().0,
                     height: viewport.size().1,
@@ -562,13 +759,23 @@ impl RenderWorker {
                                 &style,
                             );
                         }
+                        seq += 1;
+                        let camera = o.camera();
+                        if let Ok(mut log) = p.lock() {
+                            log.push((seq, camera));
+                            if log.len() > FRAME_LOG {
+                                log.remove(0);
+                            }
+                        }
                         f.put(Frame {
+                            seq,
                             width: out.width,
                             height: out.height,
                             beauty: out.beauty,
                             ids: out.ids,
                             paths: out.paths,
                             millis: started.elapsed().as_secs_f64() * 1000.0,
+                            camera,
                         });
                         if let Some(wake) = &primes_wake {
                             wake();
@@ -593,6 +800,7 @@ impl RenderWorker {
             cmds: cmd_tx,
             frames,
             errors,
+            produced,
             tid: Some(tid),
         }
     }
@@ -606,6 +814,29 @@ impl RenderWorker {
     /// The newest finished frame, if one arrived since the last call.
     pub fn take_frame(&self) -> Option<Frame> {
         self.frames.take()
+    }
+
+    /// The sequence number of the newest frame the thread has **produced**, taken
+    /// or not. `take_frame` hides a frame nobody took; this does not, which is
+    /// what lets the overlay say "14 produced / 13 shown" instead of "13/13 fresh"
+    /// while a frame is still in flight.
+    pub fn produced_seq(&self) -> u64 {
+        self.produced
+            .lock()
+            .ok()
+            .and_then(|l| l.last().map(|(s, _)| *s))
+            .unwrap_or(0)
+    }
+
+    /// Every frame the thread produced recently, as `(seq, camera)`, oldest first
+    /// and at most the last [`FRAME_LOG`] of them.
+    ///
+    /// This is the record a test reads to answer "which camera did the frame on
+    /// screen actually use": the orbit the UI holds is the one it *sent*, and a
+    /// frame drawn before that send shows an older view in every other observable
+    /// channel.
+    pub fn produced(&self) -> Vec<(u64, Camera)> {
+        self.produced.lock().map(|l| l.clone()).unwrap_or_default()
     }
 
     /// The newest render failure, if any.

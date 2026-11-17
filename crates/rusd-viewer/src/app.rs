@@ -104,6 +104,12 @@ const ORBIT_SENSITIVITY: f64 = 0.006;
 /// A gizmo drag sends at most this often (`docs/PROTOCOL.md`: ≤ 30 Hz).
 const GIZMO_HZ: f64 = 30.0;
 
+/// The tags a `NetCommand::Call` is answered under, so [`Shell::on_reply`] knows
+/// which of its own requests a reply belongs to.
+const TREE_TAG: &str = "composition_tree";
+const NODE_TAG: &str = "comp_node";
+const CAPTURE_TAG: &str = "capture";
+
 /// What wakes the window thread.
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppEvent {
@@ -178,6 +184,25 @@ pub struct Shell {
     fps: f64,
     last_frame_at: Instant,
     offline_usdc: Option<String>,
+
+    /// The composition-tree panel (`docs/PROTOCOL.md` v1.2).
+    tree: crate::panel::TreePanel,
+    /// Whether `composition_tree{}` has been asked for this connection: asked once
+    /// when the first snapshot arrives, and again on 「刷新」.
+    tree_asked: bool,
+
+    /// Whether the capture toolbar's selection mode is armed.
+    capture_armed: bool,
+    /// Where the capture drag started, in viewport points.
+    capture_start: Option<egui::Pos2>,
+    /// The optional note that goes into the next capture.
+    capture_note: String,
+    /// The last toast (a copied id or path) and when it was raised.
+    toast: Option<(String, Instant)>,
+    /// The clipboard payload waiting to be copied: egui copies text through the
+    /// platform output of a pass, so a copy asked for in this pass is handed to
+    /// `ctx.copy_text` at the **end** of it (`Shell::flush_copy`).
+    pending_copy: Option<String>,
 }
 
 impl Shell {
@@ -288,6 +313,13 @@ impl Shell {
             last_frame_at: Instant::now(),
             offline_usdc: args.usdc.clone(),
             debug_ui: args.debug_ui,
+            tree: crate::panel::TreePanel::new(),
+            tree_asked: false,
+            capture_armed: false,
+            capture_start: None,
+            capture_note: String::new(),
+            toast: None,
+            pending_copy: None,
         })
     }
 
@@ -304,6 +336,7 @@ impl Shell {
                     // claiming "connecting" while snapshots were arriving.
                     self.model.mark_live();
                     self.status = self.model.status_line_zh();
+                    self.ask_tree();
                     self.request_repaint();
                 }
                 NetEvent::Applied { what, version } => {
@@ -317,6 +350,7 @@ impl Shell {
                     self.status = join_diags(&diags);
                     self.request_repaint();
                 }
+                NetEvent::Reply { tag, result } => self.on_reply(tag, result),
                 NetEvent::Closed(diags) => {
                     self.status = join_diags(&diags);
                     self.model.mark_closed();
@@ -368,6 +402,11 @@ impl Shell {
         self.status = self.model.status_line_zh();
         self.preview = None;
         self.gizmo = None;
+        // The first scene of a session is when `composition_tree{}` becomes
+        // answerable (the server needs an open stage). Asked once; 「刷新」 asks again.
+        if !self.tree_asked {
+            self.ask_tree();
+        }
         // The stage is kept for the gizmo's anchor reads and never leaves this
         // thread; the render thread gets the geometry.
         self.stage = made.stage;
@@ -415,6 +454,162 @@ impl Shell {
             Err(diags) => self.status = join_diags(&diags),
         }
         self.window.request_redraw();
+    }
+
+    // --- the composition tree and the capture (D13) -----------------------
+
+    /// Ask `composition_tree{}` when the session becomes live and there is a scene.
+    ///
+    /// The tree is built from the server's authority stack, so it only exists once
+    /// the server has opened something; asking before that would only earn a "no
+    /// scene open". `tree_asked` keeps it to one request per connection (plus each
+    /// 「刷新」), not one per snapshot: the tree is a structural read, and a
+    /// re-composite after an opinion leaves the layers unchanged.
+    fn ask_tree(&mut self) {
+        if self.model.version.is_none() {
+            return;
+        }
+        self.tree_asked = true;
+        self.tree.model = crate::tree::TreeModel::Loading;
+        self.net.send(NetCommand::Call {
+            tag: TREE_TAG.to_owned(),
+            method: "composition_tree".to_owned(),
+            params: crate::tree::tree_params(),
+        });
+    }
+
+    /// Ask `comp_node{id}` for a clicked row.
+    fn ask_node(&mut self, id: &str) {
+        self.net.send(NetCommand::Call {
+            tag: NODE_TAG.to_owned(),
+            method: "comp_node".to_owned(),
+            params: crate::tree::comp_node_params(id),
+        });
+    }
+
+    /// A `NetCommand::Call` was answered: route it by its tag.
+    fn on_reply(&mut self, tag: String, result: Result<serde_json::Value, protocol::RpcError>) {
+        let reply = match result {
+            Ok(v) => Ok(v),
+            Err(e) => Err((e.code, e.message)),
+        };
+        match tag.as_str() {
+            TREE_TAG => {
+                self.tree.apply_tree(reply);
+                self.status = self.tree.model.status_zh();
+            }
+            NODE_TAG => self.tree.apply_node(reply),
+            CAPTURE_TAG => match reply {
+                Ok(value) => match value.get("id").and_then(|v| v.as_str()) {
+                    Some(id) => {
+                        self.copy_toast(id.to_owned());
+                        self.status = format!("capture {id}");
+                    }
+                    None => {
+                        self.status = format!("capture: the reply has no id: {value}");
+                    }
+                },
+                Err((code, message)) => {
+                    self.status = format!("capture failed: {message} (code {code})");
+                }
+            },
+            other => self.status = format!("a reply with an unknown tag {other:?}"),
+        }
+        self.request_repaint();
+    }
+
+    /// Put `text` on the clipboard and raise the 「已拷贝」 toast.
+    ///
+    /// The copy itself is deferred to the end of the pass (`flush_copy`): egui
+    /// hands clipboard writes to the platform through the pass's output, and
+    /// `ctx.copy_text` called mid-pass is exactly how that is spelled.
+    fn copy_toast(&mut self, text: String) {
+        self.status = crate::capture::copied_toast_zh(&text);
+        self.pending_copy = Some(text.clone());
+        self.toast = Some((crate::capture::copied_toast_zh(&text), Instant::now()));
+    }
+
+    /// Hand a pending copy to egui. Called once per pass, after the UI is built.
+    fn flush_copy(&mut self, ctx: &egui::Context) {
+        if let Some(text) = self.pending_copy.take() {
+            ctx.copy_text(text);
+        }
+    }
+
+    /// A click in the tree: select the row, ask its detail, and — when the row
+    /// stands for a prim — select that prim in the viewport and copy its path.
+    fn on_tree_select(&mut self, sel: crate::tree::TreeSelection) {
+        self.ask_node(&sel.id);
+        if let Some(path) = crate::panel::copy_payload(&sel) {
+            self.model.selection = Some(path.clone());
+            self.copy_toast(path);
+            self.preview = None;
+            self.gizmo = None;
+            self.ask_render();
+        }
+        self.tree.selection = Some(sel);
+        self.request_repaint();
+    }
+
+    /// Take the capture the user just framed: the frame's own beauty image, a mask
+    /// of the region at that size, and the camera the frame was drawn with.
+    ///
+    /// Everything here is local: the picture is the one on screen (so it costs no
+    /// render), the mask is built from the same rectangle a pick would use, and the
+    /// camera is [`crate::net::Frame::camera`] — what the pixels actually show, not
+    /// the orbit the UI has since moved to.
+    ///
+    /// Offline (`--usdc`) this still works and says `scene_version: 0`: the frame is
+    /// real even when no server produced it (`docs/PROTOCOL.md` v1.1 验收).
+    fn take_capture(&mut self, start: egui::Pos2, end: egui::Pos2) {
+        let Some((frame, _)) = self.frame.as_ref() else {
+            self.status = "capture: 还没有画面（等第一帧）".to_owned();
+            return;
+        };
+        let frame_size = (frame.width, frame.height);
+        let Some(sel) = crate::panel::mask_rect(self.viewport.rect(), start, end, frame_size)
+        else {
+            self.status = "capture: 选区为空".to_owned();
+            return;
+        };
+        let image_png = match crate::capture::encode_png(frame.width, frame.height, &frame.beauty) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.status = format!("capture: 编码 PNG 失败：{e}");
+                return;
+            }
+        };
+        let mask = crate::capture::mask_rgba(frame_size, sel);
+        let mask_png = match crate::capture::encode_png(frame.width, frame.height, &mask) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                self.status = format!("capture: 编码 mask 失败：{e}");
+                return;
+            }
+        };
+        let camera = crate::capture::camera_json_of(&frame.camera);
+        let params = crate::capture::capture_params(
+            camera,
+            &image_png,
+            Some(&mask_png),
+            self.model.version.unwrap_or(0),
+            Some(self.capture_note.as_str()),
+        );
+        self.net.send(NetCommand::Call {
+            tag: CAPTURE_TAG.to_owned(),
+            method: "capture".to_owned(),
+            params,
+        });
+        self.capture_armed = false;
+        self.capture_start = None;
+        self.status = format!(
+            "capture 已发送（{}×{} 帧，选区 {}×{}）",
+            frame.width,
+            frame.height,
+            sel.width(),
+            sel.height()
+        );
+        self.request_repaint();
     }
 
     // --- render thread → view --------------------------------------------
@@ -497,8 +692,27 @@ impl Shell {
                         "⟳ 热重载 reloaded on server",
                     );
                 }
+                if let Some((text, at)) = &self.toast
+                    && crate::panel::toast_visible(Instant::now(), *at)
+                {
+                    ui.separator();
+                    ui.colored_label(egui::Color32::from_rgb(120, 220, 140), text.clone());
+                }
             });
         });
+
+        egui::Panel::left("composition-tree")
+            .default_size(280.0)
+            .min_size(180.0)
+            .show(root, |ui| {
+                match crate::panel::tree_panel(ui, &self.tree) {
+                    crate::panel::TreeAction::Select(sel) => self.on_tree_select(sel),
+                    crate::panel::TreeAction::Refresh => self.ask_tree(),
+                    crate::panel::TreeAction::None => {}
+                }
+                ui.separator();
+                crate::panel::detail_panel(ui, &self.tree);
+            });
 
         egui::Panel::bottom("controls").show(root, |ui| {
             ui.horizontal(|ui| {
@@ -511,6 +725,13 @@ impl Shell {
                 ui.separator();
                 if ui.button("Fit").clicked() {
                     self.fit();
+                }
+                ui.separator();
+                if let crate::panel::CaptureAction::ToggleArmed =
+                    crate::panel::capture_toolbar(ui, self.capture_armed, &mut self.capture_note)
+                {
+                    self.capture_armed = !self.capture_armed;
+                    self.capture_start = None;
                 }
                 ui.separator();
                 match self.model.selection.clone() {
@@ -624,7 +845,16 @@ impl Shell {
     }
 
     /// Pointer input over the viewport: orbit, pan, zoom, pick, and the gizmo.
+    ///
+    /// In capture-selection mode a drag is not an orbit: it frames the region to
+    /// capture, and the orbit waits until the mode is left. Taking the picture and
+    /// moving the view at once would send an agent a mask over pixels that have
+    /// since changed.
     fn handle_input(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect) {
+        if self.capture_armed {
+            self.handle_capture_input(ui, resp, rect);
+            return;
+        }
         if resp.drag_started() {
             let Some(pos) = resp.interact_pointer_pos() else {
                 return;
@@ -742,6 +972,38 @@ impl Shell {
         Some((x, y))
     }
 
+    /// Selection-mode input: a drag frames a region, and letting go takes the
+    /// capture. Nothing here moves the camera or picks a prim — the region is the
+    /// whole output of the gesture.
+    fn handle_capture_input(&mut self, ui: &egui::Ui, resp: &egui::Response, rect: egui::Rect) {
+        if resp.drag_started()
+            && let Some(pos) = resp.interact_pointer_pos()
+        {
+            self.capture_start = Some(pos);
+        }
+        if let (Some(start), Some(pos)) = (self.capture_start, resp.interact_pointer_pos())
+            && resp.dragged()
+        {
+            crate::panel::paint_capture_rect(ui, start, pos);
+        }
+        if resp.drag_stopped() {
+            let start = self.capture_start.take();
+            let end = resp.interact_pointer_pos();
+            match (start, end) {
+                (Some(s), Some(e)) => self.take_capture(s, e),
+                _ => {
+                    self.status = "capture: 选区取消".to_owned();
+                }
+            }
+        }
+        // A single click is not a region; say so rather than capturing a pixel the
+        // user did not mean to pick.
+        if resp.clicked() {
+            self.status = "capture: 拖一个矩形（不是点）".to_owned();
+        }
+        let _ = rect;
+    }
+
     /// Whether a viewport point lands on the current selection's pixels.
     fn pixel_is_selected(&self, pos: egui::Pos2, rect: egui::Rect) -> bool {
         let (Some(sel), Some((x, y))) =
@@ -834,18 +1096,24 @@ impl Shell {
             .map(|(f, _)| (f.width, f.height))
             .unwrap_or((0, 0));
         let orbit = self.orbit;
+        // `produced` counts what the render thread made, `shown` what this window
+        // drew; `drawn_*` is the camera of the frame in hand — the one the pixels on
+        // screen were actually taken with.
+        let drawn = self.frame.as_ref().map(|(f, _)| f.camera);
         let report = crate::viewport::OverlayReport {
             pixels_per_point: vp.pixels_per_point(),
             rect_points: (vp.rect().width(), vp.rect().height()),
             viewport_texels: vp.texels(),
             frame_texels,
             texels_match: frame_texels.0 > 0 && vp.is_pixel_exact(frame_texels),
-            frames_received: self.frames_received,
+            frames_produced: self.render.produced_seq(),
             // Only one texture is ever on screen, so the frame in hand is the one
             // drawn this pass `drain_frames` ran before `paint`.
             frames_shown: self.frames_received,
             orbit_distance: orbit.map_or(0.0, |o| o.distance),
             orbit_target: orbit.map_or([0.0; 3], |o| o.target),
+            drawn_distance: drawn.map(|c| crate::camera::Orbit::from_camera(&c).distance),
+            drawn_target: drawn.map(|c| c.look_at),
         };
         let lines = report.lines();
         let font = egui::FontId::monospace(12.0);
@@ -928,6 +1196,10 @@ impl Shell {
         let raw = self.egui_state.take_egui_input(&self.window);
         let ctx = self.egui_ctx.clone();
         let full = ctx.run_ui(raw, |root| self.ui(root));
+        // A copy asked for during the pass goes out with the pass's own platform
+        // output; doing it here — after the widgets ran — is what makes one pass's
+        // click and its clipboard write the same frame.
+        self.flush_copy(&ctx);
         self.egui_state
             .handle_platform_output(&self.window, full.platform_output);
         let clipped = ctx.tessellate(full.shapes, full.pixels_per_point);

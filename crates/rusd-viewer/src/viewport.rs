@@ -141,6 +141,12 @@ pub fn whole_window(window_points: Vec2, pixels_per_point: f32) -> ViewportSize 
 /// how big is the rect, how big is the frame, are they the same size, and is the frame
 /// on screen the latest one. If `fresh` is false the window is showing an older frame,
 /// and `texels_match` says whether the picture is being resampled.
+///
+/// `drawn_*` is the decisive pair the earlier version was missing: the orbit the UI
+/// holds is the one it **sent**, and the picture on screen is whatever the render
+/// thread drew *last*. Two numbers that can disagree — a window whose overlay read
+/// `dist 1287 / target 116.9` (the fit) while the image was a pre-fit corner is
+/// exactly that disagreement, and it cannot be seen by reporting one of them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OverlayReport {
     pub pixels_per_point: f32,
@@ -149,23 +155,46 @@ pub struct OverlayReport {
     pub frame_texels: (u32, u32),
     /// Whether the frame on screen has the viewport's texel size (a 1:1 blit).
     pub texels_match: bool,
-    /// Frames the render thread has delivered, and how many have been shown.
-    pub frames_received: u64,
+    /// Frames the render thread has **produced**, and how many have been shown.
+    pub frames_produced: u64,
     pub frames_shown: u64,
     /// The camera the viewport is drawn with.
     pub orbit_distance: f64,
     pub orbit_target: [f64; 3],
+    /// The camera the frame **on screen** was drawn with; `None` before a frame.
+    pub drawn_distance: Option<f64>,
+    pub drawn_target: Option<[f64; 3]>,
 }
 
 impl OverlayReport {
-    /// Whether the frame on screen is the latest one delivered.
+    /// Whether the frame on screen is the latest the thread produced. Counted over
+    /// *productions*, not takes: a frame that reached the thread and not the screen
+    /// is the state a stale picture is stuck in.
     pub fn fresh(&self) -> bool {
-        self.frames_shown >= self.frames_received
+        self.frames_shown >= self.frames_produced
+    }
+
+    /// Whether the camera the picture was drawn with is the one the UI is showing
+    /// in the overlay — within a centimetre of target and a millimetre of distance,
+    /// which is far tighter than any real camera move.
+    pub fn camera_matches(&self) -> bool {
+        let (Some(d), Some(t)) = (self.drawn_distance, self.drawn_target) else {
+            return false;
+        };
+        (d - self.orbit_distance).abs() < 1e-3
+            && (0..3).all(|k| (t[k] - self.orbit_target[k]).abs() < 1e-2)
     }
 
     /// The overlay's lines, one per fact. Kept as text here so the same strings a
     /// screenshot shows are what a test asserts.
     pub fn lines(&self) -> Vec<String> {
+        let drawn = match (self.drawn_distance, self.drawn_target) {
+            (Some(d), Some(t)) => format!(
+                "drawn {d:.1} target ({:.1}, {:.1}, {:.1})",
+                t[0], t[1], t[2]
+            ),
+            _ => "drawn (no frame)".to_owned(),
+        };
         vec![
             format!("ppp {:.2}", self.pixels_per_point),
             format!(
@@ -187,8 +216,8 @@ impl OverlayReport {
                 if self.texels_match { "yes" } else { "NO" }
             ),
             format!(
-                "frames {} received / {} shown · fresh {}",
-                self.frames_received,
+                "frames {} produced / {} shown · fresh {}",
+                self.frames_produced,
                 self.frames_shown,
                 if self.fresh() { "yes" } else { "NO" }
             ),
@@ -198,6 +227,10 @@ impl OverlayReport {
                 self.orbit_target[0],
                 self.orbit_target[1],
                 self.orbit_target[2]
+            ),
+            format!(
+                "{drawn} · same camera {}",
+                if self.camera_matches() { "yes" } else { "NO" }
             ),
         ]
     }
@@ -219,28 +252,84 @@ mod tests {
             viewport_texels: (2240, 1173),
             frame_texels: (2240, 1173),
             texels_match: true,
-            frames_received: 7,
+            frames_produced: 7,
             frames_shown: 7,
             orbit_distance: 1287.0,
             orbit_target: [116.9, 116.3, 25.0],
+            drawn_distance: Some(1287.0),
+            drawn_target: Some([116.9, 116.3, 25.0]),
         };
-        assert!(r.fresh(), "shown == received is fresh");
+        assert!(r.fresh(), "shown == produced is fresh");
+        assert!(r.camera_matches(), "the drawn camera is the orbit's");
         let lines = r.lines().join(" | ");
         assert!(lines.contains("ppp 1.75"), "{lines}");
         assert!(lines.contains("rect 1280x670 pt"), "{lines}");
         assert!(lines.contains("1:1 yes"), "{lines}");
         assert!(lines.contains("fresh yes"), "{lines}");
+        assert!(lines.contains("same camera yes"), "{lines}");
 
         // A frame that has not reached the screen yet: the overlay must say "NO"
         // in both places that would let a screenshot be misread.
-        r.frames_received = 8;
+        r.frames_produced = 8;
         r.frame_texels = (2240, 1260);
         r.texels_match = false;
         assert!(!r.fresh());
         let lines = r.lines().join(" | ");
         assert!(lines.contains("1:1 NO"), "{lines}");
         assert!(lines.contains("fresh NO"), "{lines}");
-        assert!(lines.contains("8 received / 7 shown"), "{lines}");
+        assert!(lines.contains("8 produced / 7 shown"), "{lines}");
+    }
+
+    #[test]
+    fn the_overlay_catches_the_bug_the_round_found() {
+        // The screenshot that named this bug: everything agreed — 1:1, fresh, and
+        // the *orbit* was the correct fit — while the picture was a pre-fit corner.
+        // The two numbers that disagree are the orbit the UI holds and the camera
+        // the frame on screen was drawn with; the overlay must show both and call
+        // them different.
+        let r = OverlayReport {
+            pixels_per_point: 1.75,
+            rect_points: (1280.0, 670.0),
+            viewport_texels: (2240, 1172),
+            frame_texels: (2240, 1172),
+            texels_match: true,
+            frames_produced: 1,
+            frames_shown: 1,
+            orbit_distance: 1287.0,
+            orbit_target: [116.9, 116.3, 25.0],
+            // The frame was drawn from the geometry's own composed camera: a
+            // different eye, the same general direction.
+            drawn_distance: Some(1637.6),
+            drawn_target: Some([116.9, 116.3, 25.0]),
+        };
+        assert!(r.fresh(), "fresh says nothing about which camera was used");
+        assert!(
+            !r.camera_matches(),
+            "the stale frame's distance must not pass for the fit's"
+        );
+        let lines = r.lines().join(" | ");
+        assert!(lines.contains("orbit dist 1287.0"), "{lines}");
+        assert!(lines.contains("drawn 1637.6"), "{lines}");
+        assert!(lines.contains("same camera NO"), "{lines}");
+    }
+
+    #[test]
+    fn a_window_with_no_frame_yet_says_so_rather_than_matching_by_default() {
+        let r = OverlayReport {
+            pixels_per_point: 1.0,
+            rect_points: (100.0, 100.0),
+            viewport_texels: (100, 100),
+            frame_texels: (0, 0),
+            texels_match: false,
+            frames_produced: 0,
+            frames_shown: 0,
+            orbit_distance: 0.0,
+            orbit_target: [0.0; 3],
+            drawn_distance: None,
+            drawn_target: None,
+        };
+        assert!(!r.camera_matches(), "no frame means nothing to match");
+        assert!(r.lines().join(" | ").contains("drawn (no frame)"));
     }
 
     #[test]
@@ -254,10 +343,12 @@ mod tests {
             viewport_texels: vp.texels(),
             frame_texels: (2240, 1260),
             texels_match: vp.is_pixel_exact((2240, 1260)),
-            frames_received: 2,
+            frames_produced: 2,
             frames_shown: 1,
             orbit_distance: 1287.0,
             orbit_target: [0.0; 3],
+            drawn_distance: Some(1287.0),
+            drawn_target: Some([0.0; 3]),
         };
         assert!(!report.texels_match, "the window-sized frame is not 1:1");
         assert!(!report.fresh(), "and it was not the latest frame");
