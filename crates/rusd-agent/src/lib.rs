@@ -25,6 +25,8 @@ use rusd_render::annotate::{self, Marker, SelectMode, Selection};
 use rusd_scene::geometry::{self, SceneGeometry};
 use serde_json::{Value, json};
 
+mod capture;
+mod composition;
 mod patch;
 pub mod transport;
 
