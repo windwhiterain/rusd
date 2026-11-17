@@ -654,10 +654,13 @@ mod tests {
     #[test]
     fn a_camera_survives_the_orbit_round_trip() {
         use crate::scene::{BBox, fit_camera};
-        let cam = fit_camera(&BBox {
-            min: [-1.0, -1.0, 0.0],
-            max: [1.0, 1.0, 2.0],
-        });
+        let cam = fit_camera(
+            &BBox {
+                min: [-1.0, -1.0, 0.0],
+                max: [1.0, 1.0, 2.0],
+            },
+            16.0 / 9.0,
+        );
         let back = camera_of(&Orbit::from_camera(&cam));
         for k in 0..3 {
             assert!((cam.position[k] - back.position[k]).abs() < 1e-9);

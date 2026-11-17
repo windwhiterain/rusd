@@ -345,7 +345,7 @@ fn a_pushed_snapshot_composes_to_the_cooked_bbox_and_prim_count() {
     assert_eq!(snap.version, 2);
     assert_eq!(snap.format, "usdc");
 
-    let made = MadeScene::from_snapshot(snap).expect("the snapshot composes");
+    let made = MadeScene::from_snapshot(snap, 16.0 / 9.0).expect("the snapshot composes");
     assert_eq!(made.item_count(), 434, "city's prims");
     let b = made.bbox();
     assert!(

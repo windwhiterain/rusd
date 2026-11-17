@@ -39,6 +39,7 @@ use crate::camera::{Orbit, plane_hit};
 use crate::net::{NetCommand, NetEvent, NetWorker, RenderCommand, RenderWorker};
 use crate::protocol::{self, Notification, OpinionOp};
 use crate::session::{ClientModel, Drag, Effect, MadeScene};
+use crate::window::startup_window_attrs;
 
 /// How the viewer was started: the words after `view`.
 #[derive(Clone, Debug, PartialEq)]
@@ -162,6 +163,19 @@ impl Shell {
         proxy: EventLoopProxy<AppEvent>,
     ) -> Result<Self, String> {
         let egui_ctx = egui::Context::default();
+        // Before the first frame: the status bar's Chinese labels draw as tofu
+        // unless a CJK face is in the atlas (see `crate::fonts`).
+        let font = crate::fonts::install(&egui_ctx);
+        match &font {
+            Some(f) => eprintln!(
+                "{{\"code\":\"N_FONT\",\"message\":\"{} bytes from {}\"}}",
+                f.bytes,
+                f.path.display()
+            ),
+            None => eprintln!(
+                "{{\"code\":\"W_FONT\",\"message\":\"no CJK font found; UI text will be tofu\"}}"
+            ),
+        }
         let size = window.inner_size();
         let mut painter = pollster::block_on(egui_wgpu::winit::Painter::new(
             egui_ctx.clone(),
@@ -334,7 +348,8 @@ impl Shell {
 
     /// No server: show the `.usdc` the user named so the window is not empty.
     fn load_offline(&mut self, path: &str) {
-        match MadeScene::from_usdc_file(path) {
+        let aspect = self.window_aspect();
+        match MadeScene::from_usdc_file(path, aspect) {
             Ok(made) => {
                 let prims = made.item_count();
                 self.adopt_scene(made);
@@ -478,14 +493,28 @@ impl Shell {
         let Some(bounds) = self.model.bbox else {
             return;
         };
+        // Fit the window as it is now: "Fit" is the user asking for a fresh
+        // framing, which is the one moment a resize is allowed to matter.
+        let aspect = self.window_aspect();
+        self.model.set_aspect(aspect);
         self.orbit = Some(Orbit::from_camera(&crate::scene::fit_camera(
             &crate::scene::BBox {
                 min: bounds.0,
                 max: bounds.1,
             },
+            aspect,
         )));
         self.ask_render();
         self.window.request_redraw();
+    }
+
+    /// The viewport's `width / height`, from the window's real size.
+    fn window_aspect(&self) -> f64 {
+        let s = self.window.inner_size();
+        if s.height == 0 {
+            return 16.0 / 9.0;
+        }
+        f64::from(s.width) / f64::from(s.height)
     }
 
     /// Pointer input over the viewport: orbit, pan, zoom, pick, and the gizmo.
@@ -772,9 +801,14 @@ impl ApplicationHandler<AppEvent> for App {
         if self.shell.is_some() {
             return;
         }
-        let attrs = Window::default_attributes()
-            .with_title("rusd-viewer")
-            .with_inner_size(winit::dpi::LogicalSize::new(1100.0, 720.0));
+        let attrs = match startup_window_attrs(event_loop) {
+            Ok(a) => a,
+            Err(msg) => {
+                eprintln!("{{\"code\":\"E_WINDOW\",\"message\":\"{msg}\"}}");
+                event_loop.exit();
+                return;
+            }
+        };
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {

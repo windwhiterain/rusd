@@ -110,32 +110,139 @@ pub fn fitted_fov_deg() -> f64 {
     (2.0 * (aperture_y / (2.0 * FOCAL_MM)).atan()).to_degrees()
 }
 
-/// The look-at camera that frames `bbox`: eye at `center + (0.85d, −0.85d,
-/// 0.62d)` with `d` the larger of the two plan extents, looking at the center,
-/// through a 35 mm / 36×20.25 lens.
-pub fn fit_camera(bbox: &BBox) -> geometry::Camera {
+/// The look-at camera that frames `bbox`: eye at `center + t·(0.85, −0.85, 0.62)`
+/// along the documented view direction, with `t` chosen so the box fits the frame
+/// at the given window `aspect` (`width / height`), with [`FIT_MARGIN`] to spare.
+///
+/// A displacement-only fit is aspect-blind, and it is why the first window had the
+/// city bunched into a corner: the ground plane's *diagonal* is its widest
+/// silhouette, and a narrow viewport crops it. So the leg of the displacement is
+/// solved from the box itself:
+///
+/// - every corner is projected through the view rotation (at distance 0), giving
+///   its offset `(x, y)` from the centre in the image plane and its `z` along the
+///   view direction;
+/// - a corner is inside the vertical frustum when `|y| ≤ tan(fov/2)·(D − z)` and
+///   inside the horizontal one when `|x| ≤ tan(fov/2)·aspect·(D − z)`, for `D` the
+///   eye-to-centre distance;
+/// - so `D = max over corners of ( z + |y|/tan_v , z + |x|/(tan_v·aspect) )` is the
+///   nearest distance that holds **all eight corners** inside both frusta. Taking
+///   the larger of the two per-corner terms is exactly "both constraints, whichever
+///   needs more distance" — for a wide box the horizontal term wins, for a tall or
+///   square window the vertical one does.
+///
+/// `FIT_MARGIN` is then taken off the usable half-angle, so the box lands inside
+/// the frame with a border rather than touching the edges. The direction is the
+/// documented one, so a fit only ever slides along the same line the earlier
+/// version did.
+pub fn fit_camera(bbox: &BBox, aspect: f64) -> geometry::Camera {
     let center = bbox.center();
     let size = bbox.size();
-    let d = size[0].max(size[1]).max(1.0);
+    let fov = fitted_fov_deg();
+    // Pick the same three-quarter direction the fit has always used...
+    let dir = norm([0.85, -0.85, 0.62]);
+    // ...and work in the frame's own basis: forward `f` (eye → centre is `−f`),
+    // right `s`, up `u` — the same basis `camera::look_at` builds.
+    let f = [-dir[0], -dir[1], -dir[2]];
+    let s = norm(cross(f, [0.0, 0.0, 1.0]));
+    let u = cross(s, f);
+
+    // The usable half-angles, margin included.
+    let tan_v = (fov.to_radians() / 2.0).tan() * (1.0 - FIT_MARGIN);
+    let tan_h = tan_v * aspect.max(1e-6);
+
+    let radius = size[0].hypot(size[1]).hypot(size[2]) / 2.0;
+    let mut distance: f64 = 0.0;
+    // **All eight** corners, not the box's two opposite ones: for a box with
+    // unequal extents the corner that binds a frustum plane is generally one of
+    // the six `BBox::corners` does not name (its diagonal is the widest
+    // silhouette).
+    for corner in corners8(bbox) {
+        let d = [
+            corner[0] - center[0],
+            corner[1] - center[1],
+            corner[2] - center[2],
+        ];
+        // The corner's offset from the frame centre, along the frame's axes.
+        let x = dot(d, s);
+        let y = dot(d, u);
+        // `−dot(d, f) = dot(d, dir)` is how far the corner sits *towards* the eye,
+        // so it needs that much less distance to be in front of the frustum.
+        let z = dot(d, dir);
+        // Both constraints for this corner; the larger is the one that binds.
+        let need_v = z + y.abs() / tan_v;
+        let need_h = z + x.abs() / tan_h;
+        distance = distance.max(need_v).max(need_h);
+    }
+    // A degenerate box (one point, or a flat stack) must still leave the eye
+    // outside the geometry.
+    distance = distance.max(radius).max(1.0);
+
     geometry::Camera {
         position: [
-            center[0] + 0.85 * d,
-            center[1] - 0.85 * d,
-            center[2] + 0.62 * d,
+            center[0] + distance * dir[0],
+            center[1] + distance * dir[1],
+            center[2] + distance * dir[2],
         ],
         look_at: center,
-        fov_deg: fitted_fov_deg(),
+        fov_deg: fov,
+    }
+}
+
+/// How much of each half-angle the fit gives up, so the scene sits inside the
+/// frame with a border instead of touching the edges. `0.08` leaves ~8% of the
+/// half-angle on each side (a few percent of the frame's width and height).
+pub const FIT_MARGIN: f64 = 0.08;
+
+/// The box's eight corners (`BBox::corners` answers the two opposite ones a
+/// bounding box needs, which is not enough to fit a frustum to).
+fn corners8(b: &BBox) -> [[f64; 3]; 8] {
+    let mut out = [[0.0; 3]; 8];
+    let mut i = 0;
+    for x in [b.min[0], b.max[0]] {
+        for y in [b.min[1], b.max[1]] {
+            for z in [b.min[2], b.max[2]] {
+                out[i] = [x, y, z];
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn norm(v: [f64; 3]) -> [f64; 3] {
+    let l = dot(v, v).sqrt();
+    if l > 1e-12 {
+        [v[0] / l, v[1] / l, v[2] / l]
+    } else {
+        [0.0, 0.0, 1.0]
     }
 }
 
 /// Extract `stage`'s renderable geometry and replace its camera with the fitted
 /// one, so a cook output with no `Camera` prim still frames correctly.
-pub fn extract_fitted(stage: &Stage) -> SceneGeometry {
+///
+/// `aspect` is the window's `width / height`; see [`fit_camera`] for why the fit
+/// needs it.
+pub fn extract_fitted(stage: &Stage, aspect: f64) -> SceneGeometry {
     let mut geo = geometry::extract(stage);
-    geo.camera = Some(fit_camera(&BBox {
-        min: geo.bounds.0,
-        max: geo.bounds.1,
-    }));
+    geo.camera = Some(fit_camera(
+        &BBox {
+            min: geo.bounds.0,
+            max: geo.bounds.1,
+        },
+        aspect,
+    ));
     geo
 }
 
@@ -202,7 +309,8 @@ pub fn snapshot_usdc_bytes(
     mem.insert(layer.identifier(), bytes);
     let stack = crate::compose::Stack::open(mem, layer.identifier(), None, Vec::new())?;
     let mut diags = stack.diags.clone();
-    let geo = extract_fitted(&stack.stage);
+    let aspect = f64::from(width) / f64::from(height.max(1));
+    let geo = extract_fitted(&stack.stage, aspect);
     diags.extend(geo.diags.iter().cloned());
     let render = match out {
         Some(path) => write_snapshot(&geo, width, height, path)?,
@@ -246,4 +354,178 @@ pub fn png_is_nonempty(path: &str) -> bool {
     std::fs::metadata(path)
         .map(|m| m.len() > 0)
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera::view_proj;
+    use crate::scene::fit_camera;
+
+    /// The city's real world box, as `tests/parity.rs` records it.
+    fn city_bbox() -> BBox {
+        BBox {
+            min: [-210.262254, -211.440871, -2.0],
+            max: [444.0, 444.0, 52.0654526],
+        }
+    }
+
+    /// Every corner's NDC under `cam`, or a panic naming the one behind the eye.
+    ///
+    /// All **eight**: `BBox::corners` answers two opposite corners, which is all a
+    /// bounding box needs and not all a fit does — a check that tested only those
+    /// two passed while a city corner sat at NDC −1.38, so this helper is the one
+    /// place that must not cut the set down again.
+    fn corner_ndc(cam: &geometry::Camera, bbox: &BBox, w: u32, h: u32) -> Vec<[f64; 2]> {
+        let m = view_proj(cam, bbox.corners(), w, h);
+        let mut out = Vec::with_capacity(8);
+        for x in [bbox.min[0], bbox.max[0]] {
+            for y in [bbox.min[1], bbox.max[1]] {
+                for z in [bbox.min[2], bbox.max[2]] {
+                    let c = [x, y, z];
+                    let clip = [
+                        m[0] * c[0] + m[4] * c[1] + m[8] * c[2] + m[12],
+                        m[1] * c[0] + m[5] * c[1] + m[9] * c[2] + m[13],
+                        m[2] * c[0] + m[6] * c[1] + m[10] * c[2] + m[14],
+                        m[3] * c[0] + m[7] * c[1] + m[11] * c[2] + m[15],
+                    ];
+                    assert!(clip[3] > 0.0, "corner {c:?} is behind the eye");
+                    out.push([clip[0] / clip[3], clip[1] / clip[3]]);
+                }
+            }
+        }
+        out
+    }
+
+    /// The fit holds the whole box inside the frame, with a margin, at every
+    /// aspect the window can take.
+    ///
+    /// The bound is the one a viewer needs, not a tolerance: **all eight corners**
+    /// inside `[-1+margin, 1-margin]` in both axes. A fit that only considered the
+    /// box's extent in one axis would pass at that axis and fail at the others,
+    /// which is the defect the first window showed.
+    #[test]
+    fn the_fit_holds_the_whole_box_inside_the_frame_at_every_aspect() {
+        let bbox = city_bbox();
+        // The fit gives up `FIT_MARGIN` of the *half-angle*, which in NDC is
+        // `1 − tan(fit)/tan(full)` — 8% here, and the corner that binds lands on
+        // it exactly. The bound is `1 − FIT_MARGIN`, loosened by a hair for float
+        // noise: a *smaller* margin is a *looser* bound (0.080001 would tighten
+        // it, and the binding corner would fail by one part in 1e10).
+        let margin = crate::scene::FIT_MARGIN - 1e-6;
+        for (w, h, name) in [
+            (1920u32, 1080u32, "16:9"),
+            (2520, 1080, "21:9"),
+            (1600, 1200, "4:3"),
+            (1200, 1200, "1:1"),
+        ] {
+            let aspect = f64::from(w) / f64::from(h);
+            let cam = fit_camera(&bbox, aspect);
+            let ndc = corner_ndc(&cam, &bbox, w, h);
+            let (mut lo_x, mut hi_x, mut lo_y, mut hi_y) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+            for [x, y] in &ndc {
+                lo_x = lo_x.min(*x);
+                hi_x = hi_x.max(*x);
+                lo_y = lo_y.min(*y);
+                hi_y = hi_y.max(*y);
+                assert!(
+                    x.abs() <= 1.0 - margin && y.abs() <= 1.0 - margin,
+                    "{name}: corner at NDC ({x:.4}, {y:.4}) is outside ±{:.4}",
+                    1.0 - margin
+                );
+            }
+            // ...and it is not needlessly far either: some corner sits on the
+            // margin, which is what "the larger of the two constraints" means in
+            // practice. For a three-quarter view the box's centre projects off
+            // the origin (here at NDC y ≈ −0.22), so only one axis can reach the
+            // margin while the other is wider than the frame needs — asserting
+            // tightness on *both* axes would demand a fit the geometry cannot
+            // take.
+            let reach = ndc
+                .iter()
+                .map(|[x, y]| x.abs().max(y.abs()))
+                .fold(0.0f64, f64::max);
+            // `1e-3` of NDC is a thousandth of a half-frame — far below one pixel
+            // at any real window size, and far above the float noise a matrix
+            // round trip leaves (measured at the 1e-16 level).
+            assert!(
+                reach >= 1.0 - margin - 1e-3,
+                "{name}: no corner reaches the margin (best {reach:.12}), so the fit is timid"
+            );
+            assert_eq!(
+                cam.look_at,
+                bbox.center(),
+                "{name}: the eye still looks at the box centre"
+            );
+        }
+    }
+
+    /// The eye stays on the documented three-quarter line, whatever the aspect:
+    /// the fit slides *along* the view direction rather than turning the camera.
+    #[test]
+    fn the_fit_only_changes_the_distance_not_the_direction() {
+        let bbox = city_bbox();
+        let dir = norm([0.85, -0.85, 0.62]);
+        let mut distances = Vec::new();
+        for aspect in [16.0 / 9.0, 21.0 / 9.0, 4.0 / 3.0, 1.0] {
+            let cam = fit_camera(&bbox, aspect);
+            let off = [
+                cam.position[0] - cam.look_at[0],
+                cam.position[1] - cam.look_at[1],
+                cam.position[2] - cam.look_at[2],
+            ];
+            let r = dot(off, off).sqrt();
+            let unit = [off[0] / r, off[1] / r, off[2] / r];
+            for k in 0..3 {
+                assert!(
+                    (unit[k] - dir[k]).abs() < 1e-12,
+                    "aspect {aspect}: direction {unit:?} is not {dir:?}"
+                );
+            }
+            distances.push(r);
+        }
+        // A narrow pillar window needs the eye further back than a wide one. A
+        // square frame is the extreme case here (1752.6 vs 1287.0), because the
+        // box's diagonal is tall on screen and the horizontal constraint starts
+        // to bind; 4:3 needs more than 21:9 for the same reason.
+        //
+        // Note 16:9 and 21:9 come out *equal* (1287.0): at both, the vertical
+        // constraint binds and the extra width is simply unused. That is the
+        // "larger of the two" rule showing itself — a fit that mixed the two
+        // would have made 21:9 pull the eye closer for nothing.
+        assert!(
+            distances[3] > distances[0],
+            "1:1 needs more distance than 16:9: {distances:?}"
+        );
+        assert!(
+            distances[2] > distances[1],
+            "4:3 needs more than 21:9: {distances:?}"
+        );
+        assert!(
+            (distances[0] - distances[1]).abs() < 1e-9,
+            "16:9 and 21:9 are both vertically bound, so the same distance: {distances:?}"
+        );
+    }
+
+    /// A degenerate box still leaves the eye outside its geometry rather than at
+    /// its centre.
+    #[test]
+    fn a_point_box_puts_the_eye_one_unit_out() {
+        let bbox = BBox {
+            min: [5.0, 5.0, 5.0],
+            max: [5.0, 5.0, 5.0],
+        };
+        let cam = fit_camera(&bbox, 16.0 / 9.0);
+        let off = [
+            cam.position[0] - 5.0,
+            cam.position[1] - 5.0,
+            cam.position[2] - 5.0,
+        ];
+        let r = dot(off, off).sqrt();
+        assert!(r >= 1.0 - 1e-9, "the eye is {r} from a point box");
+    }
+
+    fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
 }

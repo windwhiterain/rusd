@@ -39,20 +39,23 @@ impl MadeScene {
     /// Turn one `stage_snapshot`'s bytes into geometry: decode base64, compose a
     /// one-layer stack in memory, extract, fit the camera.
     ///
+    /// `aspect` is the window's `width / height`: the fit needs it to hold the
+    /// whole box in a frame of that shape ([`scene::fit_camera`]).
+    ///
     /// The layer is registered under the snapshot's own tag, so an error names
     /// the version the caller would have to ask the server about.
-    pub fn from_snapshot(snap: &Snapshot) -> Result<Self, Vec<Diagnostic>> {
+    pub fn from_snapshot(snap: &Snapshot, aspect: f64) -> Result<Self, Vec<Diagnostic>> {
         let bytes = snap.decode()?;
         let tag = format!("snapshot-v{}.{}", snap.version, snap.format);
-        Self::from_layer_bytes(bytes, &tag, snap.version)
+        Self::from_layer_bytes(bytes, &tag, snap.version, aspect)
     }
 
     /// The same for a `.usdc` read from disk — the `--usdc` fallback path, so a
     /// client with no server still has a scene to look at.
-    pub fn from_usdc_file(path: &str) -> Result<Self, Vec<Diagnostic>> {
+    pub fn from_usdc_file(path: &str, aspect: f64) -> Result<Self, Vec<Diagnostic>> {
         let bytes =
             std::fs::read(path).map_err(|e| vec![crate::diag("E_READ", format!("{path}: {e}"))])?;
-        Self::from_layer_bytes(bytes, path, 0)
+        Self::from_layer_bytes(bytes, path, 0, aspect)
     }
 
     /// Decode layer bytes as one anonymous layer, compose, extract, fit.
@@ -60,6 +63,7 @@ impl MadeScene {
         bytes: Vec<u8>,
         tag: &str,
         version: u64,
+        aspect: f64,
     ) -> Result<Self, Vec<Diagnostic>> {
         let layer = openusd::sdf::Layer::from_bytes(tag, bytes.clone())
             .map_err(|e| vec![crate::diag("E_LAYER_DECODE", format!("{tag}: {e}"))])?;
@@ -67,7 +71,7 @@ impl MadeScene {
         mem.insert(layer.identifier(), bytes);
         let stack = Stack::open(mem, layer.identifier(), None, Vec::new())?;
         let mut diags = stack.diags.clone();
-        let geometry = scene::extract_fitted(&stack.stage);
+        let geometry = scene::extract_fitted(&stack.stage, aspect);
         diags.extend(geometry.diags.iter().cloned());
         let bounds = geometry.bounds;
         Ok(Self {
@@ -165,6 +169,13 @@ pub struct ClientModel {
     /// Why the last `state_changed` said the server re-composed, for the status
     /// bar (`open` / `patch` / `opinion` / `undo` / `redo` / `reload`).
     pub last_reason: Option<String>,
+    /// The window's `width / height` at which a snapshot's camera is fitted.
+    ///
+    /// A snapshot is composed once and used for as long as the scene stands, so
+    /// the fit needs the aspect at that moment; a later resize does **not** refit
+    /// (the user's orbit wins — `docs/REMOTE.md`'s "相机归 client"), but a new
+    /// snapshot fits to whatever the window is then.
+    pub aspect: f64,
     /// Each prim's world bbox center in the last scene, so a gizmo drag can start
     /// from where the prim actually is. Sorted (`BTreeMap`), so nothing depends
     /// on a hash order.
@@ -201,7 +212,16 @@ impl ClientModel {
             item_count: 0,
             bbox: None,
             last_reason: None,
+            aspect: 16.0 / 9.0,
             centers: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Set the aspect a following snapshot will be fitted at. The view calls this
+    /// from the window's real size before the snapshot arrives.
+    pub fn set_aspect(&mut self, aspect: f64) {
+        if aspect.is_finite() && aspect > 0.0 {
+            self.aspect = aspect;
         }
     }
 
@@ -216,7 +236,7 @@ impl ClientModel {
                 self.state.accepted += 1;
                 self.version = Some(snap.version);
                 self.last_reason = None;
-                match MadeScene::from_snapshot(snap) {
+                match MadeScene::from_snapshot(snap, self.aspect) {
                     Ok(made) => {
                         self.adopt(&made);
                         Effect::NewScene(Box::new(made))
@@ -399,10 +419,13 @@ mod tests {
 
     #[test]
     fn a_snapshot_becomes_a_fitted_scene_with_the_cooked_box() {
-        let made = MadeScene::from_snapshot(&match snapshot(4, &cooked_city()) {
-            Notification::Snapshot(s) => s,
-            _ => unreachable!(),
-        })
+        let made = MadeScene::from_snapshot(
+            &match snapshot(4, &cooked_city()) {
+                Notification::Snapshot(s) => s,
+                _ => unreachable!(),
+            },
+            16.0 / 9.0,
+        )
         .expect("the snapshot composes");
         assert_eq!(made.version, 4);
         assert_eq!(made.item_count(), 434, "city's 434 renderable prims");
@@ -604,8 +627,9 @@ mod tests {
             Notification::Snapshot(s) => s,
             _ => unreachable!(),
         };
-        let a = MadeScene::from_snapshot(&snap).expect("snapshot path");
-        let b = MadeScene::from_layer_bytes(bytes, "fallback.usdc", 0).expect("file path");
+        let a = MadeScene::from_snapshot(&snap, 16.0 / 9.0).expect("snapshot path");
+        let b =
+            MadeScene::from_layer_bytes(bytes, "fallback.usdc", 0, 16.0 / 9.0).expect("file path");
         assert_eq!(a.item_count(), b.item_count());
         assert_eq!(a.bounds, b.bounds);
     }
@@ -616,7 +640,7 @@ mod tests {
             Notification::Snapshot(s) => s,
             _ => unreachable!(),
         };
-        let made = MadeScene::from_snapshot(&snap).expect("composes");
+        let made = MadeScene::from_snapshot(&snap, 16.0 / 9.0).expect("composes");
         assert_eq!(made.path_of(0), None);
         assert_eq!(
             made.path_of(1),

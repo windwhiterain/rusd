@@ -160,19 +160,18 @@ fn snapshot_render_is_deterministic() {
 fn the_fitted_camera_follows_the_documented_fit() {
     let path = city_usdc();
     let bytes = std::fs::read(&path).unwrap();
-    let snap = scene::snapshot_usdc_bytes(bytes, path.to_str().unwrap(), 480, 270, None).unwrap();
+    // 480×270 is 16:9; the fit is told the frame's aspect (see `scene::fit_camera`).
+    let (w, h) = (480u32, 270u32);
+    let aspect = f64::from(w) / f64::from(h);
+    let snap = scene::snapshot_usdc_bytes(bytes, path.to_str().unwrap(), w, h, None).unwrap();
     let bbox = BBox {
         min: snap.geometry.bounds.0,
         max: snap.geometry.bounds.1,
     };
     let cam = snap.geometry.camera.expect("fitted camera");
-    // The eye is at center + (0.85d, -0.85d, 0.62d) for d the larger plan extent.
-    let d = bbox.size()[0].max(bbox.size()[1]);
     let c = bbox.center();
-    assert!((cam.position[0] - (c[0] + 0.85 * d)).abs() < 1e-6);
-    assert!((cam.position[1] - (c[1] - 0.85 * d)).abs() < 1e-6);
-    assert!((cam.position[2] - (c[2] + 0.62 * d)).abs() < 1e-6);
-    assert_eq!(cam.look_at, c);
+    assert_eq!(cam.look_at, c, "the eye looks at the box centre");
+
     // 35 mm through a 20.25 mm aperture, i.e. 2*atan(20.25 / (2*35)).
     let want_fov = (2.0f64 * (20.25f64 / (2.0 * 35.0)).atan()).to_degrees();
     assert!((cam.fov_deg - want_fov).abs() < 1e-9);
@@ -182,14 +181,33 @@ fn the_fitted_camera_follows_the_documented_fit() {
         cam.fov_deg
     );
 
-    // The fit centers the scene but does NOT contain the whole bbox: the
-    // prescribed eye (0.85d, -0.85d, 0.62d) with a 35 mm / 36×20.25 lens crops the
-    // round 655-unit ground plane at all four image borders. Measured, and
-    // asserted here so a change in the fit is visible rather than silent:
-    //   projected x ∈ [-7.3, 487.1], y ∈ [49.2, 361.2] on a 480×270 image
-    // i.e. ~7 px off the left and right edges, ~91 px off the bottom. Reporting
-    // this as a deviation, not tuning the constant to make the image look nicer.
-    let (w, h) = (480u32, 270u32);
+    // The eye keeps the documented three-quarter *direction* — (0.85, −0.85,
+    // 0.62), normalised — and only its distance is solved for.
+    let dir = {
+        let v = [0.85f64, -0.85, 0.62];
+        let l = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+        [v[0] / l, v[1] / l, v[2] / l]
+    };
+    let off = [
+        cam.position[0] - c[0],
+        cam.position[1] - c[1],
+        cam.position[2] - c[2],
+    ];
+    let r = (off[0] * off[0] + off[1] * off[1] + off[2] * off[2]).sqrt();
+    for k in 0..3 {
+        assert!(
+            (off[k] / r - dir[k]).abs() < 1e-9,
+            "eye direction component {k}: {} vs {}",
+            off[k] / r,
+            dir[k]
+        );
+    }
+
+    // The fit contains the whole box: every corner inside the frame, with a
+    // margin. This is the property the displacement-only fit lacked — it put the
+    // eye at 0.85d and cropped the round ground plane at every border (recorded
+    // then as x ∈ [−7.3, 487.1], y ∈ [49.2, 361.2] on a 480×270 image, i.e. ~7 px
+    // off the sides and ~91 px off the bottom). The same measurement now:
     let m = view_proj(cam, bbox, w, h);
     let mut lo = [f64::MAX; 2];
     let mut hi = [f64::MIN; 2];
@@ -206,6 +224,11 @@ fn the_fitted_camera_follows_the_documented_fit() {
         };
         assert!(clip[3] > 0.0, "corner {corner:?} is behind the eye");
         let ndc = [clip[0] / clip[3], clip[1] / clip[3]];
+        // Inside the frame, with a margin — in NDC, so it holds at any image size.
+        assert!(
+            ndc[0].abs() <= 0.98 && ndc[1].abs() <= 0.98,
+            "corner {corner:?} at NDC {ndc:?} is outside the frame's margin"
+        );
         let x = (ndc[0] * 0.5 + 0.5) * f64::from(w);
         let y = (1.0 - (ndc[1] * 0.5 + 0.5)) * f64::from(h);
         lo[0] = lo[0].min(x);
@@ -213,17 +236,17 @@ fn the_fitted_camera_follows_the_documented_fit() {
         hi[0] = hi[0].max(x);
         hi[1] = hi[1].max(y);
     }
-    for (got, want) in [
-        (lo[0], -7.31),
-        (hi[0], 487.10),
-        (lo[1], 49.23),
-        (hi[1], 361.24),
-    ] {
-        assert!(
-            (got - want).abs() < 0.5,
-            "projected extent {lo:?}..{hi:?} does not match the recorded fit"
-        );
-    }
+    // The old fit's recorded extents are the anti-case: the new one must be
+    // inside the frame on every side, not past it.
+    assert!(
+        lo[0] >= 0.0 && hi[0] <= f64::from(w),
+        "x extent {lo:?}..{hi:?}"
+    );
+    assert!(
+        lo[1] >= 0.0 && hi[1] <= f64::from(h),
+        "y extent {lo:?}..{hi:?}"
+    );
+
     // The scene center still clips dead center.
     let cc = c;
     let mut out = [0.0; 4];
@@ -236,6 +259,7 @@ fn the_fitted_camera_follows_the_documented_fit() {
         (x - 240.0).abs() < 1.0 && (y - 135.0).abs() < 1.0,
         "center at ({x},{y})"
     );
+    let _ = aspect;
 }
 
 fn corners(b: &BBox) -> Vec<[f64; 3]> {
@@ -621,8 +645,8 @@ fn a_session_override_changes_the_rendered_pixels() {
     mem.insert("/cooked/city.usdc", cooked.clone());
     let without = Stack::open(mem, "/cooked/city.usdc", None, Vec::new()).unwrap();
 
-    let ga = scene::extract_fitted(&with.stage);
-    let gb = scene::extract_fitted(&without.stage);
+    let ga = scene::extract_fitted(&with.stage, 16.0 / 9.0);
+    let gb = scene::extract_fitted(&without.stage, 16.0 / 9.0);
     let ra = scene::render_offscreen(&ga, 480, 270).unwrap();
     let rb = scene::render_offscreen(&gb, 480, 270).unwrap();
     assert_eq!(ra.beauty.len(), rb.beauty.len());
