@@ -175,4 +175,44 @@ client 见到的版本序列没有空洞——除非它错过了某条通知（�
 loopback 集成测试：open city → subscribe → patch ⇒ client 收 version+1 快照且本地
 合成 bbox 随之变化；opinion translate ⇒ 快照反映覆盖；undo ⇒ 恢复；改写文档文件 ⇒
 收 `reload` 快照且 client 侧合成几何随之变化。egui 壳人工 smoke 在用户机经隧道跑
-（父会话执行）。
+（父会话执行）。## v1.1 增补（D13：合成图进 viewer + 视觉引用 capture；2026-11-17 父会话定契约）
+
+### 合成图与 prim 检视
+
+- client 用**本地 composed stage** 建 prim 树（含非几何 prim：Xform / Scope / Camera /
+  Prototypes / class prim），点击节点 = 选中 + 检视面板（composed 属性、世界变换、bbox）。
+  树不依赖 server 推送：快照到达即重建。
+- **点选 prim 自动把 prim path 拷贝到剪切板**（egui ctx.copy_text），并 toast 提示
+  「已拷贝 <path>」；prim path 即对话中引用该 prim 的 id。
+- `prim_info{path}` → `{path, type, specifier, active, instanceable, children:[path],
+  attrs:[{name, value, authored_by:[layer identifier]}], arcs:[{kind, target}],
+  world_transform:[16], bbox:{min,max}|null}`。
+  来源 = **server 权威 stack**（Tier B-lite 查询）：flatten 快照丢 arcs/instanceable，
+  provenance 必须问 server。`authored_by` 按 opinion 强度序。crate 若无公开 opinion-source
+  API，`authored_by` 回 `[]` 并在响应加 `provenance:"unavailable"` 注记，不许自创。
+- server 未实现该方法时 client 降级：只显示 composed 值（method not found = -32601）。
+
+### 视觉引用 capture
+
+- `capture{camera:{position,look_at,up,fov_deg}, image:<base64 png>,
+  mask:<base64 png>|null, scene_version, note?}` → `{id}`。
+  mask 与 image **同尺寸**，白 = 选区、黑 = 其余；矩形选区为 MVP。尺寸不一致 = -32602。
+- **capture 成功后 id 自动拷贝到剪切板** + toast「已拷贝 <id>」；用户随后在与 agent
+  的对话中直接粘贴引用该 id。
+- server 存 `<cwd>/target/captures/<id>.png / <id>.mask.png / <id>.meta.json`
+  （gitignored）；bind 时扫目录重建索引；id = `cap-<seq:04d>` 单调递增（重启续号）。
+- `capture_get{id}` → `{id, camera, image, mask, scene_version, created_at, note}`；
+  未知 id = -32602（message 写明）。`capture_list{}` → `[{id, created_at,
+  scene_version, note, has_mask}]`。
+- agent 经 TCP 或 stdio 同协议取回，**在对话中以 id 引用**；相机位姿 = client 截图瞬间
+  orbit 相机（世界绝对），agent 可以同位姿 server 重渲或据 mask 定位 region。
+- capture 不推进 scene version（不是场景 mutation）；不广播通知。
+
+### 验收
+
+- server：capture 往返 / mask 尺寸校验 / 未知 id / list / 重启索引重建；prim_info 对
+  overrides session layer 覆盖过的 prim 须列出该 session layer。
+- client（后续轮）：树面板点击选中 + 检视 + **path 自动拷贝**；区域拖选 → mask →
+  capture → **id 自动拷贝** + toast；离线（--usdc）时 capture 仍可用但
+  scene_version=0、prim_info 降级。剪切板拷贝须有 headless 可测的纯函数出口
+  （copy payload 计算与 egui 调用分离）。
