@@ -55,8 +55,87 @@ data}]}`：命名 identifier 逐层推送；client 自定义 `ar::Resolver` +
 `builder().resolver().session_layer().open()` 镜像，layer 变更 = 重建 stage。
 细粒度增量（`Diff`/`apply_diff` + 自定义 codec）再后置。v1 不实现。
 
+## v1 实现语义补记（2026-11-17，实现阶段确立；父会话裁定，与上文同效力）
+
+上文是形状契约；这一节补记 v1 实现把形状之外必须定下来的语义钉死的地方。写代码的
+一方与写 client 的一方都以本节为准；本节与上文冲突时以本节为先，并回头改上文。
+
+### 启动与监听
+
+- `rusd serve` **无 `--listen`** ⇒ stdio（M5 行为不变）。
+- `rusd serve --listen`（裸 flag，无地址）⇒ 绑上文默认 `127.0.0.1:8765`。
+- `rusd serve --listen <addr:port>` ⇒ 绑该地址；`0` 端口可用于 ephemeral（测试）。
+  端口被占时报错退出（exit 2），不静默换端口。
+
+### subscribe 补推当前快照
+
+`subscribe{client}` 成功后，server **除** `{version}` 响应外，**立即向该连接补推一条
+`stage_snapshot`**（若已有 stage）。理由：协议没有"拉取当前快照"的方法，而快照只在
+mutation 时推；否则"先 open、后 subscribe"的 client 永远拿不到当前状态。
+
+- 补推发生在 `subscribe` 的**响应之后**，形状与普通 `stage_snapshot` 相同，client 的
+  version 丢弃规则原样适用（不会与后续广播重复生效）。
+- 尚无 stage（未 `open`）时不补推，只有 `{version}`。
+
+### 消息顺序
+
+一次 mutation 引起的消息，与触发它的请求的相对顺序固定为：
+
+```
+响应（request 的 result/error） → stage_snapshot → diagnostics（有则） → state_changed
+```
+
+即"先答请求，再报后果"。理由：客户端按请求 id 等待结果时不会先消费掉一串大快照；
+把因果关系摆在响应之后也让"这个快照是谁引起的"一目了然。
+
+### 合成失败的 mutation
+
+mutation（open/patch/opinion/undo/redo/reload）若解析/校验/展平失败，**只广播
+`diagnostics`，不推进 `version`、不发 `state_changed`、不发 `stage_snapshot`**。
+
+理由：没有可快照的 stage，发一个 `state_changed{version:n}` 会让所有 client 卡在
+"等 version n 的快照"而永不到达。client 因此**只能**用 `state_changed` 判断版本推进。
+
+### 版本与 client 侧丢弃
+
+`version` 仍是单调递增 u64。注意一个由此产生的细节：失败 mutation 不占版本号，所以
+client 见到的版本序列没有空洞——除非它错过了某条通知（断线、unsubscribe），此时
+整体跳过若干版本是正常的，client 不做连续性断言、只做"丢弃 ≤ 已见最大值"。
+
+### hello
+
+- `session` = `rusd-serve/<pid>`（进程身份，非用户会话名；多 session 由 server 实例区分）。
+- `version` = 当前权威版本。
+- **协议不匹配**（`protocol` 不是 1）⇒ JSON-RPC 错误 `-32602 invalid params`，message
+  写明"this server speaks protocol 1, not N"。`protocol` 缺失同样是 `-32602`。
+
+### 热重载（`reason:"reload"`）
+
+- server 在 `open{path}` 成功后，对该**文件路径**加 `notify` 文件监视（非递归，只盯
+  该文件，不盯目录）；`open{content}` 无文件可盯，不加监视。
+- 事件 **debounce ~200ms**（一次保存在磁盘上通常是多次事件：截断、写入、改名、touch），
+  静默期过后 server 重读文件；内容与当前文档**逐字相同则不发**任何消息。
+- 内容不同 ⇒ 记为一次文档 mutation（push 文档快照到 undo 栈、清 redo），重建 stage、
+  重放 overrides、cook，按"消息顺序"节广播 `stage_snapshot` +
+  `state_changed{reason:"reload"}`。
+- `open` 换到另一个路径 ⇒ 旧监视撤销、新监视建立。文件在保存中途短暂不可读不计错误，
+  等下一次事件。
+- 该监视**不**违反 REMOTE §9 G4：那条说的是 openusd crate **无 stage reload / 无外部变更
+  探测**（client 镜像侧的限制），不是禁止 server 侧文件 watch——重载由 server 重读文档 +
+  重建 stage 完成，crate 缺口不参与。
+
+### 编辑面与重放
+
+- `opinion` 就地编辑 overrides session layer 后**只 re-cook**（D6 memo 命中），不重建 stage。
+- `open`/`patch`/`undo`/`redo`/`reload` 改变文档 ⇒ **重建 stage** 并把已记录的 overrides
+  重放进新 stage 的 session layer（REMOTE §5/G3：crate 无 reload/rebind，session 仅 builder 期）。
+- `undo`/`redo` 覆盖**两个**编辑面（文档快照 / overrides 列表），单一撤销栈按发生顺序。
+- opinions 是"当前生效集合"（每个 `(prim, field)` 一条）：重复 `set` 覆盖、`remove` 删除；
+  重放该集合即重建 session layer。
+
 ## 验收（M4' spike③ / 实现期）
 
 loopback 集成测试：open city → subscribe → patch ⇒ client 收 version+1 快照且本地
-合成 bbox 随之变化；opinion translate ⇒ 快照反映覆盖；undo ⇒ 恢复。egui 壳人工
-smoke 在用户机经隧道跑（父会话执行）。
+合成 bbox 随之变化；opinion translate ⇒ 快照反映覆盖；undo ⇒ 恢复；改写文档文件 ⇒
+收 `reload` 快照且 client 侧合成几何随之变化。egui 壳人工 smoke 在用户机经隧道跑
+（父会话执行）。

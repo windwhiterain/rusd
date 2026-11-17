@@ -1,0 +1,1283 @@
+//! # TCP NDJSON JSON-RPC transport (D12 v1, Tier A snapshot mirror)
+//!
+//! `docs/PROTOCOL.md` is the contract this module implements: one JSON-RPC 2.0
+//! object per line over TCP, agent tool names reused, plus `hello` /
+//! `subscribe` / `unsubscribe` / `opinion` and the server → client
+//! notifications `stage_snapshot` / `state_changed` / `diagnostics`.
+//!
+//! ## The authority stack, and what a mutation does
+//!
+//! The server owns one [`Agent`] (the `.rusd` document, D11) and one live
+//! `openusd` stage: the document lowered with an overrides **session layer**
+//! (`rusd_scene::lower_with_session`), generator nodes cooked into it, and the
+//! remembered opinions replayed into that session layer. After every mutation
+//! the stack is (re)built, cooked, flattened (Tier A: the snapshot bakes assets
+//! and drops arcs, so it is self-sufficient and anonymous-safe) and serialized
+//! as `usdc` through `LayerRegistry::find_by_id("usdc").write_bytes`; every
+//! subscriber gets the snapshot plus a `state_changed`, one monotonic `version`
+//! at a time.
+//!
+//! Which mutations rebuild, and which edit in place:
+//!
+//! - `open` / `patch` / `undo` / `redo` / a hot **reload**: the document
+//!   changed, so the root layer must be re-authored — rebuild the stage, replay
+//!   the opinions, re-cook.
+//! - `opinion`: the session layer is edited in place (`Stage::layer_mut`), which
+//!   is what a gizmo drag sends tens of times a second; the stage survives, so
+//!   the cook engine's memo still hits for every node whose inputs did not move.
+//!
+//! Hot reload watches the opened *file* (`notify`, no recursion) — a document
+//! handed in as `content` has none — and re-reads it once the save has gone
+//! quiet (`RELOAD_DEBOUNCE`). A rewrite that leaves the bytes unchanged publishes
+//! nothing. REMOTE §9 G4's missing reload is an `openusd` crate gap on the client
+//! mirror side; the server needs no crate reload because it rebuilds the stage
+//! from the document.
+//!
+//! `Stage` is `Rc`-based and therefore `!Send`, so the whole session — document,
+//! stage, cook memo, versions, subscriber list, the live watch — lives on one
+//! dedicated sync thread and every connection talks to it through a channel
+//! (REMOTE §7's hard boundary, applied to the server). The watch callback runs on
+//! `notify`'s thread and only wakes this loop; the debounce is a deadline on the
+//! loop's timed receive, so a pending reload never starves a request.
+//!
+//! ## Semantics beyond the protocol's shape
+//!
+//! Everything below is recorded in `docs/PROTOCOL.md`'s 「v1 实现语义补记」, which
+//! the parent decision made part of the contract — none of it is a deviation:
+//!
+//! - **`subscribe` also pushes the current snapshot** to that connection when a
+//!   stage exists, right after its `{version}` response: the protocol defines no
+//!   snapshot fetch, so a late subscriber would otherwise never see the scene.
+//! - **`hello.session`** is `rusd-serve/<pid>`; a protocol mismatch is refused
+//!   with `-32602 invalid params`.
+//! - **A mutation that cannot compose** (parse/validation errors, a failed
+//!   flatten) broadcasts `diagnostics` and does not advance `version`: a
+//!   `state_changed` naming a version no snapshot will carry would strand every
+//!   client.
+//! - **Order after one request**: its response, then `stage_snapshot`, then
+//!   `diagnostics` when there are any, then `state_changed`.
+//! - **`rusd serve --listen`** takes `DEFAULT_LISTEN` for a bare flag; no flag
+//!   leaves the server on stdio.
+
+use std::collections::BTreeMap;
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use notify::Watcher as _;
+use openusd::gf;
+use openusd::sdf::{self, AttributeSpec, Variability};
+use openusd::usd::Stage;
+use rusd_core::{Diagnostic, Severity};
+use rusd_proc::{CookEngine, ExpandOutput};
+use serde_json::{Value, json};
+
+use crate::Agent;
+
+/// The wire protocol version this server speaks (`hello`).
+pub const PROTOCOL_VERSION: u64 = 1;
+
+/// The bind address `rusd serve --listen` uses when the flag carries no value
+/// (PROTOCOL §传输).
+pub const DEFAULT_LISTEN: &str = "127.0.0.1:8765";
+
+/// How long after the last file event the document is re-read. A save is not
+/// one write event — a truncate, the write, a rename, a metadata touch — so the
+/// quiet period after the last event is what marks the save complete.
+const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// JSON-RPC codes used here (PROTOCOL §传输).
+const INVALID_REQUEST: i64 = -32600;
+const METHOD_NOT_FOUND: i64 = -32601;
+const INVALID_PARAMS: i64 = -32602;
+const PARSE_ERROR: i64 = -32700;
+const SERVER_ERROR: i64 = -32000;
+
+/// Agent tool names this transport forwards to [`Agent::call`] unchanged
+/// (PROTOCOL §方法). The mutating ones are intercepted before this list.
+const AGENT_METHODS: &[&str] = &[
+    "open", "query", "validate", "expand", "render", "pick", "patch", "diff", "undo", "redo",
+    "export", "state",
+];
+
+// --- server ---------------------------------------------------------------
+
+/// A listening `rusd serve --listen` server: an accept thread, one reader and
+/// one writer thread per connection, and the sync thread that owns the session.
+pub struct Server {
+    addr: SocketAddr,
+    /// Held for the server's life: while one sender is alive the sync thread's
+    /// receiver never closes, so the session outlives every connection.
+    _keepalive: mpsc::Sender<Msg>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Server {
+    /// Bind `addr` and start serving. `port 0` binds an ephemeral port, which
+    /// [`local_addr`](Self::local_addr) then reports.
+    pub fn bind(addr: impl ToSocketAddrs) -> io::Result<Server> {
+        let listener = TcpListener::bind(addr)?;
+        let addr = listener.local_addr()?;
+        listener.set_nonblocking(true)?;
+
+        let (tx, rx) = mpsc::channel::<Msg>();
+        let name = format!("rusd-serve/{}", std::process::id());
+        let sync_tx = tx.clone();
+        thread::Builder::new()
+            .name("rusd-sync".to_owned())
+            .spawn(move || {
+                let mut session = Session::new(name, sync_tx);
+                loop {
+                    // A pending file-watch debounce turns the blocking receive
+                    // into a timed one: the loop wakes on the deadline when no
+                    // message arrives first, so a reload never blocks a
+                    // request and a request never delays a reload forever.
+                    let msg = match session.next_deadline() {
+                        Some(deadline) => {
+                            let wait = deadline.saturating_duration_since(Instant::now());
+                            match rx.recv_timeout(wait) {
+                                Ok(msg) => Some(msg),
+                                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        None => match rx.recv() {
+                            Ok(msg) => Some(msg),
+                            Err(_) => break,
+                        },
+                    };
+                    match msg {
+                        Some(msg) => session.handle(msg),
+                        None => session.on_deadline(),
+                    }
+                }
+            })?;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let accept_stop = Arc::clone(&stop);
+        let accept_tx = tx.clone();
+        thread::Builder::new()
+            .name("rusd-accept".to_owned())
+            .spawn(move || {
+                let mut conn = 0u64;
+                while !accept_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            // The listener is non-blocking only so that accept can
+                            // notice `stop`; each connection is a blocking stream.
+                            let _ = stream.set_nonblocking(false);
+                            conn += 1;
+                            let tx = accept_tx.clone();
+                            let id = conn;
+                            let _ = thread::Builder::new()
+                                .name(format!("rusd-conn-{id}"))
+                                .spawn(move || serve_conn(stream, id, tx));
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(2));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })?;
+        Ok(Server {
+            addr,
+            _keepalive: tx,
+            stop,
+        })
+    }
+
+    /// The address actually bound (resolved for an ephemeral port).
+    pub fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// Stop accepting connections. Connections already open end when their
+    /// clients close them; the sync thread ends when the last of them does.
+    pub fn shutdown(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+/// Serve forever on `addr` (`rusd serve --listen`).
+pub fn serve_tcp(addr: &str) -> Result<(), String> {
+    let server = Server::bind(addr).map_err(|e| format!("cannot listen on {addr}: {e}"))?;
+    eprintln!(
+        "rusd serve: listening on {} (protocol {PROTOCOL_VERSION}, NDJSON JSON-RPC)",
+        server.local_addr()
+    );
+    loop {
+        thread::park();
+    }
+}
+
+/// What a `--listen` flag means given the word after it: a value that is not
+/// another flag is the address, and a bare flag (no word, or a flag following)
+/// means [`DEFAULT_LISTEN`].
+pub fn listen_target(next: Option<&str>) -> &str {
+    match next {
+        Some(value) if !value.starts_with('-') => value,
+        _ => DEFAULT_LISTEN,
+    }
+}
+
+// --- one connection -------------------------------------------------------
+
+/// A message from a connection thread to the sync thread.
+enum Msg {
+    /// One parsed NDJSON request; `out` is this connection's writer channel, so
+    /// the response, and any notification it is subscribed to, land in order.
+    Request {
+        conn: u64,
+        req: Value,
+        out: mpsc::Sender<String>,
+    },
+    /// The connection closed: forget its subscription.
+    Gone { conn: u64 },
+    /// The watched document file changed on disk: (re)arm the debounce.
+    FileChanged,
+}
+
+/// Read NDJSON requests from `stream` until it closes, handing each to the sync
+/// thread; a writer thread drains the responses and notifications back out.
+fn serve_conn(stream: TcpStream, conn: u64, tx: mpsc::Sender<Msg>) {
+    let Ok(mut out_stream) = stream.try_clone() else {
+        return;
+    };
+    let (wtx, wrx) = mpsc::channel::<String>();
+    let writer = thread::Builder::new()
+        .name(format!("rusd-write-{conn}"))
+        .spawn(move || {
+            for line in wrx {
+                if writeln!(out_stream, "{line}")
+                    .and_then(|()| out_stream.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+    for line in BufReader::new(stream).lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let req = match serde_json::from_str::<Value>(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = wtx.send(to_line(&err_reply(
+                    Value::Null,
+                    PARSE_ERROR,
+                    format!("parse error: {e}"),
+                )));
+                continue;
+            }
+        };
+        if tx
+            .send(Msg::Request {
+                conn,
+                req,
+                out: wtx.clone(),
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+    let _ = tx.send(Msg::Gone { conn });
+    drop(wtx);
+    if let Ok(handle) = writer {
+        let _ = handle.join();
+    }
+}
+
+// --- the session (one sync thread) ----------------------------------------
+
+/// A remembered override opinion: PROTOCOL's `{path, field, value, op}`.
+#[derive(Clone, Debug, PartialEq)]
+struct Opinion {
+    path: String,
+    field: String,
+    value: OpinionValue,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum OpinionValue {
+    Set(Value),
+    Remove,
+}
+
+impl Opinion {
+    /// Whether `other` addresses the same opinion slot (prim + field).
+    fn same_slot(&self, other: &Opinion) -> bool {
+        self.path == other.path && self.field == other.field
+    }
+}
+
+/// One undoable face of the authority stack (REMOTE §3): the document source,
+/// or the list of override opinions.
+enum Face {
+    Doc(String),
+    Overrides(Vec<Opinion>),
+}
+
+/// What a pipeline pass produced: cook/validate diagnostics and whether the
+/// stage composed at all.
+struct Pipeline {
+    diags: Vec<Diagnostic>,
+    ok: bool,
+}
+
+impl Pipeline {
+    fn failed(diags: Vec<Diagnostic>) -> Self {
+        Pipeline { diags, ok: false }
+    }
+}
+
+struct Session {
+    agent: Agent,
+    session_name: String,
+    version: u64,
+    stage: Option<Stage>,
+    session_id: Option<String>,
+    cook: CookEngine,
+    ops: Vec<Opinion>,
+    undo: Vec<Face>,
+    redo: Vec<Face>,
+    /// Subscribed connections, by connection id.
+    subs: BTreeMap<u64, mpsc::Sender<String>>,
+    /// Notification lines produced by the request being handled, held until
+    /// that request's response is written: a client that sends `open` reads the
+    /// response to `open` first, then the snapshot it caused.
+    pending: Vec<String>,
+    /// A channel back into this same sync loop, which the file-watch callback
+    /// uses to wake it (that callback runs on `notify`'s own thread).
+    wake: mpsc::Sender<Msg>,
+    /// The document path being watched for hot reload, and the watcher that
+    /// holds the registration. One watcher is kept and re-pointed when `open`
+    /// names a different file, because dropping it would end the watch.
+    watch: Option<Watch>,
+    /// When the debounce of the last file event expires; `None` when no file
+    /// event is pending.
+    reload_due: Option<Instant>,
+}
+
+/// The hot-reload watch on one document path (PROTOCOL `reason:"reload"`).
+struct Watch {
+    /// The path `open` named — the file, not its directory, so an unrelated
+    /// write beside it never wakes the session.
+    path: PathBuf,
+    /// Held, never read: dropping it ends the watch.
+    _watcher: notify::RecommendedWatcher,
+}
+
+impl Session {
+    fn new(session_name: String, wake: mpsc::Sender<Msg>) -> Self {
+        Session {
+            agent: Agent::new(),
+            session_name,
+            version: 0,
+            stage: None,
+            session_id: None,
+            cook: rusd_proc::default_registry(),
+            ops: Vec::new(),
+            undo: Vec::new(),
+            redo: Vec::new(),
+            subs: BTreeMap::new(),
+            pending: Vec::new(),
+            wake,
+            watch: None,
+            reload_due: None,
+        }
+    }
+
+    fn handle(&mut self, msg: Msg) {
+        match msg {
+            Msg::Request { conn, req, out } => self.request(conn, &req, &out),
+            Msg::Gone { conn } => {
+                self.subs.remove(&conn);
+            }
+            Msg::FileChanged => self.reload_due = Some(Instant::now() + RELOAD_DEBOUNCE),
+        }
+    }
+
+    /// The instant the sync loop must wake at, if a file event is debouncing.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.reload_due
+    }
+
+    /// The debounce expired with no newer event: re-read the watched document
+    /// and publish it as a `reload`.
+    fn on_deadline(&mut self) {
+        if self.reload_due.take().is_none() {
+            return;
+        }
+        let Some(path) = self.watch.as_ref().map(|w| w.path.clone()) else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            // A save caught mid-write is not an error worth publishing: the
+            // next event brings the finished file.
+            return;
+        };
+        if self.agent.doc_text() == Some(text.as_str()) {
+            return;
+        }
+        if let Some(before) = self.agent.doc_text().map(str::to_owned) {
+            self.undo.push(Face::Doc(before));
+        }
+        self.redo.clear();
+        self.agent.replace_doc(text);
+        let pipeline = self.rebuild();
+        let _ = self.after_mutation("reload", &pipeline);
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            self.broadcast(&pending);
+        }
+    }
+
+    /// Point the hot-reload watch at `path`, replacing any earlier one.
+    fn watch_doc(&mut self, path: &str) {
+        if self.watch.as_ref().map(|w| w.path.as_path()) == Some(Path::new(path)) {
+            return;
+        }
+        self.watch = None;
+        self.reload_due = None;
+        let wake = self.wake.clone();
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            // Any delivery is a hint to re-read; the re-read itself decides
+            // whether the content changed.
+            if event.is_ok() {
+                let _ = wake.send(Msg::FileChanged);
+            }
+        });
+        let Ok(mut watcher) = watcher else {
+            eprintln!("rusd serve: cannot watch {path} for hot reload: the OS watcher failed");
+            return;
+        };
+        if let Err(e) = watcher.watch(Path::new(path), notify::RecursiveMode::NonRecursive) {
+            eprintln!("rusd serve: cannot watch {path} for hot reload: {e}");
+            return;
+        }
+        self.watch = Some(Watch {
+            path: PathBuf::from(path),
+            _watcher: watcher,
+        });
+    }
+
+    /// Dispatch one request and write its JSON-RPC response to `out`.
+    fn request(&mut self, conn: u64, req: &Value, out: &mpsc::Sender<String>) {
+        let id = req.get("id").cloned().unwrap_or(Value::Null);
+        let Some(method) = req.get("method").and_then(Value::as_str) else {
+            send(
+                out,
+                &err_reply(id, INVALID_REQUEST, "a request needs a `method`".into()),
+            );
+            return;
+        };
+        let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+        if !params.is_object() {
+            send(
+                out,
+                &err_reply(id, INVALID_PARAMS, "`params` must be an object".into()),
+            );
+            return;
+        }
+        // A `subscribe` also pushes the current snapshot, which must reach the
+        // client *after* the response it is answering.
+        let mut after: Option<String> = None;
+        let result = match method {
+            "hello" => self.hello(&params),
+            "subscribe" => {
+                let subscribed = self.subscribe(conn, &params, out);
+                if subscribed.is_ok() {
+                    after = self.snapshot_line(self.version).ok();
+                }
+                subscribed
+            }
+            "unsubscribe" => self.unsubscribe(conn, &params),
+            "opinion" => self.opinion(&params),
+            "open" => self.open(&params),
+            "patch" => self.patch(&params),
+            "undo" => self.undo(),
+            "redo" => self.redo(),
+            other if AGENT_METHODS.contains(&other) => {
+                self.agent.call(other, &params).map_err(server_error)
+            }
+            other => Err((METHOD_NOT_FOUND, format!("unknown method: {other}"))),
+        };
+        match result {
+            Ok(result) => send(out, &ok_reply(id, result)),
+            Err((code, message)) => send(out, &err_reply(id, code, message)),
+        }
+        // Effect, then consequence: everything this request caused reaches the
+        // clients after the answer to the request itself.
+        let pending = std::mem::take(&mut self.pending);
+        if !pending.is_empty() {
+            self.broadcast(&pending);
+        }
+        if let Some(line) = after {
+            let _ = out.send(line);
+        }
+    }
+
+    // --- viewer methods ---------------------------------------------------
+
+    fn hello(&self, p: &Value) -> Result<Value, (i64, String)> {
+        match p.get("protocol").and_then(Value::as_u64) {
+            Some(PROTOCOL_VERSION) => {}
+            Some(other) => {
+                return Err((
+                    INVALID_PARAMS,
+                    format!("this server speaks protocol {PROTOCOL_VERSION}, not {other}"),
+                ));
+            }
+            None => return Err((INVALID_PARAMS, "hello: `protocol` (number) required".into())),
+        }
+        Ok(json!({
+            "protocol": PROTOCOL_VERSION,
+            "session": self.session_name,
+            "version": self.version,
+        }))
+    }
+
+    fn subscribe(
+        &mut self,
+        conn: u64,
+        p: &Value,
+        out: &mpsc::Sender<String>,
+    ) -> Result<Value, (i64, String)> {
+        if p.get("client").and_then(Value::as_str).is_none() {
+            return Err((
+                INVALID_PARAMS,
+                "subscribe: `client` (string) required".into(),
+            ));
+        }
+        self.subs.insert(conn, out.clone());
+        Ok(json!({ "version": self.version }))
+    }
+
+    fn unsubscribe(&mut self, conn: u64, p: &Value) -> Result<Value, (i64, String)> {
+        if p.get("client").and_then(Value::as_str).is_none() {
+            return Err((
+                INVALID_PARAMS,
+                "unsubscribe: `client` (string) required".into(),
+            ));
+        }
+        self.subs.remove(&conn);
+        Ok(json!({ "ok": true }))
+    }
+
+    /// Author override opinions into the overrides session layer (REMOTE §3's
+    /// third edit face), then re-cook the live stage and publish.
+    fn opinion(&mut self, p: &Value) -> Result<Value, (i64, String)> {
+        let ops = parse_opinions(p)?;
+        if ops.is_empty() {
+            return Ok(json!({ "version": self.version }));
+        }
+        let (Some(stage), Some(session_id)) = (self.stage.clone(), self.session_id.clone()) else {
+            return Err(server_error("no scene open; call open first".into()));
+        };
+        let previous = self.ops.clone();
+        for op in &ops {
+            if let Err(diags) = apply_opinion(&stage, &session_id, op) {
+                // The session layer is now half-edited: rebuild it from the
+                // opinions that were recorded as good.
+                self.rebuild();
+                return Err(server_error(diags_message(&diags)));
+            }
+            upsert(&mut self.ops, op.clone());
+        }
+        self.undo.push(Face::Overrides(previous));
+        self.redo.clear();
+        let pipeline = self.recook();
+        self.after_mutation("opinion", &pipeline)?;
+        Ok(json!({ "version": self.version }))
+    }
+
+    // --- agent tools, with the mutation pipeline hung off them -------------
+
+    fn open(&mut self, p: &Value) -> Result<Value, (i64, String)> {
+        let result = self.agent.call("open", p).map_err(server_error)?;
+        self.ops.clear();
+        self.undo.clear();
+        self.redo.clear();
+        // Hot reload follows a document opened by path; a document handed in as
+        // `content` has no file to watch.
+        match p.get("path").and_then(Value::as_str) {
+            Some(path) => self.watch_doc(path),
+            None => {
+                self.watch = None;
+                self.reload_due = None;
+            }
+        }
+        let pipeline = self.rebuild();
+        self.after_mutation("open", &pipeline)?;
+        Ok(result)
+    }
+
+    fn patch(&mut self, p: &Value) -> Result<Value, (i64, String)> {
+        if p.get("ops").and_then(Value::as_array).is_none() {
+            return Err((INVALID_PARAMS, "patch: `ops` array required".into()));
+        }
+        let before = self.agent.doc_text().map(str::to_owned);
+        let result = self.agent.call("patch", p).map_err(server_error)?;
+        if let Some(text) = before {
+            self.undo.push(Face::Doc(text));
+        }
+        self.redo.clear();
+        let pipeline = self.rebuild();
+        self.after_mutation("patch", &pipeline)?;
+        Ok(result)
+    }
+
+    fn undo(&mut self) -> Result<Value, (i64, String)> {
+        let Some(face) = self.undo.pop() else {
+            return Err(server_error("nothing to undo".into()));
+        };
+        match face {
+            Face::Doc(text) => {
+                if let Some(current) = self.agent.doc_text().map(str::to_owned) {
+                    self.redo.push(Face::Doc(current));
+                }
+                self.agent.replace_doc(text);
+            }
+            Face::Overrides(ops) => {
+                let current = std::mem::replace(&mut self.ops, ops);
+                self.redo.push(Face::Overrides(current));
+            }
+        }
+        let pipeline = self.rebuild();
+        self.after_mutation("undo", &pipeline)?;
+        Ok(json!({ "ok": true, "undo_depth": self.undo.len() }))
+    }
+
+    fn redo(&mut self) -> Result<Value, (i64, String)> {
+        let Some(face) = self.redo.pop() else {
+            return Err(server_error("nothing to redo".into()));
+        };
+        match face {
+            Face::Doc(text) => {
+                if let Some(current) = self.agent.doc_text().map(str::to_owned) {
+                    self.undo.push(Face::Doc(current));
+                }
+                self.agent.replace_doc(text);
+            }
+            Face::Overrides(ops) => {
+                let current = std::mem::replace(&mut self.ops, ops);
+                self.undo.push(Face::Overrides(current));
+            }
+        }
+        let pipeline = self.rebuild();
+        self.after_mutation("redo", &pipeline)?;
+        Ok(json!({ "ok": true, "redo_depth": self.redo.len() }))
+    }
+
+    // --- the pipeline -----------------------------------------------------
+
+    /// Rebuild the authority stack from the document: lower with a session
+    /// layer, replay the opinions, cook, and hand the stage to the agent so its
+    /// own tools see the same scene the viewers do.
+    fn rebuild(&mut self) -> Pipeline {
+        self.agent.set_live(None);
+        self.stage = None;
+        self.session_id = None;
+        // A different root layer means the memoized cook layers are not in this
+        // stage: a memo hit would skip the insert and leave a hole, so the
+        // content-hash cache starts over with the stage.
+        self.cook = rusd_proc::default_registry();
+
+        let Some(text) = self.agent.doc_text().map(str::to_owned) else {
+            return Pipeline {
+                diags: Vec::new(),
+                ok: false,
+            };
+        };
+        let doc = match rusd_core::syntax::parse(&text) {
+            Ok(doc) => doc,
+            Err(diags) => return Pipeline::failed(diags),
+        };
+        let validate = rusd_scene::validate(&doc);
+        if validate.iter().any(|d| d.severity == Severity::Error) {
+            return Pipeline::failed(validate);
+        }
+        let stage = match rusd_scene::lower_with_session(&doc) {
+            Ok(stage) => stage,
+            Err(diags) => return Pipeline::failed(diags),
+        };
+        let session_id = stage.session_layer().map(|l| l.identifier().to_owned());
+        if let Some(session_id) = session_id.as_deref() {
+            for op in &self.ops {
+                if let Err(diags) = apply_opinion(&stage, session_id, op) {
+                    return Pipeline::failed(diags);
+                }
+            }
+        }
+        let root_id = stage.root_layer().identifier().to_owned();
+        let nodes = rusd_proc::nodes_from_doc(&doc);
+        let result = self.cook.cook(&stage, &root_id, &nodes);
+        let stats = result.stats;
+        let diags = result.diags;
+        let prim_count = rusd_scene::prim_count(&stage);
+        self.live(stage.clone(), stats, &diags, prim_count, nodes.len());
+        self.stage = Some(stage);
+        self.session_id = session_id;
+        Pipeline { diags, ok: true }
+    }
+
+    /// Re-cook over the live stage after an in-place session-layer edit: nodes
+    /// whose inputs did not move are memo hits (D6).
+    fn recook(&mut self) -> Pipeline {
+        let (Some(stage), Some(text)) =
+            (self.stage.clone(), self.agent.doc_text().map(str::to_owned))
+        else {
+            return Pipeline {
+                diags: Vec::new(),
+                ok: false,
+            };
+        };
+        let doc = match rusd_core::syntax::parse(&text) {
+            Ok(doc) => doc,
+            Err(diags) => return Pipeline::failed(diags),
+        };
+        let root_id = stage.root_layer().identifier().to_owned();
+        let nodes = rusd_proc::nodes_from_doc(&doc);
+        let result = self.cook.cook(&stage, &root_id, &nodes);
+        let stats = result.stats;
+        let diags = result.diags;
+        let prim_count = rusd_scene::prim_count(&stage);
+        self.live(stage, stats, &diags, prim_count, nodes.len());
+        Pipeline { diags, ok: true }
+    }
+
+    fn live(
+        &mut self,
+        stage: Stage,
+        stats: rusd_proc::CookStats,
+        diags: &[Diagnostic],
+        prim_count: usize,
+        node_count: usize,
+    ) {
+        self.agent.set_live(Some(ExpandOutput {
+            stage,
+            stats,
+            diags: diags.to_vec(),
+            prim_count,
+            node_count,
+        }));
+    }
+
+    /// Publish the new authority state: bump the version, flatten to `usdc`,
+    /// and broadcast to every subscriber.
+    fn after_mutation(&mut self, reason: &str, pipeline: &Pipeline) -> Result<(), (i64, String)> {
+        if !pipeline.ok {
+            self.pending.push(diagnostics_line(&pipeline.diags));
+            return Ok(());
+        }
+        let version = self.version + 1;
+        let snapshot = self.snapshot_line(version).map_err(server_error)?;
+        self.version = version;
+        self.pending.push(snapshot);
+        if !pipeline.diags.is_empty() {
+            self.pending.push(diagnostics_line(&pipeline.diags));
+        }
+        self.pending.push(to_line(&json!({
+            "method": "state_changed",
+            "params": { "version": version, "reason": reason },
+        })));
+        Ok(())
+    }
+
+    /// The Tier A snapshot: the whole stage flattened into one `usdc` layer,
+    /// base64 on the wire.
+    fn snapshot_line(&self, version: u64) -> Result<String, String> {
+        let Some(stage) = self.stage.as_ref() else {
+            return Err("no scene open; nothing to snapshot".into());
+        };
+        let flat = stage
+            .flatten()
+            .map_err(|e| format!("flatten failed: {e}"))?;
+        let format = sdf::LayerRegistry::find_by_id("usdc")
+            .ok_or("the usdc file format is not registered")?;
+        let written = format
+            .write_bytes(flat.data())
+            .map_err(|e| format!("usdc write failed: {e}"))?;
+        Ok(to_line(&json!({
+            "method": "stage_snapshot",
+            "params": {
+                "version": version,
+                "format": "usdc",
+                "data": base64_encode(&written.bytes),
+            },
+        })))
+    }
+
+    fn broadcast(&mut self, lines: &[String]) {
+        self.subs
+            .retain(|_, out| lines.iter().all(|line| out.send(line.clone()).is_ok()));
+    }
+}
+
+// --- opinions -------------------------------------------------------------
+
+/// Parse `opinion{ops:[{path, field, value, op}]}` (PROTOCOL §viewer 专用).
+fn parse_opinions(p: &Value) -> Result<Vec<Opinion>, (i64, String)> {
+    let ops = p
+        .get("ops")
+        .and_then(Value::as_array)
+        .ok_or((INVALID_PARAMS, "opinion: `ops` array required".to_owned()))?;
+    let mut out = Vec::with_capacity(ops.len());
+    for (i, op) in ops.iter().enumerate() {
+        let path = op.get("path").and_then(Value::as_str).ok_or((
+            INVALID_PARAMS,
+            format!("opinion: ops[{i}].path (string) required"),
+        ))?;
+        let field = op.get("field").and_then(Value::as_str).ok_or((
+            INVALID_PARAMS,
+            format!("opinion: ops[{i}].field (string) required"),
+        ))?;
+        let kind = op.get("op").and_then(Value::as_str).ok_or((
+            INVALID_PARAMS,
+            format!("opinion: ops[{i}].op (\"set\"|\"remove\") required"),
+        ))?;
+        let value = match kind {
+            "set" => OpinionValue::Set(op.get("value").cloned().ok_or((
+                INVALID_PARAMS,
+                format!("opinion: ops[{i}] is a `set` and needs a `value`"),
+            ))?),
+            "remove" => OpinionValue::Remove,
+            other => {
+                return Err((
+                    INVALID_PARAMS,
+                    format!("opinion: ops[{i}].op is \"{other}\"; expected \"set\" or \"remove\""),
+                ));
+            }
+        };
+        out.push(Opinion {
+            path: path.to_owned(),
+            field: field.to_owned(),
+            value,
+        });
+    }
+    Ok(out)
+}
+
+/// Remember `op` as the current opinion on its slot: a later `set` replaces the
+/// earlier one and a `remove` drops it, so the override list stays one entry per
+/// prim+field and replaying it reproduces the session layer.
+fn upsert(ops: &mut Vec<Opinion>, op: Opinion) {
+    match op.value {
+        OpinionValue::Remove => ops.retain(|o| !o.same_slot(&op)),
+        OpinionValue::Set(_) => match ops.iter_mut().find(|o| o.same_slot(&op)) {
+            Some(slot) => *slot = op,
+            None => ops.push(op),
+        },
+    }
+}
+
+/// Author one opinion into the overrides session layer. The session layer is the
+/// strongest opinion in the stack, so it overrides both the document and the
+/// cooked layers beneath it.
+fn apply_opinion(stage: &Stage, session_id: &str, op: &Opinion) -> Result<(), Vec<Diagnostic>> {
+    let prim = sdf::path(&op.path)
+        .map_err(|e| vec![Diagnostic::error("E_OPINION", format!("{}: {e}", op.path))])?;
+    let attr_path = format!("{}.{}", op.path, op.field);
+    let path = sdf::path(&attr_path)
+        .map_err(|e| vec![Diagnostic::error("E_OPINION", format!("{attr_path}: {e}"))])?;
+    // Read the composed declaration before borrowing the session layer: the
+    // session layer's RefMut is held for the whole edit below.
+    let (value, type_name) = match &op.value {
+        OpinionValue::Remove => (None, None),
+        OpinionValue::Set(v) => {
+            let ty = attribute_type(stage, &prim, &op.field).unwrap_or_else(|| infer_type(v));
+            let value = json_to_sdf(v, &ty)?;
+            (Some(value), Some(ty))
+        }
+    };
+    let mut session = stage.layer_mut(session_id).ok_or_else(|| {
+        vec![Diagnostic::error(
+            "E_SESSION",
+            "the stage has no overrides session layer",
+        )]
+    })?;
+    session
+        .edit(|l| -> Result<(), sdf::AuthoringError> {
+            let d = l.data_mut();
+            match value {
+                None => {
+                    d.erase_field(&path, "default");
+                    Ok(())
+                }
+                Some(value) => {
+                    if d.has_spec(&path) {
+                        d.set_field(&path, "default", value);
+                        Ok(())
+                    } else {
+                        let mut attr = AttributeSpec::new(
+                            d,
+                            path.as_str(),
+                            type_name.as_deref().unwrap_or("double"),
+                            Variability::Uniform,
+                            false,
+                        )?;
+                        attr.set_default(value)?;
+                        Ok(())
+                    }
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| vec![Diagnostic::error("E_OPINION", e.to_string())])
+}
+
+/// The composed attribute's declared type, if the stack already has one.
+fn attribute_type(stage: &Stage, prim: &sdf::Path, field: &str) -> Option<String> {
+    let prim = stage.prim(prim.clone()).ok()?;
+    prim.attribute(field)
+        .type_name()
+        .ok()
+        .flatten()
+        .map(|t| t.as_str().to_owned())
+}
+
+/// The type to declare for an attribute no layer has yet.
+fn infer_type(v: &Value) -> String {
+    match v {
+        Value::Bool(_) => "bool",
+        Value::Number(n) if n.is_f64() => "double",
+        Value::Number(_) => "int",
+        Value::String(_) => "string",
+        Value::Array(items) => {
+            if triple(v).is_some() {
+                "vector3f"
+            } else if items.iter().all(Value::is_string) {
+                "string[]"
+            } else {
+                "double[]"
+            }
+        }
+        _ => "double",
+    }
+    .to_owned()
+}
+
+/// Convert an opinion's JSON value to the USD value its declared type needs.
+fn json_to_sdf(v: &Value, ty: &str) -> Result<sdf::Value, Vec<Diagnostic>> {
+    let bad = |m: String| vec![Diagnostic::error("E_OPINION", m)];
+    match ty {
+        "point3f" | "vector3f" | "float3" | "normal3f" | "color3f" | "texCoord3f" => {
+            let a = triple(v).ok_or_else(|| bad(format!("{ty} needs three numbers")))?;
+            Ok(sdf::Value::Vec3f(gf::vec3f(a[0], a[1], a[2])))
+        }
+        "double" => Ok(sdf::Value::Double(
+            v.as_f64()
+                .ok_or_else(|| bad(format!("{ty} needs a number")))?,
+        )),
+        "float" => Ok(sdf::Value::Float(
+            v.as_f64()
+                .ok_or_else(|| bad(format!("{ty} needs a number")))? as f32,
+        )),
+        "int" => Ok(sdf::Value::Int(
+            v.as_i64()
+                .ok_or_else(|| bad(format!("{ty} needs an integer")))? as i32,
+        )),
+        "int64" => Ok(sdf::Value::Int64(
+            v.as_i64()
+                .ok_or_else(|| bad(format!("{ty} needs an integer")))?,
+        )),
+        "uint" => Ok(sdf::Value::Uint(
+            v.as_u64()
+                .ok_or_else(|| bad(format!("{ty} needs an integer")))? as u32,
+        )),
+        "uint64" => Ok(sdf::Value::Uint64(
+            v.as_u64()
+                .ok_or_else(|| bad(format!("{ty} needs an integer")))?,
+        )),
+        "bool" => Ok(sdf::Value::Bool(
+            v.as_bool()
+                .ok_or_else(|| bad(format!("{ty} needs a boolean")))?,
+        )),
+        "string" => Ok(sdf::Value::String(
+            v.as_str()
+                .ok_or_else(|| bad(format!("{ty} needs a string")))?
+                .to_owned(),
+        )),
+        "token" => Ok(sdf::Value::Token(
+            v.as_str()
+                .ok_or_else(|| bad(format!("{ty} needs a string")))?
+                .into(),
+        )),
+        "asset" => Ok(sdf::Value::AssetPath(
+            v.as_str()
+                .ok_or_else(|| bad(format!("{ty} needs a string")))?
+                .into(),
+        )),
+        "double[]" | "float[]" | "int[]" | "int64[]" | "string[]" | "token[]" => {
+            let items = v
+                .as_array()
+                .ok_or_else(|| bad(format!("{ty} needs an array")))?;
+            array_to_sdf(items, ty)
+        }
+        other => Err(bad(format!(
+            "an opinion cannot author a `{other}` attribute (supported: point3f, vector3f, \
+             float3, normal3f, color3f, double, float, int, int64, uint, uint64, bool, string, \
+             token, asset, and their arrays)"
+        ))),
+    }
+}
+
+fn array_to_sdf(items: &[Value], ty: &str) -> Result<sdf::Value, Vec<Diagnostic>> {
+    let bad = |m: String| vec![Diagnostic::error("E_OPINION", m)];
+    let nums = |f: fn(&Value) -> Option<f64>| -> Result<Vec<f64>, Vec<Diagnostic>> {
+        items
+            .iter()
+            .map(|v| f(v).ok_or_else(|| bad(format!("{ty} needs an array of numbers"))))
+            .collect()
+    };
+    match ty {
+        "double[]" => Ok(sdf::Value::DoubleVec(nums(Value::as_f64)?)),
+        "float[]" => Ok(sdf::Value::FloatVec(
+            nums(Value::as_f64)?.into_iter().map(|n| n as f32).collect(),
+        )),
+        "int[]" => Ok(sdf::Value::IntVec(
+            items
+                .iter()
+                .map(|v| {
+                    v.as_i64()
+                        .map(|n| n as i32)
+                        .ok_or_else(|| bad(format!("{ty} needs an array of integers")))
+                })
+                .collect::<Result<_, _>>()?,
+        )),
+        "int64[]" => Ok(sdf::Value::Int64Vec(
+            items
+                .iter()
+                .map(|v| {
+                    v.as_i64()
+                        .ok_or_else(|| bad(format!("{ty} needs an array of integers")))
+                })
+                .collect::<Result<_, _>>()?,
+        )),
+        "string[]" => Ok(sdf::Value::StringVec(
+            items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| bad(format!("{ty} needs an array of strings")))
+                })
+                .collect::<Result<_, _>>()?,
+        )),
+        "token[]" => Ok(sdf::Value::TokenVec(
+            items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(Into::into)
+                        .ok_or_else(|| bad(format!("{ty} needs an array of strings")))
+                })
+                .collect::<Result<_, Vec<Diagnostic>>>()?,
+        )),
+        other => Err(bad(format!("unhandled array type {other}"))),
+    }
+}
+
+fn triple(v: &Value) -> Option<[f32; 3]> {
+    let a = v.as_array()?;
+    if a.len() != 3 {
+        return None;
+    }
+    Some([
+        a[0].as_f64()? as f32,
+        a[1].as_f64()? as f32,
+        a[2].as_f64()? as f32,
+    ])
+}
+
+// --- JSON-RPC and wire helpers -------------------------------------------
+
+fn ok_reply(id: Value, result: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "result": result })
+}
+
+fn err_reply(id: Value, code: i64, message: String) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+fn server_error(message: String) -> (i64, String) {
+    (SERVER_ERROR, message)
+}
+
+fn diagnostics_line(diags: &[Diagnostic]) -> String {
+    to_line(&json!({
+        "method": "diagnostics",
+        "params": { "items": crate::diags_json(diags) },
+    }))
+}
+
+fn diags_message(diags: &[Diagnostic]) -> String {
+    serde_json::to_string(&crate::diags_json(diags)).unwrap_or_else(|_| "diagnostics".to_owned())
+}
+
+fn to_line(v: &Value) -> String {
+    serde_json::to_string(v).expect("a JSON value always serializes")
+}
+
+fn send(out: &mpsc::Sender<String>, v: &Value) {
+    let _ = out.send(to_line(v));
+}
+
+// --- base64 (the `stage_snapshot` payload) --------------------------------
+
+const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Encode `bytes` as standard base64 with padding, the wire form of a
+/// `stage_snapshot`'s `data`.
+pub fn base64_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b1 = u32::from(chunk[0]);
+        let b2 = u32::from(chunk.get(1).copied().unwrap_or(0));
+        let b3 = u32::from(chunk.get(2).copied().unwrap_or(0));
+        let n = (b1 << 16) | (b2 << 8) | b3;
+        out.push(char::from(B64[(n >> 18) as usize & 63]));
+        out.push(char::from(B64[(n >> 12) as usize & 63]));
+        out.push(if chunk.len() > 1 {
+            char::from(B64[(n >> 6) as usize & 63])
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            char::from(B64[n as usize & 63])
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decode standard base64, tolerating whitespace; `None` if it is not base64.
+pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 3);
+    let mut acc: u32 = 0;
+    let mut bits = 0;
+    let mut pad = 0;
+    for byte in text.bytes() {
+        let value = match byte {
+            b'=' => {
+                pad += 1;
+                continue;
+            }
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => B64.iter().position(|&c| c == byte)? as u32,
+        };
+        if pad > 0 {
+            return None;
+        }
+        acc = (acc << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    if bits >= 6 || pad > 2 {
+        return None;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn base64_roundtrips_every_length() {
+        for len in 0..40usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 37 + 11) as u8).collect();
+            let text = base64_encode(&bytes);
+            assert_eq!(
+                base64_decode(&text).as_deref(),
+                Some(bytes.as_slice()),
+                "len {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn base64_matches_a_known_vector() {
+        assert_eq!(base64_encode(b"rusd"), "cnVzZA==");
+        assert_eq!(base64_encode(b"Man"), "TWFu");
+        assert!(base64_decode("not base64!").is_none());
+    }
+
+    #[test]
+    fn opinion_upsert_keeps_one_entry_per_slot() {
+        let mut ops = Vec::new();
+        let a = Opinion {
+            path: "/W/B".into(),
+            field: "xformOp:translate".into(),
+            value: OpinionValue::Set(json!([1.0, 2.0, 3.0])),
+        };
+        let b = Opinion {
+            path: "/W/B".into(),
+            field: "xformOp:translate".into(),
+            value: OpinionValue::Set(json!([4.0, 5.0, 6.0])),
+        };
+        upsert(&mut ops, a);
+        upsert(&mut ops, b.clone());
+        assert_eq!(ops, vec![b]);
+        upsert(
+            &mut ops,
+            Opinion {
+                path: "/W/B".into(),
+                field: "xformOp:translate".into(),
+                value: OpinionValue::Remove,
+            },
+        );
+        assert!(ops.is_empty());
+    }
+
+    #[test]
+    fn malformed_opinions_are_invalid_params() {
+        let err = parse_opinions(&json!({})).unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS);
+        let err = parse_opinions(&json!({"ops": [{"path": "/W"}]})).unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS);
+        let err = parse_opinions(&json!({"ops": [{"path": "/W", "field": "a", "op": "nudge"}]}))
+            .unwrap_err();
+        assert_eq!(err.0, INVALID_PARAMS);
+        let ops = parse_opinions(&json!({"ops": [{"path": "/W", "field": "a", "op": "remove"}]}))
+            .unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].value, OpinionValue::Remove);
+    }
+
+    #[test]
+    fn json_values_convert_to_the_declared_usd_type() {
+        assert_eq!(
+            json_to_sdf(&json!([1.0, 2.5, -3.0]), "point3f").unwrap(),
+            sdf::Value::Vec3f(gf::vec3f(1.0, 2.5, -3.0))
+        );
+        assert_eq!(
+            json_to_sdf(&json!(2.0), "double").unwrap(),
+            sdf::Value::Double(2.0)
+        );
+        assert!(json_to_sdf(&json!([1.0, 2.0]), "point3f").is_err());
+        assert!(json_to_sdf(&json!({"a": 1}), "double").is_err());
+        assert_eq!(infer_type(&json!([1.0, 2.0, 3.0])), "vector3f");
+        assert_eq!(infer_type(&json!(true)), "bool");
+    }
+}
