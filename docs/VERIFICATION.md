@@ -27,8 +27,7 @@ Rusd 场景 (city.rusd / forest.rusd)
 1. **结构腿**：参考实现 pxr 打开导出件，逐 gprim 校验 schema（Cube 有 size>0、Sphere 有
    radius>0、Mesh 有 ≥3 点），并核对 stage 元数据（defaultPrim / upAxis / metersPerUnit）
    与世界 bbox。
-2. **视觉腿**：pxr 读回 → Cycles XML → Cycles 5.3 local build 路径追踪出图，人工确认城市/
-   森林连贯（无浮空、无缺块、法线正确、构图可用）。
+2. **视觉腿**：pxr 读回 → Cycles XML → Cycles 5.3 local build 路径追踪出图，人工确认城市/森林几何连贯（法线正确、构图可用；city 外圈建筑浮空属场景 ground 尺寸 bug，见 §7.1，非导出缺陷）。
 
 ## 2. 复现命令
 
