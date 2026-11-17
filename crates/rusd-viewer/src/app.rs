@@ -1066,6 +1066,8 @@ impl Shell {
             // ordinary (a flattened cook output has prims no layer spec authored),
             // so it is said plainly rather than treated as a failure.
             if let Some(path) = self.model.selection.clone() {
+                // v1.3: picking a prim in the viewport copies its path, same as a tree click.
+                self.copy_toast(path.clone());
                 self.inspect_picked(&path);
             } else {
                 // Clicking the background clears the selection; the detail panel
