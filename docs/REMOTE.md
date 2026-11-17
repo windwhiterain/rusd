@@ -59,6 +59,11 @@ client: Layer::from_bytes → 单层栈 → extract → 本地 wgpu 渲染
   外部 asset，因此**匿名安全**：它不引用别处的路径，落盘/入库都不担心 dangling。
 - 代价：client 不再有 prim 级的合成语义（mute、variant、arc 全靠 server 决定），
   也不能对未展平的结构做局部编辑。**这正是 Tier A 的定位：渲染镜像。**
+- **出图水平镜像（验收时注意）**：`scripts/verify/usd_to_cycles.py` 的 XML 桥出图相对
+  `rusd-render` 是**水平镜像**的——Cycles XML 相机沿本地 **+Z**（USD 是 −Z）、屏幕坐标随之
+  呈左手，同 eye/target 下同一棵树会出现在画面左右相反侧。这只影响**出图观感**，
+  **不影响几何校验**（点数/bbox/prim 数照旧可比）。详见 `docs/VERIFICATION.md` §4 的
+  XML 相机约定。
 
 ## 5. Tier B — 协同合成镜像（命名 layer stack 逐层推送）
 
@@ -68,6 +73,9 @@ client: Layer::from_bytes → 单层栈 → extract → 本地 wgpu 渲染
   **usda 文本**或 **usdc 字节**（字节经 `LayerRegistry::find_by_id("usdc").write_bytes`）。
 - client 侧：**自定义 `ar::Resolver`**（把 identifier 映射到已在内存里的字节）
   \+ `Stage::builder().resolver(...).session_layer(...).open()`，逐 opinion 镜像 server 的栈。
+- **usda 的 `over` 不能写绝对路径**（openusd 0.8 解析器行为）：`over "/World/City"` 这类
+  绝对路径不成立，必须**阶梯嵌套**——`over "World" { over "City" { … } }`。做 Tier B 的
+  session layer 镜像时按同样形状生成，否则整条 override 静默丢失。
 - **layer 变更 ⇒ 重建 stage**。这不是偷懒，而是 crate 的限制：openusd 0.8 的
   `Stage` **没有 reload / rebind**，`session_layer` **只在 builder 期**能设
   （`Stage::session_layer()` 是只读 getter）。所以要镜像新状态，只能重新 build。
@@ -126,9 +134,30 @@ client: Layer::from_bytes → 单层栈 → extract → 本地 wgpu 渲染
 
 1. **①传输可行性 — 已完成**：city flatten usdc **58KB**；release 全进程
    **export 0.159s / expand 0.107s**。结论：传场景的量级完全可接受。
-2. **②headless 内存合成 + 渲染 parity — 进行中**（`Rusd/viewer-spike`）：
-   两个子命令 `snapshot` / `compose`，比对 Tier A 快照镜像与本地逐层合成的几何/像素
-   是否一致。这是 Tier B 能不能成立的前置证据。
+2. **②headless 内存合成 + 渲染 parity — 已完成**（合并 main `71f5a82` ← `spike/viewer-headless`
+   = `601cb0c`）。`rusd-viewer` 新建 crate（17 测试），全 workspace **123 绿**，fmt/clippy 零警告。
+   两子命令 `snapshot` / `compose`。本机（同机）parity 三项：内存合成栈 ≡ 磁盘栈 **434 项
+   逐 item 1e-9**；session 覆盖 `(15,12,7)` = block `(12,12,0)` + 覆盖 `(3,0,7)`；镜像 ≡
+   直接合成**逐 opinion 全等**。这是 Tier B 成立的前置证据。
+   - **跨机器腿（peer 构建 → scp 用户机 → 本地 GPU 跑）**：peer 构建 release
+     `rusd-viewer.exe`，scp 到用户机 `C:\Users\17124\rusd-client\`，在**用户机本地 GPU**
+     跑 `snapshot`。结果与 peer **逐位相同**：items/prims **434**；bbox min
+     `(-210.26225399971008, -211.44087135791779, -2.0)` / max `(444, 444, 52.065452575683594)`；
+     foreground **121073** 像素两机相同；PNG 均 **41752B**。**逐像素差 125/518400 = 0.024%**，
+     max channel Δ86，**全在几何边缘**——独立 GPU 光栅化精度差，属预期容差（不是逻辑不一致）。
+     ⇒ D12 §8 的命名空间不变量在真实跨机器、真实双 GPU 下站得住。
+   - **产物位置**：peer `target/peer_city.png`；用户机
+     `C:\Users\17124\rusd-client\{server_city.png, peer_city.png, rusd-viewer.exe, city.usdc}`。
+     注意这些是**用户机上**的路径，peer 看不到。
+   - **备注：parity 测试依赖主树产物**。`crates/rusd-viewer/tests/parity.rs` 要读主轨的
+     `target/city.usdc`（**gitignored**），在 worktree 里跑测试时会向上探测 6 层找它；
+     找不到就显式 `panic` 并列出所有探过的路径。在干净的 worktree / 另一台机器上跑，用
+     **`RUSD_MAIN_TREE=<主轨根>`** 环境变量直接指定。这不是新坑，是“成品产物不进仓库”的必然
+     代价；提醒：不要误以为测试红了就是 parity 坏了。
+   - **备注：出图水平镜像**同 §4（Cycles XML 相机 +Z 左手屏幕坐标）；跨机器比对像素时
+     两机走同一条路径，所以不受影响，但**不要**拿 rusd-render 的图跟 XML 桥的图直接叠图比较。
+   - **状态：现在两条子 agent 在实现**：`m4/serve-transport`（server 传输层 + 推送）与
+     `m4/viewer-egui`（egui 壳 + gizmo → opinion），契约 `docs/PROTOCOL.md`（`67b5522`）。
 3. **③egui 壳 + gizmo → opinion 闭环 — ②过后开**：交互拖动产出 override opinion，
    经协议回到 server，再收到新快照。
 

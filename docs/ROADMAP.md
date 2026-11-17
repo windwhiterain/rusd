@@ -80,17 +80,23 @@ peer 构建 scp 分发）。server 不再拥有相机——相机归 client，se
 
 - [x] spike ①：传输可行性 —— city flatten usdc **58KB**；release 全进程 export 0.159s /
       expand 0.107s ⇒ 传场景而非传帧（2026-11-17）
-- [ ] spike ②：headless 内存合成 + 渲染 parity（`Rusd/viewer-spike`，`snapshot` / `compose`
-      两子命令）—— Tier B 成立的前置证据
-- [ ] server 传输层：TCP NDJSON JSON-RPC（复用 rusd-agent 工具名）+ `subscribe` + 通知
+- [x] spike ②：headless 内存合成 + 渲染 parity（`rusd-viewer` crate，`snapshot` / `compose`）——
+      Tier B 成立的前置证据。合并 main `71f5a82`（← `spike/viewer-headless` = `601cb0c`）：
+      17 测试、全 workspace **123 绿**、fmt/clippy 零警告；parity 内存合成≡磁盘栈 **434 项
+      逐 item 1e-9**、session 覆盖 `(15,12,7)` = block `(12,12,0)` + 覆盖 `(3,0,7)`、镜像≡
+      直接合成逐 opinion 全等（2026-11-17）；跨机器（scp 到用户机本地 GPU）：items 434、
+      **bbox min/max 与 peer 逐位相同**、foreground 121073 相同、PNG 均 41752B、逐像素差
+      **125/518400 = 0.024%** 全在边缘（双 GPU 光栅容差）。详见 REMOTE §10。
+- [ ] server 传输层（**`m4/serve-transport`**，契约 `docs/PROTOCOL.md` = `67b5522`）：
+      TCP NDJSON JSON-RPC（复用 rusd-agent 工具名）+ `hello`/`subscribe` + `opinion` + 通知
       `stage_snapshot` / `layers_changed` / `diagnostics` / `state_changed`；默认 loopback
 - [ ] Tier A 推送：change 时推 flattened usdc 快照；client `Layer::from_bytes` 单层栈 →
       extract → 本地 wgpu 渲染（flatten 丢 arcs ⇒ 匿名安全）
 - [ ] Tier B 镜像：命名 identifier layer stack 逐层推送（usda 文本 / usdc 字节）+ client 自定义
       `ar::Resolver` + `Stage::builder().resolver().session_layer().open()`；层变更 = 重建 stage
 - [ ] `rusd-viewer` crate：winit + egui 壳，本地 orbit/zoom/pick/annotate（零网络往返），
-      相机归 client（每次 render 带全 RenderConfig）
-- [ ] spike ③：egui 壳 + gizmo → override opinion 闭环（②过后开）
+      相机归 client（每次 render 带全 RenderConfig）——**`m4/viewer-egui`**
+- [ ] spike ③：egui 壳 + gizmo → override opinion 闭环（②已过，可开；归 `m4/viewer-egui`）
 - [ ] SSH 隧道文档（`ssh -L`）与分发说明（peer 构建 → scp，同 win-x64）
 - [ ] 后置：`Diff`/`apply_diff` 细粒度增量（`sdf::Value`/`Diff` 无 serde，需自定义 codec）；
       `--bind LAN`
