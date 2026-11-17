@@ -258,24 +258,28 @@ impl Shell {
         for e in self.net.drain() {
             match e {
                 NetEvent::Notification(n) => self.on_notification(n),
-                NetEvent::Live { addr } => {
-                    self.status = format!("live {addr}");
-                    self.window.request_redraw();
+                NetEvent::Live { addr: _ } => {
+                    // `hello` + `subscribe` succeeded: the connection is what the
+                    // status bar must now say. Without this the view kept
+                    // claiming "connecting" while snapshots were arriving.
+                    self.model.mark_live();
+                    self.status = self.model.status_line_zh();
+                    self.request_repaint();
                 }
                 NetEvent::Applied { what, version } => {
                     self.status = match version {
                         Some(v) => format!("{what} accepted → server v{v}"),
                         None => format!("{what} accepted"),
                     };
-                    self.window.request_redraw();
+                    self.request_repaint();
                 }
                 NetEvent::Failed(diags) => {
                     self.status = join_diags(&diags);
-                    self.window.request_redraw();
+                    self.request_repaint();
                 }
                 NetEvent::Closed(diags) => {
                     self.status = join_diags(&diags);
-                    self.model.state.subscribed = false;
+                    self.model.mark_closed();
                     // Nothing will arrive: fall back to the file the user named,
                     // if any, and say so rather than show an empty window.
                     if self.model.version.is_none()
@@ -283,7 +287,7 @@ impl Shell {
                     {
                         self.load_offline(&path);
                     }
-                    self.window.request_redraw();
+                    self.request_repaint();
                 }
             }
         }
@@ -293,34 +297,35 @@ impl Shell {
         match self.model.apply(&n) {
             Effect::NewScene(made) => self.adopt_scene(*made),
             Effect::Status => {
-                self.status = self.model.status_line();
-                self.window.request_redraw();
+                self.status = self.model.status_line_zh();
+                self.request_repaint();
             }
             Effect::Nothing => {}
             Effect::Failed(diags) => {
                 self.status = join_diags(&diags);
-                self.window.request_redraw();
+                self.request_repaint();
             }
         }
     }
 
-    /// A new scene: the first one frames the camera, the render thread receives
-    /// the geometry alone (the stage stays here, `!Send`), and a drag's local
-    /// preview is dropped (the server's answer replaces it).
+    /// A new scene: the **first one of a connection** frames the camera to this
+    /// window's aspect (`ClientModel::wants_first_fit`), later ones keep the user's
+    /// orbit; the render thread receives the geometry alone (the stage stays here,
+    /// `!Send`), and a drag's local preview is dropped (the server's answer replaces
+    /// it).
     fn adopt_scene(&mut self, made: MadeScene) {
         self.bounds = made.bounds;
-        if let Some(cam) = made.geometry.camera {
-            match self.orbit.as_mut() {
-                // Keep the user's camera across re-compositions: a patch must not
-                // jerk the view back to the fitted frame.
-                Some(o) => {
-                    o.fov_deg = cam.fov_deg;
-                }
-                None => self.orbit = Some(Orbit::from_camera(&cam)),
-            }
+        // One function decides whether this scene frames the view or keeps the
+        // user's camera (`crate::view::camera_for_scene`), so the window and the
+        // wiring tests cannot disagree about it. The bug this replaces: the
+        // camera was only taken when `orbit` was `None`, and by the first snapshot
+        // it never was.
+        let aspect = self.window_aspect();
+        if let Some(orbit) = crate::view::camera_for_scene(&mut self.model, &made, aspect) {
+            self.orbit = Some(orbit);
         }
         self.model.adopt(&made);
-        self.status = self.model.status_line();
+        self.status = self.model.status_line_zh();
         self.preview = None;
         self.gizmo = None;
         // The stage is kept for the gizmo's anchor reads and never leaves this
@@ -331,7 +336,16 @@ impl Shell {
             geometry: Box::new(made.geometry),
             bounds: made.bounds,
         });
-        self.window.request_redraw();
+        // The scene's own camera is now the fit, so the render thread must draw
+        // with it on this command rather than waiting for a `View` that may never
+        // come (an idle client sends none, which is what starved the first frame).
+        if let Some(orbit) = self.orbit {
+            self.render.send(RenderCommand::View {
+                orbit,
+                selection: self.model.selection.clone(),
+            });
+        }
+        self.request_repaint();
     }
 
     /// The selected prim's drag anchor: its world centre, its authored local
@@ -349,6 +363,9 @@ impl Shell {
     /// No server: show the `.usdc` the user named so the window is not empty.
     fn load_offline(&mut self, path: &str) {
         let aspect = self.window_aspect();
+        // A fallback scene is not a server's: the status bar must say 离线 rather
+        // than 连接中.
+        self.model.offline = true;
         match MadeScene::from_usdc_file(path, aspect) {
             Ok(made) => {
                 let prims = made.item_count();
@@ -411,6 +428,13 @@ impl Shell {
             ui.horizontal(|ui| {
                 ui.strong("rusd-viewer");
                 ui.separator();
+                // The Chinese summary is the primary line: it is what makes the
+                // installed CJK face visibly right (a missing glyph shows as a
+                // box right here), and it is the one a user reads. The detailed
+                // ASCII line follows for diagnostics and for a viewer whose
+                // font did not load.
+                ui.label(self.model.status_line_zh());
+                ui.separator();
                 ui.label(&self.status);
                 ui.separator();
                 ui.label(format!("{:.0} fps", self.fps));
@@ -421,7 +445,7 @@ impl Shell {
                     ui.separator();
                     ui.colored_label(
                         egui::Color32::from_rgb(255, 200, 60),
-                        "⟳ reloaded on server",
+                        "⟳ 热重载 reloaded on server",
                     );
                 }
             });
@@ -745,6 +769,19 @@ impl Shell {
     }
 
     // --- paint ------------------------------------------------------------
+
+    /// Wake the UI and the GPU: a redraw now, and egui's own repaint request.
+    ///
+    /// Both halves are needed. `request_redraw` gets a frame drawn; without egui's
+    /// `request_repaint` an immediate-mode UI only redraws when the event loop
+    /// happens to wake, which is what left the window at a handful of fps between
+    /// events while a snapshot was waiting to be shown. This is called on every
+    /// scene, notification and input-driven change, so a fresh snapshot is shown
+    /// on the next frame and an idle viewer simply sits still.
+    fn request_repaint(&mut self) {
+        self.egui_ctx.request_repaint();
+        self.window.request_redraw();
+    }
 
     fn paint(&mut self) {
         let raw = self.egui_state.take_egui_input(&self.window);
