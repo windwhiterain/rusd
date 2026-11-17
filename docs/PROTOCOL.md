@@ -216,3 +216,45 @@ loopback 集成测试：open city → subscribe → patch ⇒ client 收 version
   capture → **id 自动拷贝** + toast；离线（--usdc）时 capture 仍可用但
   scene_version=0、prim_info 降级。剪切板拷贝须有 headless 可测的纯函数出口
   （copy payload 计算与 egui 调用分离）。
+## v1.2 增补（D13 修正：合成树 ≠ prim 树；2026-11-17 用户裁定，取代 v1.1 合成图节）
+
+**用户裁定：viewer 要的是 USD 合成树（composition tree），不是 composed prim 树。**
+flatten 快照丢 arcs/instanceable/variant 结构 ⇒ 合成树**不能**从 client 本地快照建；
+由 **server 从权威 stack 的 sdf layer specs 构建**（arc/variantSet 皆是 sdf 字段，公开
+API 可读，不依赖 pcp 内部），序列化后供 client 画树。Tier B 本地镜像仍后置。
+
+**v1.1 的「prim 树面板」与 `prim_info` 撤销**，以本节为准；capture 节不变。
+
+### 方法
+
+- `composition_tree{}` → `{layers:[{id, kind, strength}], arcs:[{id, kind,
+  source_layer, source_prim, target_layer, target_prim}], prim_nodes:[{id, path,
+  authored_in:[layer id 按 strength 序]}], variant_sets:[{id, prim, name,
+  variants:[name], selection}]}`。
+  kind ∈ root/session/sublayer/reference/payload/inherit/specialize/variant。
+  layers 含 server resolver 能开到的全部层（含外部 reference 目标层）。
+- `comp_node{id}` → 详情 union：
+  - layer → `{identifier, usda_text, spec_count}`（export_to_string）；
+  - arc → `{kind, source_layer, source_prim, target_layer, target_prim,
+    target_spec_fields:[{name, value}]}`；
+  - prim → `{path, opinions:[{layer, specifier, fields:[{name, value}]}] 按
+    strength 序, arcs_out:[arc id], variant_sets:[id]}`；
+  - variant_set → `{prim, name, variants, selection, per_variant:[{variant,
+    authored_in:[layer id]}]}`。
+  未知 id = -32602。
+
+### client UI（后续轮）
+
+- 树面板根 = layer stack（strength 序，session 最强）；arc 作边/子节点指向目标层；
+  prim 节点挂在作者层下；variant_set/variant 可展开。**点击任何节点** = 选中 +
+  `comp_node` 详情面板（layer 的 usda 文本 / arc 的目标 spec / prim 的逐层 opinions /
+  variant 选择）。
+- 点选 prim 节点仍自动拷贝 prim path 到剪切板 + toast（v1.1 剪切板条款保留）。
+- server 未实现时面板显示「合成树不可用（server 版本）」降级，不崩。
+
+### 验收（server 侧并入 capture-server 轮）
+
+- composition_tree 对含 reference/prototypes 的 city 栈：layers 含 cook/root/session，
+  arcs 含 reference 到 prototypes，prim_nodes 的 authored_in 强度序正确；
+- comp_node 四类详情各一测试；overrides 覆盖过的 prim 的 opinions 首条 = session layer；
+- 未知 id -32602。
