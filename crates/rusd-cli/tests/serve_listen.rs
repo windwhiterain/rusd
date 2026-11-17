@@ -45,19 +45,28 @@ fn hello(addr: &str) -> serde_json::Value {
 #[test]
 fn a_bare_listen_flag_serves_on_the_protocol_default() {
     let (mut child, line) = start(&["--listen"]);
-    // Either the default port is free and the server serves there, or something
-    // else holds it — and the message names it either way, which is the point:
-    // a bare flag chose `127.0.0.1:8765`, not an ephemeral port.
-    let listening = line.starts_with("rusd serve: listening on ");
+    // A bare flag must *choose* `127.0.0.1:8765` (PROTOCOL's default), not an
+    // ephemeral port — the startup line says which way, free port or not.
     assert!(
         line.contains("127.0.0.1:8765"),
         "a bare --listen must take the protocol default, got: {line}"
     );
-    if listening {
-        let response = hello("127.0.0.1:8765");
-        assert_eq!(response["result"]["protocol"], 1, "{response}");
-        assert_eq!(response["result"]["version"], 0, "{response}");
+    assert!(
+        line.starts_with("rusd serve: listening on ") || line.contains("cannot listen on"),
+        "the startup line names either the bound port or the refusal: {line}"
+    );
+    if line.contains("cannot listen on") {
+        // Another server already holds 8765 (a long-running one, or a parallel
+        // run). Choosing the right address is what this test is for; whether
+        // the port was free is not, so this is a skip — never a kill.
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("skipped: 127.0.0.1:8765 is already in use ({line})");
+        return;
     }
+    let response = hello("127.0.0.1:8765");
+    assert_eq!(response["result"]["protocol"], 1, "{response}");
+    assert_eq!(response["result"]["version"], 0, "{response}");
     let _ = child.kill();
     let _ = child.wait();
 }

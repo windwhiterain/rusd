@@ -456,12 +456,12 @@ impl Session {
         self.watch = None;
         self.reload_due = None;
         let wake = self.wake.clone();
-        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        let watcher = notify::recommended_watcher(move |_event: notify::Result<notify::Event>| {
             // Any delivery is a hint to re-read; the re-read itself decides
-            // whether the content changed.
-            if event.is_ok() {
-                let _ = wake.send(Msg::FileChanged);
-            }
+            // whether the content changed. An error delivery counts: the
+            // Windows backend reports a buffer overflow that way, and dropping
+            // it would make a reload wait for the next save.
+            let _ = wake.send(Msg::FileChanged);
         });
         let Ok(mut watcher) = watcher else {
             eprintln!("rusd serve: cannot watch {path} for hot reload: the OS watcher failed");
