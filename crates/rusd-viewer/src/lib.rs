@@ -62,6 +62,7 @@ pub mod panel;
 pub mod protocol;
 pub mod scene;
 pub mod session;
+pub mod startup;
 pub mod tree;
 pub mod view;
 pub mod viewport;

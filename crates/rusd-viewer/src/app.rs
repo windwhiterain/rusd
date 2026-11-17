@@ -39,6 +39,7 @@ use crate::camera::{Orbit, plane_hit};
 use crate::net::{NetCommand, NetEvent, NetWorker, RenderCommand, RenderWorker};
 use crate::protocol::{self, Notification, OpinionOp};
 use crate::session::{ClientModel, Drag, Effect, MadeScene};
+use crate::startup::{self, Startup};
 use crate::window::startup_window_attrs;
 
 /// How the viewer was started: the words after `view`.
@@ -207,10 +208,15 @@ pub struct Shell {
 
 impl Shell {
     /// Build the GPU stack and the two worker threads on an existing window.
+    ///
+    /// `startup` is the milestone recorder the caller already has: the same one
+    /// that marked `window_created` marks the steps inside here, so a startup that
+    /// stalls says so on the file (`RUSD_VIEWER_STARTUP_LOG`) or in its marks.
     fn new(
         window: Arc<Window>,
         args: &ViewArgs,
         proxy: EventLoopProxy<AppEvent>,
+        startup: &mut Startup,
     ) -> Result<Self, String> {
         let egui_ctx = egui::Context::default();
         // Before the first frame: the status bar's Chinese labels draw as tofu
@@ -233,8 +239,10 @@ impl Shell {
             false,
             egui_wgpu::RendererOptions::default(),
         ));
+        startup.mark(startup::PAINTER_READY);
         pollster::block_on(painter.set_window(egui::ViewportId::ROOT, Some(window.clone())))
             .map_err(|e| format!("GPU surface: {e}"))?;
+        startup.mark(startup::SURFACE_READY);
         let render_state = painter
             .render_state()
             .ok_or_else(|| "no GPU render state after set_window".to_owned())?;
@@ -268,12 +276,21 @@ impl Shell {
                 })
             },
         );
+        startup.mark(startup::RENDER_WORKER);
         let net = NetWorker::spawn(
             args.connect.clone(),
             Box::new(move || {
                 let _ = proxy.send_event(AppEvent::Wake);
             }),
         );
+        // **Startup does not wait for the greeting.** `NetWorker::spawn` returns as
+        // soon as the thread exists; `hello`/`subscribe` and the first snapshot
+        // happen on it. This mark therefore means "the socket is being worked on",
+        // not "the server answered" — which is the whole point: a viewer whose
+        // window waits for a snapshot is a viewer that shows nothing when the
+        // server is quiet.
+        startup.mark(startup::NET_WORKER);
+        startup.mark(startup::SHELL_BUILT);
 
         let scale = window.scale_factor() as f32;
         let window_points = egui::vec2(size.width as f32, size.height as f32) / scale;
@@ -1234,14 +1251,20 @@ pub struct App {
     args: ViewArgs,
     shell: Option<Shell>,
     proxy: EventLoopProxy<AppEvent>,
+    /// The startup milestones: marks the shell made, and the file they go to.
+    startup: Startup,
+    /// Whether the first frame has been marked (`FIRST_PAINT`).
+    painted: bool,
 }
 
 impl App {
-    pub fn new(args: ViewArgs, proxy: EventLoopProxy<AppEvent>) -> Self {
+    pub fn new(args: ViewArgs, proxy: EventLoopProxy<AppEvent>, startup: Startup) -> Self {
         Self {
             args,
             shell: None,
             proxy,
+            startup,
+            painted: false,
         }
     }
 }
@@ -1260,14 +1283,17 @@ impl ApplicationHandler<AppEvent> for App {
             }
         };
         let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
+            Ok(w) => {
+                self.startup.mark(startup::WINDOW_CREATED);
+                Arc::new(w)
+            }
             Err(e) => {
                 eprintln!("{{\"code\":\"E_WINDOW\",\"message\":\"{e}\"}}");
                 event_loop.exit();
                 return;
             }
         };
-        match Shell::new(window, &self.args, self.proxy.clone()) {
+        match Shell::new(window, &self.args, self.proxy.clone(), &mut self.startup) {
             Ok(shell) => {
                 shell.window.request_redraw();
                 self.shell = Some(shell);
@@ -1333,6 +1359,13 @@ impl ApplicationHandler<AppEvent> for App {
                 shell.drain_net();
                 shell.drain_frames();
                 shell.paint();
+                // The first frame is the marker that the window is usable: a banner
+                // that sees `shell_built` but never `first_paint` was built and never
+                // drawn, which is exactly the state the silent startup was stuck in.
+                if !self.painted {
+                    self.painted = true;
+                    self.startup.mark(startup::FIRST_PAINT);
+                }
                 return;
             }
             _ => {}
@@ -1355,6 +1388,7 @@ impl ApplicationHandler<AppEvent> for App {
 /// process while building the event loop (session 0 / non-interactive service
 /// sessions do this), which no `Result` here can intercept.
 pub fn run(args: ViewArgs) -> i32 {
+    let mut startup = Startup::from_env();
     let event_loop = match EventLoop::<AppEvent>::with_user_event().build() {
         Ok(l) => l,
         Err(e) => {
@@ -1362,9 +1396,10 @@ pub fn run(args: ViewArgs) -> i32 {
             return 1;
         }
     };
+    startup.mark(startup::EVENT_LOOP);
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    let mut app = App::new(args, proxy);
+    let mut app = App::new(args, proxy, startup);
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("{{\"code\":\"E_EVENT_LOOP\",\"message\":\"{e}\"}}");
         return 1;

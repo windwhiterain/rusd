@@ -86,6 +86,10 @@ impl TreePanel {
                     self.detail_error = Some(e);
                 }
             },
+            Err((crate::protocol::TIMEOUT_CODE, _)) => {
+                self.detail = None;
+                self.detail_error = Some("合成树：服务器未在时限内应答".to_owned());
+            }
             Err((crate::tree::METHOD_NOT_FOUND, _)) => {
                 self.detail = None;
                 self.detail_error = Some(crate::tree::unavailable_text());

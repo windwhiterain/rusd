@@ -2252,6 +2252,7 @@ dependencies = [
  "openusd",
  "png",
  "pollster",
+ "rusd-agent",
  "rusd-core",
  "rusd-proc",
  "rusd-render",
