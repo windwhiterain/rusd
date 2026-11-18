@@ -508,7 +508,7 @@ session overrides；root 档 = 只有 root 与 overrides、不含任何 op。
 
 ## v1.5.5 增补（用户裁定：合成图每个节点都要能看；2026-11-18）
 
-**详情面板（detail panel）的规则：树里点任何一个节点，详���面板都必须显示这个节点自己的东西；
+**详情面板（detail panel）的规则：树里点任何一个节点，详情面板都必须显示这个节点自己的东西；
 不允许点了没反应。** 分种类落定：
 
 ### 层行（session / root / sublayer / op）
