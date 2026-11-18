@@ -657,6 +657,12 @@ impl Shell {
             TREE_TAG => {
                 self.tree.apply_tree(reply);
                 self.status = self.tree.model.status_zh();
+                // A reason that arrived while this read was in flight was coalesced, not
+                // queued: one more read answers all of them (a gizmo drag sends opinions
+                // at ≤ 30 Hz, and each one is a reason).
+                if self.tree.take_reread() {
+                    crate::view::ask_tree(&self.net, &mut self.tree);
+                }
             }
             NODE_TAG => self.tree.apply_node(reply),
             PREVIEW_TAG => match reply {

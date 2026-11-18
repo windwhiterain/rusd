@@ -302,6 +302,22 @@ fn only_open_refits_the_camera() {
 
 // --- 2. `open`: the tree is asked again, over the wire -----------------------
 
+/// Take `mode`'s answer for a `composition_tree` request, the way the shell does when
+/// `NetEvent::Reply` arrives: the round trip is over, so the next reason may ask again.
+///
+/// A test that skipped this would leave `asking` set, and the *next* reason would be
+/// coalesced rather than sent — which is the behaviour under test in
+/// `an_opinion_burst_asks_once_and_owes_one_more_read`, and noise in every other test.
+fn settle_tree(tree: &mut TreePanel) {
+    tree.apply_tree(Ok(json!({
+        "layers": [],
+        "arcs": [],
+        "prim_nodes": [],
+        "variant_sets": [],
+    })));
+    assert!(!tree.asking, "the round trip is over");
+}
+
 #[test]
 fn an_open_asks_the_composition_tree_again() {
     // The defect, as the wire sees it: a tree asked once per connection. Here the
@@ -317,6 +333,7 @@ fn an_open_asks_the_composition_tree_again() {
     adopt(&mut model, 1, &wide);
     view::ask_tree(&worker, &mut tree);
     mock.next_method("composition_tree");
+    settle_tree(&mut tree);
 
     // The new document, in the contract's order: snapshot first, then the reason.
     adopt(&mut model, 2, &narrow_doc());
@@ -329,6 +346,59 @@ fn an_open_asks_the_composition_tree_again() {
     let plan = view::apply_state_change(&mut model, &mut tree, &worker, 2, "open", 16.0 / 9.0);
     assert!(plan.asked_tree, "an open re-reads the tree");
     mock.next_method("composition_tree");
+}
+
+#[test]
+fn an_opinion_burst_asks_once_and_owes_one_more_read() {
+    // A gizmo drag sends an opinion up to 30 times a second (`docs/PROTOCOL.md`: ≤ 30 Hz),
+    // and each one is a `state_changed{reason:"opinion"}`. Asking the tree per reason
+    // would put 30 structural reads of the authority stack in flight during one drag, so
+    // a reason that arrives while a read is outstanding is **coalesced**: recorded, not
+    // sent. Both halves matter — the tree must follow the server, and it must do so once
+    // per round trip, not once per message.
+    let mock = Mock::start();
+    let worker = NetWorker::spawn(mock.addr.clone(), Box::new(|| {}));
+    assert_eq!(mock.next_method("hello").method, "hello");
+    assert_eq!(mock.next_method("subscribe").method, "subscribe");
+
+    let mut model = ClientModel::new();
+    let mut tree = TreePanel::new();
+    let framed = adopt(&mut model, 1, &wide_doc());
+    camera_for_scene(&mut model, &framed, 16.0 / 9.0);
+
+    // One round trip's worth of reasons: twelve opinions, as a drag's first 400 ms.
+    for version in 2..=13 {
+        tell(&mut model, version, "opinion");
+        let plan = view::apply_state_change(
+            &mut model,
+            &mut tree,
+            &worker,
+            version,
+            "opinion",
+            16.0 / 9.0,
+        );
+        assert!(plan.asked_tree, "every opinion may move the layers");
+    }
+    assert!(tree.asking, "a request is outstanding");
+    assert!(
+        tree.reread_pending,
+        "and a read is owed, or the tree would stop following"
+    );
+    // Exactly one request crossed the wire, not twelve.
+    assert_eq!(
+        mock.try_next().map(|r| r.method),
+        Some("composition_tree".to_owned()),
+        "the burst sent the first read"
+    );
+    assert!(
+        mock.try_next().is_none(),
+        "and the other eleven were coalesced, not sent"
+    );
+
+    // The shell takes the owed read when the answer arrives (app::Shell::on_reply).
+    settle_tree(&mut tree);
+    assert!(tree.take_reread(), "one more read answers all twelve");
+    assert!(!tree.take_reread(), "and only one");
 }
 
 #[test]
@@ -378,6 +448,7 @@ fn a_preview_frame_moves_neither_the_tree_nor_the_camera() {
     let orbit = camera_for_scene(&mut model, &first, 16.0 / 9.0).expect("the first scene frames");
     view::ask_tree(&worker, &mut tree);
     mock.next_method("composition_tree");
+    settle_tree(&mut tree);
 
     // The prefix frame: the same version, a different composition.
     let prefix = json!({
@@ -520,6 +591,10 @@ fn two_opens_in_a_row_both_refit() {
     let plan_a = view::apply_state_change(&mut model, &mut tree, &worker, 1, "open", 16.0 / 9.0);
     let orbit_a = plan_a.refit.expect("the first open fits");
     mock.next_method("composition_tree");
+    // The round trip ends before the second document is switched to: two `open`s inside
+    // one round trip are coalesced into one read on purpose (a drag's opinions are why),
+    // and this test is about the camera, not about that.
+    settle_tree(&mut tree);
 
     let second = adopt(&mut model, 2, &narrow);
     let plan_b = view::apply_state_change(&mut model, &mut tree, &worker, 2, "open", 16.0 / 9.0);
@@ -558,6 +633,7 @@ fn the_window_path_a_scene_then_a_reason_reaches_the_same_two_decisions() {
     camera_for_scene(&mut model, &first, 16.0 / 9.0).expect("first fit");
     view::ask_tree(&worker, &mut tree);
     mock.next_method("composition_tree");
+    settle_tree(&mut tree);
 
     // The server pushes the new document, then says why (`mock.pushes` is the path a
     // real server takes, and it is what makes the ordering assertion real).

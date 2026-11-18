@@ -117,11 +117,29 @@ pub fn ask_tree(net: &crate::net::NetWorker, tree: &mut crate::panel::TreePanel)
     if !matches!(tree.model, crate::tree::TreeModel::Ready(_)) {
         tree.model = crate::tree::TreeModel::Loading;
     }
+    tree.note_asked(true);
     net.send(crate::net::NetCommand::Call {
         tag: TREE_TAG.to_owned(),
         method: "composition_tree".to_owned(),
         params: crate::tree::tree_params(),
     });
+}
+
+/// Ask the tree **unless a request is already in flight**; if one is, record that
+/// another read is owed ([`TreePanel::take_reread`]).
+///
+/// This is what a `state_changed` goes through, and the coalescing is the point: a gizmo
+/// drag emits an opinion up to 30 times a second, each one a `state_changed{reason:
+/// "opinion"}`, and a `composition_tree` is a structural read of the whole authority
+/// stack. Asking per notification would put 30 of those in flight during one drag.
+/// Coalescing keeps both halves of the requirement — the tree follows the server, and it
+/// follows it once per round trip instead of once per message.
+fn ask_tree_coalesced(net: &crate::net::NetWorker, tree: &mut crate::panel::TreePanel) {
+    if tree.asking {
+        tree.reread_pending = true;
+        return;
+    }
+    ask_tree(net, tree);
 }
 
 /// The scene's bounds as the **screen** has them: the world box of the last scene
@@ -158,7 +176,7 @@ pub fn apply_state_change(
     let refit = camera_for_state_change(model, version, reason, aspect);
     let asks = asks_tree(reason);
     if asks {
-        ask_tree(net, tree);
+        ask_tree_coalesced(net, tree);
     }
     StateChangePlan {
         refit,
