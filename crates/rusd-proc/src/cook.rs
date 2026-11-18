@@ -39,10 +39,26 @@ pub struct CookStats {
     pub skipped: usize,
 }
 
+/// One cooked node's output, as the composition tree reports it (PROTOCOL
+/// v1.5.1): which generator ran, what geometry it read, and the layer it authored.
+pub struct CookOp {
+    /// Stable node id (the generator prim path string).
+    pub id: String,
+    /// Generator schema name (registry key).
+    pub generator: String,
+    /// The `input_points` parameter, when the node reads input geometry.
+    pub input: Option<String>,
+    /// The node's current output layer identifier (changes on every rebuild).
+    pub layer_id: String,
+}
+
 /// Result of a cook pass: counters plus diagnostics (warnings/errors).
 pub struct CookResult {
     pub stats: CookStats,
     pub diags: Vec<Diagnostic>,
+    /// Every node with a memoized output layer after this pass, in cook order
+    /// (reused nodes included). Replace wholesale after each cook; never accumulate.
+    pub ops: Vec<CookOp>,
 }
 
 struct MemoEntry {
@@ -76,10 +92,10 @@ impl CookEngine {
         let mut stats = CookStats::default();
         let mut diags = Vec::new();
 
-        for id in order {
+        for id in &order {
             let node = by_id[id.as_str()];
             let key = memo_key(stage, node);
-            if self.memo.get(&id).map(|m| m.key) == Some(key) {
+            if self.memo.get(id.as_str()).map(|m| m.key) == Some(key) {
                 stats.reused += 1;
                 continue;
             }
@@ -117,7 +133,23 @@ impl CookEngine {
                 Err(d) => diags.extend(d),
             }
         }
-        CookResult { stats, diags }
+        let ops = order
+            .iter()
+            .filter_map(|id| {
+                let entry = self.memo.get(id.as_str())?;
+                let node = by_id[id.as_str()];
+                Some(CookOp {
+                    id: id.clone(),
+                    generator: node.generator.clone(),
+                    input: node.params.get("input_points").and_then(|v| match v {
+                        Value::String(s) => Some(s.clone()),
+                        _ => None,
+                    }),
+                    layer_id: entry.layer_id.clone(),
+                })
+            })
+            .collect();
+        CookResult { stats, diags, ops }
     }
 }
 
