@@ -462,3 +462,32 @@ v1.5 的 mock 夹具把 strength 关系摆反（拿升序当 cook 顺序），�
 
 - viewer：真实 strength 形状（op 行 strength 降序）的绘制顺序回归——mock 夹具必须摆成
   wire 的真实关系，不能拿升序当 cook 顺序（red-check：反转前该回归须红）。
+
+## v1.5.3 增补（用户裁定：root 档必须可见；2026-11-18）
+
+**合成图的每一档前缀都要看得到，包括「仅输入（root）」档**——合成 = root + cook ops +
+session overrides；root 档 = 只有 root 与 overrides、不含任何 op。
+
+### wire（agent）
+
+- `preview{upto}` 新增合法值 = **当前 root 层 identifier**（`composition_tree` layers 里
+  `kind = "root"` 那层的 id）。语义 = 「cook 顺序 ≤ root」⇒ 不含任何 op。快照 `upto` 字段报
+  该 root id；回应 `{"upto": <root id>, "root": true}`。
+- 预览态仍按 cook 顺序位置存：root 档 = **位置 -1**（patch/rebuild 后位置不变，identifier 可换）。
+- 未知 upto 仍 -32602，错误信息列 op 层 id **与** root id。
+- 其余不变：null = final、op id = 含到该 op、preview 不动 version、非订阅不补推。
+
+### viewer
+
+- **root 行（`kind = "root"` 的层行）成为预览控制行**（与 op 行同权）：点击发
+  `preview{upto: <root id>}`；`preview == root id` 时高亮 + `≤` 标记。root 行的
+  `comp_node` 详情让位（同 op 行先例：控制行点击即预览）。
+- 其余结构行（session / arc 目标 / prim）仍走选择，不改预览；final 按钮语义不变。
+
+### 验收补充
+
+- agent：preview{upto: root id} ⇒ 快照 upto = root id、无 op 层、version 不动、跨 rebuild
+  存活（位置 -1）、未知 id 仍 -32602。
+- viewer：root 行点击发 preview{upto: root id}（mock 断言）+ 高亮断言 + 非 op 非 root 行
+  仍选择。
+- 真窗：点 root 行 ⇒ 只见输入 mesh（起伏地面）；sample / instances / final 照旧。
