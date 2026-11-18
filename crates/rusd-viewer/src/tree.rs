@@ -339,6 +339,14 @@ pub struct TreeNode {
     /// what the panel draws: deciding "is this a preview control?" anywhere else makes
     /// the row and the click two opinions that can disagree.
     pub op: bool,
+    /// Whether this row is the **root layer's** row -- `layers[].kind == "root"`.
+    ///
+    /// From v1.5.3 (`docs/PROTOCOL.md`) the root row is a **preview control too**:
+    /// `preview{upto: <root layer id>}` composes `root + session overrides` and **no
+    /// cook op at all**, which is the input-only picture a pipeline is drawn from.
+    /// It is a flag beside [`TreeNode::op`] for the same reason: the row says what a
+    /// click means, and the panel decides nothing on its own.
+    pub root: bool,
     /// Children, in the order a panel draws them.
     pub children: Vec<TreeNode>,
 }
@@ -386,6 +394,12 @@ impl TreeNodeKind {
 /// `preview{upto}` takes is still the row's `id`, and its elided form is the subtitle's
 /// second half.
 ///
+/// The stack's **root layer** row is the *other* preview control (v1.5.3,
+/// “每一档前缀都要看得到”): its click previews `root + overrides`
+/// and **no cook op at all**. It is flagged [`TreeNode::root`] rather than `op`,
+/// because the two prefixes are not the same thing, and the panel reads the same
+/// pair of flags either way.
+///
 /// The rows' order is **cook order** (v1.5, as v1.5.2 fixes it): the stack in strength
 /// order with each run of op rows reversed ([`CompositionTree::draw_order`]), because a
 /// cook step inserts its output at the top of the sublayer stack. A panel drawn in
@@ -420,6 +434,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 label: format!("→ {}", arc.target_layer),
                 prim: None,
                 op: false,
+                root: false,
                 secondary: None,
                 children: Vec::new(),
             }]
@@ -432,6 +447,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
             label: format!("{} → {}:{}", arc.kind, arc.target_layer, arc.target_prim),
             prim: Some(arc.source_prim.clone()),
             op: false,
+            root: false,
             secondary: None,
             children: target_row,
         });
@@ -457,6 +473,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 },
                 prim: Some(prim.path.clone()),
                 op: false,
+                root: false,
                 secondary: None,
                 children: vset
                     .variants
@@ -471,6 +488,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                         label: v.clone(),
                         prim: Some(prim.path.clone()),
                         op: false,
+                        root: false,
                         secondary: None,
                         children: Vec::new(),
                     })
@@ -510,9 +528,20 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         },
         prim: None,
         op: layer.op,
+        root: is_root_layer(layer),
         secondary: layer.op.then(|| op_row_subtitle(layer)),
         children,
     }
+}
+
+/// Whether `layer` is the stack's **root layer** (`kind == "root"`), whose row is
+/// v1.5.3's third preview control (`docs/PROTOCOL.md`: root row becomes a preview
+/// control row).
+///
+/// Pure and public so the row's flag and the panel's click rule can be asserted
+/// against the same predicate instead of each spelling `"root"` on its own.
+pub fn is_root_layer(layer: &LayerNode) -> bool {
+    layer.kind == "root"
 }
 
 /// The word an op row's subtitle prints where the op reads no geometry: `input`
@@ -1884,5 +1913,69 @@ mod tests {
             ["root.usda", "rusd_city"],
             "a run of one is its own reversal"
         );
+    }
+
+    #[test]
+    fn only_the_root_layer_row_carries_the_root_flag() {
+        // v1.5.3 (`docs/PROTOCOL.md`): the row of the layer whose `kind` is `root` is a
+        // preview control, and the flag is what says so. Every other row is not one:
+        // op rows have their own flag, and an arc's leaf that *names* a layer is a
+        // `Layer` row that is still a selection.
+        let tree = CompositionTree::parse(&json!({
+            "layers": [
+                {"id": "anon:session", "kind": "session", "strength": 0},
+                {"id": "mesh.usda", "kind": "root", "strength": 1},
+                {"id": "anon:rusd_sample_points/0", "kind": "sublayer", "strength": 2,
+                 "op": true, "op_name": "RusdSamplePoints",
+                 "input": "/World/Mesh", "output": "anon:rusd_sample_points/0"},
+                {"id": "prototypes.usda", "kind": "reference", "strength": 3},
+            ],
+            "arcs": [
+                {"id": "arc:0", "kind": "reference", "source_layer": "mesh.usda",
+                 "source_prim": "/World/Mesh", "target_layer": "prototypes.usda",
+                 "target_prim": "/Prototypes/Mesh"},
+            ],
+            "prim_nodes": [],
+            "variant_sets": [],
+        }))
+        .expect("parses");
+        let rows = roots(&tree);
+        let by_id = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .unwrap_or_else(|| panic!("no row {id}"))
+        };
+
+        assert!(by_id("mesh.usda").root, "the root layer's row");
+        assert!(
+            !by_id("anon:session").root,
+            "a session layer is not the root"
+        );
+        assert!(
+            !by_id("anon:rusd_sample_points/0").root,
+            "an op layer is a control for its own reason, not this one"
+        );
+        assert!(
+            !by_id("prototypes.usda").root,
+            "a reference layer is not the root layer"
+        );
+        // The arc's leaf names the target layer, so it repeats that layer's id -- and it
+        // is still not the root row: the flag is the tree's, not a string comparison.
+        let leaf = rows
+            .iter()
+            .flat_map(|r| r.children.iter())
+            .flat_map(|c| c.children.iter())
+            .find(|c| c.label == "→ prototypes.usda")
+            .expect("the arc's leaf naming its target");
+        assert_eq!(leaf.kind, TreeNodeKind::Layer);
+        assert!(!leaf.op && !leaf.root, "the leaf is a plain layer row");
+
+        // And the predicate is the contract's word for it, not a second opinion.
+        assert!(is_root_layer(
+            tree.layer("mesh.usda").expect("the root layer")
+        ));
+        assert!(!is_root_layer(
+            tree.layer("anon:session").expect("the session layer")
+        ));
     }
 }
