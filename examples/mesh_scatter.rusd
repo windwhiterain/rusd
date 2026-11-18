@@ -1,12 +1,23 @@
-# rusd 0.1 — D14.1 演示：scatter 基于输入 mesh 表面
-# 输入层持有一块 2×2 四边形的起伏地面（UsdGeom.Mesh：points + faceVertexCounts +
-# faceVertexIndices）；RusdScatter 用 input_points 读它，按三角形**面积加权**
-# 采样 count 个位置（累积面积选三角形 + 重心坐标选点），在**自己的输出层**
-# 写原型实例。
+# rusd 0.1 — v1.5 演示：mesh → points → instances 两段 op 管线
+# 输入层持有一块 3×3 顶点（4 个四边形）的起伏地面（UsdGeom.Mesh：points +
+# faceVertexCounts + faceVertexIndices）。管线拆成两个显式 op，中间态是一个真 layer：
 #
-# 替换语义：输出层对输入 mesh 写 `visibility = "invisible"` 的 over ——
-# 合成结果只显示实例；停在 scatter 之前的前缀仍看到原 mesh（它的 spec 未被删除，
-# 只被更强的层覆盖）。
+#   /World/Terrain       —— 作者的 mesh（输入；不属于任何 op）
+#   /World/TuftSamples   —— RusdSamplePoints：按三角形**面积加权**采样 240 个点
+#                           （累积面积选三角形 + 重心坐标选点），在**自己的输出层**
+#                           写 /World/TuftSamples/points（point3f[]）
+#   /World/Tufts         —— RusdInstances：读那个点云，逐点写原型实例
+#                           /World/Tufts/i000000…，在**自己的输出层**
+#
+# 替换语义**逐 op 成立**（PROTOCOL v1.5.1）：每段 op 在自己的输出层对**它消费掉的
+# 那个 prim** 写 `visibility = "invisible"` 的 over —— sample 盖住 mesh，instances
+# 盖住点云。输入 spec 一处不删，所以三档前缀**互斥可见**：
+#
+#   upto = null（root）      → 只见 mesh
+#   upto = /World/TuftSamples → 只见点云
+#   upto = /World/Tufts      → 只见实例
+#
+# 确定性：采样流按 (stage.seed, 节点路径, 该节点 seed) 键控，改别的节点不 reshuffle。
 
 [stage]
 default_prim = "/World"
@@ -41,7 +52,19 @@ points = [
 ]
 schema = "Mesh"
 
-# --- 输出：表面上 240 个原型实例 -----------------------------------------
+# --- 第一段：mesh 表面 → 点云 ---------------------------------------------
+# 只吃 mesh 表面（无 mesh 拓扑 ⇒ E_INPUT_GEOMETRY，不会退化成"每个顶点一个点"）。
+# 输出 /World/TuftSamples/points；同一层对 /World/Terrain 写 visibility=invisible。
+[World.TuftSamples]
+count = 240
+input_points = "/World/Terrain"
+schema = "RusdSamplePoints"
+seed = 11
+
+# --- 第二段：点云 → 原型实例 ---------------------------------------------
+# 只吃点云（没有 points ⇒ E_INPUT_GEOMETRY）。没有 count 参数：点云里有几个点就
+# 几个实例，max_prims 只做预算截断（保原序 + W_BUDGET）。
+# 输出 /World/Tufts/i000000…；同一层对 /World/TuftSamples/points 写 visibility=invisible。
 [World.Prototypes]
 schema = "Xform"
 
@@ -50,10 +73,9 @@ radius = 0.35
 schema = "Sphere"
 
 [World.Tufts]
-count = 240
-input_points = "/World/Terrain"
+input_points = "/World/TuftSamples/points"
 max_prims = 5000
 prototype = "/World/Prototypes/Tuft"
 scale = { dist = "uniform", min = 0.7, max = 1.5 }
-schema = "RusdScatter"
+schema = "RusdInstances"
 seed = 11

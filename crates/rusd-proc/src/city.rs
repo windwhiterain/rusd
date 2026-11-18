@@ -29,7 +29,7 @@ fn dict_f(m: &BTreeMap<String, Value>, k: &str, d: f64) -> f64 {
 
 /// Sample a distribution value: `{dist="uniform",min,max}` / `{dist="normal",mu,sigma}`,
 /// or a constant number.
-fn sample_dist(rng: &mut Rng, v: Option<&Value>, default: f64) -> f64 {
+pub(crate) fn sample_dist(rng: &mut Rng, v: Option<&Value>, default: f64) -> f64 {
     match v {
         Some(Value::Dict(m)) => match m.get("dist").and_then(|d| match d {
             Value::String(s) => Some(s.as_str()),
@@ -54,7 +54,7 @@ fn zone_defaults(zone: &str) -> (f64, f64, f64) {
     }
 }
 
-type AuthResult = Result<(), sdf::AuthoringError>;
+pub(crate) type AuthResult = Result<(), sdf::AuthoringError>;
 
 /// Author a box building: Cube massing scaled to (w, depth, height), positioned
 /// at (cx, cy) rising in Z, with a display color.
@@ -390,7 +390,7 @@ impl Generator for RusdScatter {
 /// `xformOpOrder` is `[translate, scale]` (USD's order: scale applied first), and
 /// the whole op stack is authored in one pass because an attribute spec can only be
 /// created once per path.
-fn author_reference(
+pub(crate) fn author_reference(
     d: &mut dyn sdf::AbstractData,
     prim: &sdf::Path,
     root_id: &str,
@@ -631,7 +631,7 @@ fn scatter_from_geometry(
 /// area from a cumulative table, then a point inside it uniformly — the
 /// square-root barycentric pair, which is the uniform distribution over a triangle
 /// (a plain `(u, v)` would pile the instances towards the first corner).
-fn surface_samples(
+pub(crate) fn surface_samples(
     tris: &[rusd_scene::geometry::Triangle],
     count: usize,
     rng: &mut Rng,

@@ -348,12 +348,15 @@ fn a_mesh_gives_count_instances_all_on_its_surface() {
         "the mesh example must cook clean: {:?}",
         result.diags
     );
+    // v1.5: the mesh pipeline is two ops, so `count` is the *sample* node's
+    // parameter (it decides how many points the surface yields) and the instances
+    // node turns every one of them into an instance.
     let count = match syntax::parse(MESH)
         .unwrap()
         .prims
         .iter()
-        .find(|p| p.path.as_str() == "/World/Tufts")
-        .expect("the scatter node")
+        .find(|p| p.path.as_str() == "/World/TuftSamples")
+        .expect("the sample node")
         .props
         .get("count")
     {
@@ -461,9 +464,12 @@ fn a_different_seed_moves_the_instances() {
     let (a, _) = expand(MESH);
     let doc = syntax::parse(MESH).unwrap();
     let mut doc2 = doc.clone();
+    // v1.5: the stream that places points on the surface belongs to the *sample*
+    // node, so that is whose seed this moves. (The instances node has its own seed,
+    // for its own `scale` samples.)
     doc2.prims
         .iter_mut()
-        .find(|p| p.path.as_str() == "/World/Tufts")
+        .find(|p| p.path.as_str() == "/World/TuftSamples")
         .unwrap()
         .props
         .insert("seed".to_owned(), Value::Int(999));
