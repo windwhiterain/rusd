@@ -31,11 +31,13 @@
 //!   stack's `sdf` layer specs, not off the flattened snapshot, which has already
 //!   dropped every arc. The tree is cached for the `version` it describes and
 //!   dropped whenever the stage is rebuilt.
-//! - `preview` here (PROTOCOL v1.4) — how far into the cook **one connection's**
-//!   snapshots go. The state is per connection, not per session: two viewers may
-//!   watch different stages of the same cook at once. A preview is not a mutation
-//!   and does not move `version`; it flattens the same authority stack with the
-//!   later cook output layers muted.
+//! - `preview` here (PROTOCOL v1.4, extended by v1.5.3) — how far into the cook
+//!   **one connection's** snapshots go. The state is per connection, not per
+//!   session: two viewers may watch different stages of the same cook at once. A
+//!   preview is not a mutation and does not move `version`; it flattens the same
+//!   authority stack with the later cook output layers muted. A connection can
+//!   stop at any cook op, at `null` (the whole composition) or at the **root
+//!   layer** — the stop before every op, which shows the pipeline's input.
 //!
 //! Which mutations rebuild, and which edit in place:
 //!
@@ -112,6 +114,17 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:8765";
 /// one write event — a truncate, the write, a rename, a metadata touch — so the
 /// quiet period after the last event is what marks the save complete.
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
+
+/// The preview state that stops **before** the first cook op: the stage composes
+/// only the document's own layer plus the session overrides, with every cook
+/// output layer muted (PROTOCOL v1.5.3).
+///
+/// It is spelled `-1` because the state is a position in cook order and this is
+/// the position no cook reaches. That spelling is what makes the root stop
+/// survive a rebuild: a cook output layer's identifier is anonymous and a
+/// rebuild mints a new one, while `-1` says the same thing however many ops the
+/// new cook has and whatever the root layer is now called.
+const PREVIEW_ROOT: isize = -1;
 
 /// JSON-RPC codes used here (PROTOCOL §传输).
 const INVALID_REQUEST: i64 = -32600;
@@ -432,10 +445,12 @@ struct Session {
     /// `sdf` layer specs and kept for the version it describes: `comp_node` is
     /// asked for one node at a time, after the tree that named it.
     tree: Option<(u64, CompositionTree)>,
-    /// Per-connection preview state (PROTOCOL v1.4): how far into the cook a
-    /// connection's snapshots stop. The value is a position in the **cook order**
-    /// of the stage's output layers (0 is the first generator cooked); a
-    /// connection absent from the map sees the final, full composition.
+    /// Per-connection preview state (PROTOCOL v1.4, extended by v1.5.3): how far
+    /// into the cook a connection's snapshots stop. The value is a position in
+    /// the **cook order** of the stage's output layers (0 is the first generator
+    /// cooked), or [`PREVIEW_ROOT`] (`-1`) for the root stop, which composes no
+    /// op at all; a connection absent from the map sees the final, full
+    /// composition.
     ///
     /// The wire names a layer *identifier*, but cook output layers are anonymous
     /// (`anon:<n>:<tag>`) and a rebuild — `open` / `patch` / `undo` / `redo` /
@@ -443,8 +458,11 @@ struct Session {
     /// survive an edit to the document: the layer at that position is still the
     /// same generator's output, and the snapshot names the identifier the stack
     /// has now. A position the rebuilt stack no longer reaches falls back to the
-    /// final composition, and the snapshot says so by carrying no `upto`.
-    preview: BTreeMap<u64, usize>,
+    /// final composition, and the snapshot says so by carrying no `upto`. The
+    /// root stop needs no such fallback: it is not a position any cook reaches,
+    /// only the statement that no op is to be composed, which a rebuild cannot
+    /// invalidate.
+    preview: BTreeMap<u64, isize>,
 }
 
 /// What one mutation made available to its subscribers, held until the
@@ -656,10 +674,16 @@ impl Session {
 
     // --- viewer methods ---------------------------------------------------
 
-    /// `preview{upto}` (PROTOCOL v1.4): how far into the cook **this**
-    /// connection's snapshots go. `upto` is the identifier of a cook output
-    /// layer, as `composition_tree`'s `layers` lists them (the rows with
-    /// `op: true`), or `null` for the final, whole composition.
+    /// `preview{upto}` (PROTOCOL v1.4, extended by v1.5.3): how far into the cook
+    /// **this** connection's snapshots go. `upto` is one of
+    ///
+    /// - the identifier of a cook output layer, as `composition_tree`'s `layers`
+    ///   lists them (the rows with `op: true`) — the snapshot stops after that
+    ///   op;
+    /// - the identifier of the **root layer** (the row with `kind: "root"`) — the
+    ///   snapshot stops **before** every op, so the connection sees the
+    ///   document's own scene plus the session overrides (PROTOCOL v1.5.3);
+    /// - `null`, the final, whole composition.
     ///
     /// The prefix the connection then sees is the root layer plus the cook
     /// output layers up to and including `upto` in **cook order** — not the
@@ -667,16 +691,24 @@ impl Session {
     /// the newest layer first.
     ///
     /// The state is stored as the position in cook order for the reason
-    /// [`Session::preview`] gives. An identifier that names no cook output
-    /// layer of the current stage is `-32602`, naming what would have worked:
-    /// asking for a preview of a layer that is not an op is a client bug, not a
-    /// request to see something else.
+    /// [`Session`]'s `preview` field gives, and the root stop is the position
+    /// `-1`: no op at all. Both kinds of stop then survive a rebuild — a cook
+    /// output layer's identifier is anonymous and a rebuild mints a new one,
+    /// while `-1` means the same thing however many ops the new cook has and
+    /// whatever the root layer is called now.
+    ///
+    /// An identifier that names neither a cook output layer nor the root layer
+    /// of the current stage is `-32602`, naming what would have worked: asking
+    /// to stop at some other layer is a client bug, not a request to see
+    /// something else.
     fn preview(&mut self, conn: u64, p: &Value) -> Result<Value, (i64, String)> {
         let upto = match p.get("upto") {
             None => {
                 return Err((
                     INVALID_PARAMS,
-                    "preview: `upto` (a cook output layer identifier, or null) required".into(),
+                    "preview: `upto` (a cook output layer identifier, the root layer \
+                     identifier, or null) required"
+                        .into(),
                 ));
             }
             Some(Value::Null) => None,
@@ -691,37 +723,52 @@ impl Session {
         let Some(stage) = self.stage.clone() else {
             return Err(server_error("no scene open; call open first".into()));
         };
+        let root_id = stage.root_layer().identifier().to_owned();
         let ops = crate::composition::cook_output_layers(&stage);
         match upto {
             None => {
                 self.preview.remove(&conn);
                 Ok(json!({ "upto": Value::Null }))
             }
+            // The root layer: the composition stops before the first cook op.
+            Some(id) if id == root_id => {
+                self.preview.insert(conn, PREVIEW_ROOT);
+                Ok(json!({ "upto": id, "root": true }))
+            }
             Some(id) => {
                 let position = ops.iter().position(|layer| *layer == id).ok_or_else(|| {
                     (
                         INVALID_PARAMS,
                         format!(
-                            "preview: {id:?} is not a cook output layer of this stage; \
-                             the op layers are {ops:?} (null previews the final composition)"
+                            "preview: {id:?} is neither a cook output layer nor the root layer \
+                             of this stage; the op layers are {ops:?} and the root layer is \
+                             {root_id:?} (null previews the final composition)"
                         ),
                     )
                 })?;
-                self.preview.insert(conn, position);
+                self.preview.insert(conn, position as isize);
                 Ok(json!({ "upto": id, "op_index": position }))
             }
         }
     }
 
     /// Where `conn`'s preview stops, as a position in cook order; `None` is the
-    /// final composition. A position the current stage no longer reaches (the
-    /// document changed and the cook now has fewer ops) falls back to the final
+    /// final composition, and [`PREVIEW_ROOT`] (`-1`) is the stop before every
+    /// cook op. A position the current stage no longer reaches (the document
+    /// changed and the cook now has fewer ops) falls back to the final
     /// composition, draining the stale state as it does.
-    fn preview_position(&mut self, conn: u64) -> Option<usize> {
+    ///
+    /// The root stop is never stale: `-1` is not a position in the current cook
+    /// at all, but the statement that no op should be composed, which holds for
+    /// a stage with no ops just as well as for one with three.
+    fn preview_position(&mut self, conn: u64) -> Option<isize> {
         let position = *self.preview.get(&conn)?;
+        if position == PREVIEW_ROOT {
+            return Some(PREVIEW_ROOT);
+        }
         let stage = self.stage.as_ref()?;
         let len = crate::composition::cook_output_layers(stage).len();
-        if position < len {
+        if (position as usize) < len {
             Some(position)
         } else {
             self.preview.remove(&conn);
@@ -1064,13 +1111,21 @@ impl Session {
     /// the same engine that composes the whole — there is no second pipeline to
     /// keep in step. The layers come back exactly as they were, so a caller's
     /// final composition is untouched by a client's preview.
-    fn snapshot_line(&self, version: u64, upto: Option<usize>) -> Result<String, String> {
+    ///
+    /// The root stop (`upto` is [`PREVIEW_ROOT`], `-1`) mutes **every** cook
+    /// output layer, so what composes is the document's own scene plus the
+    /// session overrides: the first of the prefixes PROTOCOL v1.5.3 requires to
+    /// be reachable, and the one that shows the pipeline's input.
+    fn snapshot_line(&self, version: u64, upto: Option<isize>) -> Result<String, String> {
         let Some(stage) = self.stage.as_ref() else {
             return Err("no scene open; nothing to snapshot".into());
         };
+        let root_id = stage.root_layer().identifier().to_owned();
         let ops = crate::composition::cook_output_layers(stage);
         let muted: Vec<String> = match upto {
-            Some(position) => ops.iter().skip(position + 1).cloned().collect(),
+            // Nothing has cooked yet at the root stop, so every op layer goes.
+            Some(PREVIEW_ROOT) => ops.clone(),
+            Some(position) => ops.iter().skip(position as usize + 1).cloned().collect(),
             None => Vec::new(),
         };
         for id in &muted {
@@ -1093,11 +1148,16 @@ impl Session {
         });
         // `upto` is absent for the final composition (PROTOCOL v1.4): the
         // snapshot then means the whole scene, which is what a client that never
-        // asked for a preview always gets.
-        if let Some(position) = upto
-            && let Some(id) = ops.get(position)
-        {
-            params["upto"] = json!(id);
+        // asked for a preview always gets. A preview names the layer it stops
+        // at: the root layer for the root stop (v1.5.3), the op layer otherwise.
+        match upto {
+            Some(PREVIEW_ROOT) => params["upto"] = json!(root_id),
+            Some(position) => {
+                if let Some(id) = ops.get(position as usize) {
+                    params["upto"] = json!(id);
+                }
+            }
+            None => {}
         }
         Ok(to_line(&json!({
             "method": "stage_snapshot",
@@ -1112,6 +1172,8 @@ impl Session {
     /// A snapshot is built once per **distinct preview state** among the
     /// subscribers, not once per connection: a preview is a flatten of the whole
     /// stage, and two viewers watching the same prefix must not pay for it twice.
+    /// [`PREVIEW_ROOT`] is an ordinary key here — several viewers on the root
+    /// stop share one flatten like any other prefix.
     fn publish(&mut self) {
         let pending = std::mem::take(&mut self.pending);
         if pending.is_empty() {
@@ -1120,20 +1182,20 @@ impl Session {
         // Which preview state each subscriber is in, resolved once: this also
         // drains a state the rebuilt cook no longer reaches.
         let conns: Vec<u64> = self.subs.keys().copied().collect();
-        let mut states: BTreeMap<u64, Option<usize>> = conns
+        let mut states: BTreeMap<u64, Option<isize>> = conns
             .into_iter()
             .map(|conn| (conn, self.preview_position(conn)))
             .collect();
         // One preview line per state that some subscriber is actually in, built
         // once however many connections watch it: a preview is a flatten of the
         // whole stage, which is the one cost worth sharing here.
-        let mut previews: BTreeMap<usize, String> = BTreeMap::new();
+        let mut previews: BTreeMap<isize, String> = BTreeMap::new();
         for item in &pending {
             let Pending::Snapshot { version, .. } = item else {
                 continue;
             };
             // Collected first: a failure below rewrites `states`.
-            let wanted: Vec<usize> = states.values().flatten().copied().collect();
+            let wanted: Vec<isize> = states.values().flatten().copied().collect();
             for position in wanted {
                 if previews.contains_key(&position) {
                     continue;
