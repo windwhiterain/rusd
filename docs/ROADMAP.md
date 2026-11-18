@@ -141,6 +141,22 @@ peer 构建 scp 分发）。server 不再拥有相机——相机归 client，se
         同 version 前缀帧 accept=stale 当旧于 floor 或同 floor 同合成、前缀不抬 floor
   - [x] 测试：merge 后全 workspace **468 绿**（`rusd-viewer` **282**，含同 version 回归
         `tests/state_change_v142.rs`）
+- [x] **v1.5 mesh→points→instances 管线可视化真窗验收**（2026-11-18；证据见
+      `docs/VERIFICATION.md` §11，client 约定见 `REMOTE.md` §15，契约 PROTOCOL v1.5/v1.5.1/v1.5.2）：
+  - [x] 两段 op（merge `8c2675a`）：`RusdSamplePoints`（mesh→points，面积加权 count+seed）+
+        `RusdInstances`（points→instances，逐点 + seed）；`examples/mesh_scatter.rusd` 重写；
+        逐 op visibility 替换语义 ⇒ 三档前缀互斥可见（root=mesh / sample=点云 / instances=实例）；
+        旧单步 `RusdScatter` 回退与 city/forest 不动
+  - [x] op 元数据（merge `21dac77`）：`CookResult.ops`（含 reused，cook 顺序）→
+        `composition_tree` op 层 `op_name`/`input`/`output`（join 键 layer_id，additive）
+  - [x] op 行可读标签（merge `fbc22f8`）：主标签 op_name + 副文本 input→output 摘要
+        （parametric/anon 回退）；点击仍 `preview{upto}`
+  - [x] **v1.5.2 排序修复**（merge `490c14f` = `57ff201` + `ba6185e`）：真实 wire layers 是
+        strength 序，cook 顺序 = op 行 strength 降序；mock 夹具摆反致真窗读反管线 ⇒
+        `draw_order()` 最大连续 op 段就地反转 + 真实形状绘制回归（red-check 6 条）
+  - [x] 测试：merge 后全 workspace **521 绿**（`rusd-viewer` **303**）；clippy 0、fmt 无漂移
+  - [ ] 开放 UX：root-only（只见 mesh）预览档不可达（`preview{upto}` 只收 op id/null）——
+        要不要加 root 预览档留用户裁定
 - [ ] SSH 隧道文档（`ssh -L`）与分发说明（peer 构建 → scp，同 win-x64）
 - [ ] 后置：`Diff`/`apply_diff` 细粒度增量（`sdf::Value`/`Diff` 无 serde，需自定义 codec）；
       `--bind LAN`

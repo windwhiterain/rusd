@@ -425,3 +425,27 @@ floor 是 `Option`：没有 floor 时 version 0 是**首帧**，不是重复。
 拖动 gizmo 时 opinion 以 ≤30Hz 出站。若每个 `state_changed` 都发一次 `composition_tree`，
 拖动就会打爆 server。规则：**同一往返窗口内只保留一个在途的树请求**，答复到达后若有新请求
 待发则合并为一次；拖动期间树的内容不变，所以合并不会漏掉可见变化。
+
+## 15. v1.5 管线可视化的 client 约定（2026-11-18）
+
+### 15.1 op 元数据 join 与预览档可达性
+
+`composition_tree` 的 op 层带 `op_name`/`input`/`output`（server 用 `CookResult.ops` join，
+键 = layer_id）。client 画 op 行用这些字段，不再只显 anon identifier。**预览档可达性**：
+`preview{upto}` 只接受 op 层 id 或 null，所以 viewer 实际可达 sample / instances / final 三态；
+**root-only（只见输入 mesh）档不可达**——sample 档里 mesh 已被逐 op visibility over 隐藏。
+三档互斥可见在 proc 级（mute 测试）已证；要不要给 viewer 加 root 预览档是开放 UX 决策。
+
+### 15.2 op 行绘制顺序（v1.5.2）
+
+wire `layers` 是 strength 序；cook 每步插 position 0 ⇒ 越晚 cook 越强 ⇒ **cook 顺序 = op 行
+strength 降序**。client 在 strength 序上对每段最大连续 op 行就地反转来画，结构层不动。
+**mock 夹具必须摆成 wire 的真实 strength 关系**：v1.5 的夹具拿升序当 cook 顺序，测试绿但真窗
+读反管线——库不能作自己的第二意见（§7.2 同题），形状回归要用真实形状。
+
+### 15.3 部署与验证链（本轮）
+
+peer 构建 release（`rusd.exe` serve + `rusd-viewer.exe`）→ 按 PID 停旧 serve 解 exe 锁 →
+重启 serve（peer 8765）→ 隧道 `ssh -L 8765:127.0.0.1:8765`（server 本机）→ 杀旧 viewer 解
+exe 锁 → scp viewer 到 server `C:/Users/17124/rusd-client/` → 重开窗口。wire 级 join/preview
+用 server python 走隧道独立核（不依赖 viewer）；几何与交互用 DPI-aware 真窗截图。

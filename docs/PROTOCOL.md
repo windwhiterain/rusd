@@ -437,3 +437,28 @@ v1.5 的实现拆给三个并行 subagent（proc / agent / viewer）。下列裁
 - agent：op_name/input/output 上 wire 且 join 正确（含 input=null 的参数式 scatter）；
   未知字段不破坏旧 client（既有 wire 回归）。
 - viewer：op 行标签断言（op_name + input→output + parametric 回退 + anon 回退）。
+
+## v1.5.2 增补（集成裁定：op 行绘制顺序；2026-11-18 父会话裁定）
+
+**撤回 v1.5.1「行序 = cook 顺序（现状已对）」**：那是父会话的事实错误。真实 wire 的
+`layers` 是 **strength 序**（session 0、root 1、instances 2、sample 3）——cook 每步把输出层
+插到 root stack 的 position 0，越晚 cook 越强，所以 **cook 顺序 = op 行 strength 降序**。
+v1.5 的 mock 夹具把 strength 关系摆反（拿升序当 cook 顺序），「cook order」测试测的是假形状，
+真窗面板会把管线读反（instances 在 sample 上面）。
+
+### 绘制顺序（viewer）
+
+- 结构层（root/session/arc 目标）保持 **strength 序**，不动。
+- **op 行之间按 strength 降序画**（= cook 顺序）：在 root_layers 的 strength 序上，对每一段
+  最大连续 op 行就地反转；结构层位置不变。`root_layers` 本身仍报 strength 序（wire 不改）。
+- 点击语义不变：op 行 → `preview{upto: 该层 id}`；final → `preview{null}`。
+
+### 参数补正（proc）
+
+- `RusdInstances` 补 `seed: U64`（通用 generator 参数，v1.5.1 起草疏漏；示例 `seed = 11` 保留）。
+  `RusdSamplePoints` 的 `seed` 不变。两 op 的 RNG 仍只从 `(stage.seed, prim_path, local_seed)` 派生。
+
+### 验收补充
+
+- viewer：真实 strength 形状（op 行 strength 降序）的绘制顺序回归——mock 夹具必须摆成
+  wire 的真实关系，不能拿升序当 cook 顺序（red-check：反转前该回归须红）。

@@ -364,3 +364,71 @@ rusd-viewer.exe view --connect 127.0.0.1:8765
 
 merge 后全 workspace **468 绿**，其中 `rusd-viewer` **282**（含 mock server 协议集成与
 `tests/state_change_v142.rs` 的同 version 回归）。
+
+## 11. v1.5 mesh→points→instances 管线可视化真窗验收（2026-11-18）
+
+契约 PROTOCOL v1.5/v1.5.1/v1.5.2；实现 merge `8c2675a`（proc）/ `21dac77`（agent）/
+`fbc22f8`+`490c14f`（viewer，含 v1.5.2 排序修复）。三个并行 subagent 按 crate 切，契约先行
+（父会话先落 v1.5.1 裁定 + `CookResult.ops` 机械 stub `384615d`，三 worktree 各自独立编译）。
+
+### 11.1 两段 op 与三档前缀几何（proc）
+
+`examples/mesh_scatter.rusd` 重写为：作者 mesh 层 `/World/Terrain` → `RusdSamplePoints`
+（`/World/TuftSamples`，count=240，seed=11，输出 Points prim 在 `<node>/points`）→
+`RusdInstances`（`/World/Tufts`，prototype `/World/Prototypes/Tuft`，seed=11）。逐 op 替换语义：
+sample 输出层对输入 mesh 写 `visibility="invisible"` over，instances 对输入 points 写同样 over。
+
+三档互斥可见证据（离线 `snapshot` 子命令打开 mesh_scatter 导出三档 usdc，再 headless 渲染）：
+- root 前缀（mute 两 op 层）：仅 mesh；
+- upto=sample：items=2 / prims=2（点云 + 原型，mesh 已隐藏）——PNG 为贴表面小 glyphs 点云；
+- upto=instances / final：items=241（240 实例 + 原型）——PNG 为 240 球体。
+proc 级 `two_op_pipeline` 17 项断言三档 composed visibility 互斥；sample 点数==count 且落在
+输入表面、instances 逐点世界变换一致、同 seed 同输入⇒同输出。
+
+### 11.2 op 行可读标签与顺序（agent + viewer）
+
+`composition_tree` op 层带 `op_name`/`input`/`output`（join 键 `CookOp.layer_id == 条目 id`）。
+真窗面板：
+- 主标签 `RusdSamplePoints` / `RusdInstances`；副文本 `/World/Terrain → anon:39:rusd_sample_…` /
+  `/World/TuftSamples/points → anon:43:rusd_instanc…`（output 截断 ≤20 字符 + …）；`≤` 预览标记。
+- **顺序 sample 上、instances 下 = cook 顺序**（v1.5.2 修复后）。
+
+### 11.3 真窗交互序列（DPI-aware）
+
+点 sample 行 ⇒ 行高亮 + 顶栏「2 prim · 预览 ≤ anon:39」+ 视口点云；点 instances 行 ⇒
+「241 prim · 预览 ≤ anon:43」+ 240 球体；点 final 按钮 ⇒「241 prim · 无预览」+ composition
+最终 + 高亮清除。DPI 度量全对（per-monitor aware，2560×1440，无虚拟化）。截图
+`live-1/live-sample/live-instances/live-restored.png`（server `C:/Users/17124/rusd-client/`）。
+
+### 11.4 集成发现的排序 bug（v1.5.2）
+
+wire 级端到端（server python 走隧道）发现真实 `layers` 是 strength 序，op 行 strength 降序才是
+cook 顺序；viewer mock 夹具摆反 ⇒ 真窗会读反管线。回炉 viewer 修 `draw_order()`（最大连续 op
+段就地反转，结构层不动），red-check 6 条全红后转绿。教训：**mock 夹具必须摆成 wire 的真实
+形状，库不能作自己的第二意见**（REMOTE §7.2 同题）。
+
+### 11.5 实现裁定记录（父会话）
+
+- 授权 proc 纯增量改 `rusd-scene/src/schema.rs`（两 PropDef 表 + lookup，kind=Generator；
+  本轮该文件唯一写者=proc）；`SAMPLE_POINTS` 去掉 max_prims。
+- 授权最小适配 `preview_prefix.rs`（ops.len()=2 + 两段前缀断言）与 `geometry_in.rs`
+  （count 改读 `/World/TuftSamples`），其余断言/测试不动；输出路径约定批准（sample Points
+  在 `<node>/points`，实例路径 `/World/Tufts/i*` 不变）。
+- `INSTANCES` 补 `seed: U64`（通用 generator 参数，起草疏漏补正），示例 seed=11 保留。
+
+### 11.6 复现命令
+
+```bash
+source scripts/msvc-env.sh
+cargo test                       # 521 绿（rusd-viewer 303）
+# 三档几何（peer）：离线 snapshot 导出 + headless 渲染 JSON/PNG
+#   open_tiers.py 打开 examples/mesh_scatter.rusd 导出 root/sample/instances 三档 usdc
+# 真窗（server 本机桌面）：
+#   rusd-viewer.exe view --connect 127.0.0.1:8765 --debug-ui
+#   File ▸ Open examples/mesh_scatter.rusd；点 sample/instances op 行与 final 按钮
+```
+
+### 11.7 测试
+
+merge 后全 workspace **521 绿**（`rusd-viewer` **303**，含 v1.5.2 真实形状绘制顺序回归）；
+clippy 0、fmt 无漂移。
