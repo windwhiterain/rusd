@@ -1,6 +1,7 @@
 //! Built-in generators. M2 ships `RusdGrid` (a simple parametric grid) to exercise
 //! the cook engine end-to-end; the city suite (StreetGrid/Building/BlockFill/Scatter)
-//! registers here in M3.
+//! registers here in M3, and the v1.5 two-op pipeline (`RusdSamplePoints` →
+//! `RusdInstances`) in v1.5.
 
 use openusd::gf;
 use openusd::sdf::{self, AttributeSpec, PrimSpec, Specifier, Value as SdfValue, Variability};
@@ -88,6 +89,11 @@ pub fn default_registry() -> CookEngine {
     e.register(Box::new(crate::city::RusdStreetGrid));
     e.register(Box::new(crate::city::RusdBuilding));
     e.register(Box::new(crate::city::RusdScatter));
+    // v1.5: the two-op pipeline. Registered as two separate generators because the
+    // intermediate point cloud is a real layer, which is what makes a prefix able to
+    // stop between them (docs/PROTOCOL.md v1.5).
+    e.register(Box::new(crate::pipeline::RusdSamplePoints));
+    e.register(Box::new(crate::pipeline::RusdInstances));
     e
 }
 

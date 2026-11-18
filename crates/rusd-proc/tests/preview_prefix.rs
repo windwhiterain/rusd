@@ -103,8 +103,36 @@ fn a_prefix_before_the_scatter_shows_the_cloud_and_the_full_stack_shows_the_inst
 #[test]
 fn a_prefix_before_a_surface_scatter_shows_the_surface() {
     let (stage, ops) = cooked(MESH);
-    assert_eq!(ops.len(), 1, "one generator node: {ops:?}");
+    // v1.5: the mesh pipeline is two ops, so there are two prefixes to stop at and
+    // three mutually exclusive states between them (PROTOCOL v1.5.1): the surface,
+    // the sampled cloud, the instances.
+    assert_eq!(ops.len(), 2, "two generator nodes: {ops:?}");
+    // The stack reports the strongest sublayer first, and each op inserts above the
+    // ones already there: the instances op (cooked second) is ahead of the sampler.
+    let instances_layer = ops
+        .iter()
+        .find(|id| id.contains("rusd_instances"))
+        .unwrap_or_else(|| panic!("no instances layer in {ops:?}"))
+        .clone();
+    let sample_layer = ops
+        .iter()
+        .find(|id| id.contains("rusd_sample_points"))
+        .unwrap_or_else(|| panic!("no sample layer in {ops:?}"))
+        .clone();
+    assert!(
+        stage
+            .layer_stack()
+            .iter()
+            .position(|id| *id == instances_layer)
+            < stage
+                .layer_stack()
+                .iter()
+                .position(|id| *id == sample_layer),
+        "the instances layer composes above the samples it consumed: {ops:?}"
+    );
 
+    // Full stack: the surface is replaced by the cloud, and the cloud by its
+    // instances. Nothing consumed is left drawing.
     assert!(draws(&stage, "/World/Tufts/i000000"), "instances draw");
     assert_eq!(
         visibility(&stage, "/World/Terrain").as_deref(),
@@ -112,23 +140,53 @@ fn a_prefix_before_a_surface_scatter_shows_the_surface() {
         "the full stack hides the surface"
     );
     assert!(!draws(&stage, "/World/Terrain"), "and draws none of it");
+    assert!(
+        !draws(&stage, "/World/TuftSamples/points"),
+        "and the intermediate cloud is hidden in turn"
+    );
 
-    stage.mute_layer(&ops[0]);
+    // Prefix 1 — stop before the instances op: the cloud is what is left.
+    stage.mute_layer(&instances_layer);
+    assert!(
+        visibility(&stage, "/World/TuftSamples/points").is_none(),
+        "no opinion hides the cloud once the op that consumed it is out of the stack"
+    );
+    assert!(
+        draws(&stage, "/World/TuftSamples/points"),
+        "the middle prefix shows the sampled cloud"
+    );
+    assert!(
+        !draws(&stage, "/World/Tufts/i000000"),
+        "and no instances: the op that makes them is not cooking"
+    );
+    assert!(
+        !draws(&stage, "/World/Terrain"),
+        "and still no surface: the sampler's own opinion is untouched"
+    );
+
+    // Prefix 2 — stop before the sample op as well: the input surface is back.
+    stage.mute_layer(&sample_layer);
     assert!(
         visibility(&stage, "/World/Terrain").is_none(),
         "a prefix has no visibility opinion to obey"
     );
     assert!(
         draws(&stage, "/World/Terrain"),
-        "the prefix shows the surface"
+        "the first prefix shows the surface"
     );
-    assert!(!draws(&stage, "/World/Tufts/i000000"));
+    assert!(
+        !draws(&stage, "/World/TuftSamples/points"),
+        "and no cloud: the op that authors it is not cooking"
+    );
 
-    stage.unmute_layer(&ops[0]);
+    // And back: unmuting restores the full stack exactly.
+    stage.unmute_layer(&sample_layer);
+    stage.unmute_layer(&instances_layer);
     assert_eq!(
         visibility(&stage, "/World/Terrain").as_deref(),
         Some("invisible")
     );
+    assert!(draws(&stage, "/World/Tufts/i000000"));
 }
 
 #[test]

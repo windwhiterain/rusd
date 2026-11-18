@@ -270,6 +270,12 @@ pub fn nodes_from_doc(doc: &rusd_core::syntax::ParsedDocument) -> Vec<CookNode> 
                 }
                 reads
             }
+            // v1.5 two-op pipeline (PROTOCOL v1.5.1): the pair's declarations live
+            // in `deps`, because the two ops have to agree on the cloud path between
+            // them (the sample op writes it, the instances op reads it).
+            "RusdSamplePoints" | "RusdInstances" => {
+                crate::deps::reads_for(prim.schema.as_str(), &prim.props, prim.path.as_str())
+            }
             _ => Vec::new(),
         };
         let stage_seed = match doc.stage.get("seed") {
@@ -284,7 +290,7 @@ pub fn nodes_from_doc(doc: &rusd_core::syntax::ParsedDocument) -> Vec<CookNode> 
             seed,
             stage_seed,
             reads,
-            writes: vec![prim.path.as_str().to_owned()],
+            writes: crate::deps::writes_for(prim.schema.as_str(), prim.path.as_str()),
         });
     }
     nodes
@@ -518,5 +524,146 @@ mod tests {
         let r = e.cook(&stage, &root, &ns);
         assert_eq!(r.stats.skipped, 1);
         assert!(r.diags.iter().any(|d| d.code == "W_UNKNOWN_GENERATOR"));
+    }
+    // --- CookResult.ops (PROTOCOL v1.5.1) --------------------------------------
+    //
+    // `ops` is what the composition tree joins on: one entry per node that has a
+    // memoized output layer after the pass, in cook order, replaced wholesale each
+    // pass. The ways it can be wrong are all asserted below — a reused node dropped,
+    // the order lost, a stale layer id reported, or a node's input misreported.
+
+    #[test]
+    fn ops_report_every_node_with_a_layer_in_cook_order() {
+        let (stage, root) = root_stage();
+        let mut e = engine();
+        let r = e.cook(&stage, &root, &nodes());
+        let ids: Vec<&str> = r.ops.iter().map(|o| o.id.as_str()).collect();
+        // Dependency order, not document order: A (the parcel) cooks before B, which
+        // reads it; C is independent and already came first in the node list.
+        assert_eq!(ids, vec!["A", "C", "B"], "cook order: {ids:?}");
+        for op in &r.ops {
+            let want = match op.id.as_str() {
+                "A" => "TestParcel",
+                "B" => "TestBuilding",
+                _ => "TestTree",
+            };
+            assert_eq!(op.generator, want, "{} reports its generator", op.id);
+            assert!(!op.layer_id.is_empty(), "{} has a layer id", op.id);
+            assert_eq!(
+                op.input, None,
+                "{} is parametric: no `input_points`, so no input",
+                op.id
+            );
+        }
+    }
+
+    #[test]
+    fn ops_keep_reused_nodes_after_an_incremental_pass() {
+        // A second pass that re-cooks one node must still list all three: a reused
+        // node's layer is in the stack, and a tree that could not name it would show a
+        // gap where an op is.
+        let (stage, root) = root_stage();
+        let mut e = engine();
+        let first = e.cook(&stage, &root, &nodes());
+        assert_eq!(first.stats.cooked, 3);
+
+        let mut ns = nodes();
+        ns[0].params.insert("width".to_owned(), Value::Float(30.0));
+        let second = e.cook(&stage, &root, &ns);
+        assert_eq!(second.stats.cooked, 2, "A and B re-cook");
+        assert_eq!(second.stats.reused, 1, "C is reused");
+        let ids: Vec<&str> = second.ops.iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["A", "C", "B"],
+            "the reused node is still listed, in cook order: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_rebuilt_node_reports_a_new_layer_and_a_reused_one_keeps_its_own() {
+        // `layer_id` is the node's **current** output layer: a rebuild authors a fresh
+        // anonymous layer, and the superseded one is muted. A stale id here would point
+        // a client at a layer that no longer composes.
+        let (stage, root) = root_stage();
+        let mut e = engine();
+        let first = e.cook(&stage, &root, &nodes());
+        let before = first
+            .ops
+            .iter()
+            .find(|o| o.id == "A")
+            .expect("A cooked")
+            .layer_id
+            .clone();
+
+        let mut ns = nodes();
+        ns[0].params.insert("width".to_owned(), Value::Float(30.0));
+        let second = e.cook(&stage, &root, &ns);
+        let after = second
+            .ops
+            .iter()
+            .find(|o| o.id == "A")
+            .expect("A cooked again")
+            .layer_id
+            .clone();
+        assert_ne!(before, after, "a rebuilt node authors a new layer");
+        // The reused node keeps the layer it already had — it did not rebuild.
+        let c_before = first
+            .ops
+            .iter()
+            .find(|o| o.id == "C")
+            .expect("C cooked")
+            .layer_id
+            .clone();
+        let c_after = second
+            .ops
+            .iter()
+            .find(|o| o.id == "C")
+            .expect("C still cooked")
+            .layer_id
+            .clone();
+        assert_eq!(c_before, c_after, "a reused node keeps its layer");
+
+        // And the stage agrees: the reported layer is in the stack.
+        let stack = stage.layer_stack();
+        assert!(
+            stack.contains(&after),
+            "the reported layer is in the stack: {stack:?}"
+        );
+    }
+
+    #[test]
+    fn ops_are_replaced_not_accumulated_across_passes() {
+        // Calling `cook` twice with the same nodes must not grow `ops`: it is a report
+        // of one pass, and the caller replaces it wholesale.
+        let (stage, root) = root_stage();
+        let mut e = engine();
+        let first = e.cook(&stage, &root, &nodes());
+        let second = e.cook(&stage, &root, &nodes());
+        assert_eq!(first.ops.len(), 3);
+        assert_eq!(second.ops.len(), 3, "not six: one pass, one report");
+    }
+
+    #[test]
+    fn ops_report_the_nodes_input_points_parameter() {
+        // v1.5 wiring: the composition tree labels an op row with what it read, so
+        // `input` has to be the authored `input_points` path — `None` for a node that
+        // has none (the parametric scatter).
+        let (stage, root) = root_stage();
+        let mut e = engine();
+        let mut ns = nodes();
+        ns[1].params.insert(
+            "input_points".to_owned(),
+            Value::String("/World/Parcel".to_owned()),
+        );
+        let r = e.cook(&stage, &root, &ns);
+        let b = r.ops.iter().find(|o| o.id == "B").expect("B cooked");
+        assert_eq!(
+            b.input.as_deref(),
+            Some("/World/Parcel"),
+            "the op reports what it read"
+        );
+        let c = r.ops.iter().find(|o| o.id == "C").expect("C cooked");
+        assert_eq!(c.input, None, "a parametric node has no input");
     }
 }

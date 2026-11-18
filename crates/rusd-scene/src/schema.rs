@@ -147,6 +147,25 @@ static SCATTER: &[PropDef] = &[
     p("max_prims", U64),
     p("max_triangles", U64),
 ];
+// v1.5: mesh -> points. The first half of the two-op pipeline build; it reads a
+// `Mesh`'s surface (never its bare vertices) and authors a `Points` prim in its own
+// output layer, so a pipeline prefix stopped after this op shows the cloud and a
+// prefix stopped before it shows the mesh.
+static SAMPLE_POINTS: &[PropDef] = &[req("input_points", Path), p("count", U64), p("seed", U64)];
+// v1.5: points -> instances. The second half: one prototype instance per input
+// point, in the cloud's own order. No `count`: the cloud decides how many there
+// are, and `max_prims` is what bounds the result (truncated in order + W_BUDGET).
+static INSTANCES: &[PropDef] = &[
+    req("input_points", Path),
+    req("prototype", Path),
+    p("scale", Distribution),
+    p("max_prims", U64),
+    // v1.5.1 补正 (parent ruling): `seed` is the repository-wide generator parameter
+    // — every instance samples `scale` from a stream keyed by
+    // `(stage.seed, prim path, local seed)` (SPEC §5), so the local seed has to be
+    // authorable here too. Only `max_prims` bounds the count; there is no `count`.
+    p("seed", U64),
+];
 static STREET_GRID: &[PropDef] = &[
     p("blocks_x", U64),
     p("blocks_y", U64),
@@ -215,6 +234,8 @@ pub fn lookup(name: &str) -> Option<SchemaDef> {
         "PointLight" => ("PointLight", SchemaKind::Builtin, POINT_LIGHT),
         "Points" => ("Points", SchemaKind::Builtin, POINTS),
         "RusdScatter" => ("RusdScatter", SchemaKind::Generator, SCATTER),
+        "RusdSamplePoints" => ("RusdSamplePoints", SchemaKind::Generator, SAMPLE_POINTS),
+        "RusdInstances" => ("RusdInstances", SchemaKind::Generator, INSTANCES),
         "RusdStreetGrid" => ("RusdStreetGrid", SchemaKind::Generator, STREET_GRID),
         "RusdBlockFill" => ("RusdBlockFill", SchemaKind::Generator, BLOCK_FILL),
         "RusdBuilding" => ("RusdBuilding", SchemaKind::Generator, BUILDING),
