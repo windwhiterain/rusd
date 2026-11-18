@@ -108,6 +108,7 @@ mod tests {
             version: 1,
             format: "usdc".to_owned(),
             data: base64_encode(&cooked_city()),
+            upto: None,
         });
         match ClientModel::new().apply(&n) {
             crate::session::Effect::NewScene(m) => *m,

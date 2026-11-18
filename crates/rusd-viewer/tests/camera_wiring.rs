@@ -408,6 +408,7 @@ fn the_late_servers_notification_is_the_contracts_shape() {
             version,
             format,
             data,
+            ..
         })) => {
             assert_eq!(version, 7);
             assert_eq!(format, "usdc");
