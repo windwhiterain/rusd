@@ -22,6 +22,12 @@
 //!   `comp_node` ask. The 「final」 button beside 「刷新」 sends `preview{upto: null}`.
 //!   Clicking any other row is unchanged: `comp_node{id}`, and the preview stays where
 //!   it was (`docs/PROTOCOL.md` v1.4).
+//! - **an op row says which op it is and what it reads and writes** (v1.5): the title
+//!   is the generator's schema name (`RusdSamplePoints`, `RusdInstances`,
+//!   `RusdScatter`) rather than an anonymous identifier, and a dim subtitle reads
+//!   `{input} → {output summary}`, with `(parametric)` where the op has no input
+//!   geometry. A row whose answer carried no `op_name` falls back to the identifier,
+//!   which is exactly the pre-v1.5 picture.
 //! - **a variant set expands** into its variants, the selected one first shown in
 //!   the row (`size = small`).
 //! - **clicking any row** selects it and asks `comp_node{id}` for its detail. A row
@@ -321,6 +327,11 @@ fn row(
             {
                 clicked = Some(TreeAction::Preview(Some(node.id.clone())));
             }
+            // v1.5: the row's second half — `{input} → {output summary}` — is drawn
+            // **beside** the title and is not itself a control: one row, one click,
+            // and that click is the preview. Drawing it outside the `selectable_label`
+            // is what keeps the two from becoming two hit areas with one meaning.
+            subtitle(ui, node);
         });
         for child in &node.children {
             if let Some(a) = row(ui, child, depth + 1, selected, preview) {
@@ -360,6 +371,21 @@ fn row(
 fn indent(ui: &mut egui::Ui, depth: usize) {
     if depth > 0 {
         ui.add_space(8.0 * depth as f32);
+    }
+}
+
+/// A row's dim secondary text (v1.5), when it has one.
+///
+/// Weak and small so it reads as an annotation rather than a second label, and never
+/// as another control: the op row's click stays the title's.
+fn subtitle(ui: &mut egui::Ui, node: &TreeNode) {
+    if let Some(text) = &node.secondary {
+        ui.label(
+            RichText::new(text)
+                .small()
+                .weak()
+                .color(Color32::from_rgb(160, 170, 180)),
+        );
     }
 }
 

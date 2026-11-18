@@ -59,6 +59,26 @@ pub struct LayerNode {
     /// flag, and only this flag, decides whether a layer row is a preview control or
     /// a plain structural row.
     pub op: bool,
+    /// The cook generator's schema name -- `RusdSamplePoints`, `RusdInstances`,
+    /// `RusdScatter` -- from an op layer's `op_name` (`docs/PROTOCOL.md` v1.5).
+    ///
+    /// `None` when the answer carried no `op_name`: a pre-v1.5 server, or a stack the
+    /// cook never built, where the contract's own fallback is a null
+    /// (v1.5.1: join 缺失 => `op_name`/`input` null, `output` = 条目 id). A row whose
+    /// `op_name` is `None` keeps its pre-v1.5 label.
+    pub op_name: Option<String>,
+    /// The geometry this op reads: the `input_points` prim path (v1.5.1), or `None`
+    /// for a generator driven by its own parameters.
+    ///
+    /// The subtitle prints [`PARAMETRIC`] for `None`, which is the contract's word
+    /// for exactly that.
+    pub input: Option<String>,
+    /// The op's **output layer** identifier, as the server joined it to this entry
+    /// (`CookOp.layer_id == layers[].id`, v1.5.1).
+    ///
+    /// `None` when the join is missing; the reader falls back to the layer's own id,
+    /// which is the contract's fallback (`output` = 条目 id).
+    pub output: Option<String>,
 }
 
 /// One composition arc: an edge between two layers at two prims.
@@ -140,6 +160,13 @@ impl CompositionTree {
                     // flag, and "no op rows" is exactly right for a server whose
                     // layers cannot answer `preview`.
                     op: l.get("op").and_then(Value::as_bool).unwrap_or(false),
+                    // v1.5: additive op metadata, and absent means absent. A non-op
+                    // layer is not supposed to send them (the contract says so), and a
+                    // pre-v1.5 server sends none, so every one of the three is optional
+                    // and nothing is guessed from its absence.
+                    op_name: optional_string(l, "op_name"),
+                    input: optional_string(l, "input"),
+                    output: optional_string(l, "output"),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -253,6 +280,12 @@ pub struct TreeNode {
     pub kind: TreeNodeKind,
     /// What the row says beside its icon.
     pub label: String,
+    /// A second, dimmer piece of text on the row (v1.5: an op row's
+    /// `{input} -> {output summary}`), or `None` for every row that has none.
+    ///
+    /// Carried on the row, like `op`, so the panel draws the subtitle from the row it
+    /// already draws rather than re-deriving which rows are ops.
+    pub secondary: Option<String>,
     /// The prim path this node stands for, when it stands for one: a prim node's
     /// own, an arc's *target* prim, a variant set's prim. Selecting such a row is
     /// also selecting the prim in the viewport (`docs/PROTOCOL.md` v1.2: 「点选
@@ -306,8 +339,11 @@ impl TreeNodeKind {
 /// ```
 ///
 /// A layer row that is a **cook op** (v1.4) is drawn with `op: true` and a `≤` marker,
-/// so the panel can tell a preview control from a plain structural row. Its label still
-/// carries the identifier, because that identifier is what `preview{upto}` takes.
+/// so the panel can tell a preview control from a plain structural row. From v1.5 its
+/// title is the generator's schema name ([`op_row_title`]) and its subtitle reads
+/// `{input} → {output summary}` ([`op_row_subtitle`]); the identifier that
+/// `preview{upto}` takes is still the row's `id`, and its elided form is the subtitle's
+/// second half.
 ///
 /// **The arc's target layer is a row that names it, not a second copy of its
 /// branch.** Every layer is already a root, so nesting the target's subtree under
@@ -338,6 +374,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 label: format!("→ {}", arc.target_layer),
                 prim: None,
                 op: false,
+                secondary: None,
                 children: Vec::new(),
             }]
         } else {
@@ -349,6 +386,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
             label: format!("{} → {}:{}", arc.kind, arc.target_layer, arc.target_prim),
             prim: Some(arc.source_prim.clone()),
             op: false,
+            secondary: None,
             children: target_row,
         });
     }
@@ -373,6 +411,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 },
                 prim: Some(prim.path.clone()),
                 op: false,
+                secondary: None,
                 children: vset
                     .variants
                     .iter()
@@ -386,6 +425,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                         label: v.clone(),
                         prim: Some(prim.path.clone()),
                         op: false,
+                        secondary: None,
                         children: Vec::new(),
                     })
                     .collect(),
@@ -400,12 +440,15 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         id: layer.id.clone(),
         kind: TreeNodeKind::Layer,
         label: if layer.op {
-            // A preview control (v1.4): the identifier is the `upto` value, so it must
-            // stay in the label verbatim; `≤` is the marker that says clicking it
-            // previews *up to* here rather than inspecting it.
+            // A preview control (v1.4): the row's title is what says *which* op this
+            // is, and v1.5 makes that the generator's own schema name instead of an
+            // anonymous layer identifier; `≤` is the marker that says clicking it
+            // previews *up to* here rather than inspecting it. The identifier is not
+            // lost: it is the row's subtitle's second half (`op_row_subtitle`), and
+            // it is what `preview{upto}` takes.
             format!(
                 "≤ {} [{} · {}/{}]",
-                layer.id,
+                op_row_title(layer),
                 layer.kind,
                 layer.strength,
                 tree.layers.len()
@@ -421,8 +464,60 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         },
         prim: None,
         op: layer.op,
+        secondary: layer.op.then(|| op_row_subtitle(layer)),
         children,
     }
+}
+
+/// The word an op row's subtitle prints where the op reads no geometry: `input`
+/// null means the generator is driven by its own parameters instead
+/// (`docs/PROTOCOL.md` v1.5.1).
+pub const PARAMETRIC: &str = "(parametric)";
+
+/// How many characters of an identifier an op row's subtitle shows before eliding
+/// it: v1.5.1's 「output 摘要 = identifier 截断 ≤ 20 字符 + …」.
+pub const OUTPUT_SUMMARY_CHARS: usize = 20;
+
+/// An op row's **title**: the generator's schema name (`RusdSamplePoints`,
+/// `RusdInstances`, `RusdScatter`), or the layer's own identifier when the server
+/// sent no `op_name`.
+///
+/// The fallback is the pre-v1.5 label, so a server from before this field existed
+/// draws exactly the rows it used to (`docs/PROTOCOL.md` v1.5.1: `op_name` null =>
+/// 回退 anon identifier).
+pub fn op_row_title(layer: &LayerNode) -> &str {
+    layer.op_name.as_deref().unwrap_or(layer.id.as_str())
+}
+
+/// An op row's **subtitle**: `{input} → {output summary}` (v1.5.1).
+///
+/// `input` is `None` for a generator with no input geometry, printed as
+/// [`PARAMETRIC`]; the output half is [`output_summary`] of the op's output layer.
+pub fn op_row_subtitle(layer: &LayerNode) -> String {
+    format!(
+        "{} → {}",
+        layer.input.as_deref().unwrap_or(PARAMETRIC),
+        output_summary(layer)
+    )
+}
+
+/// An op's output identifier, elided to [`OUTPUT_SUMMARY_CHARS`] characters.
+///
+/// The output layer's own id is the fallback when the server's join to
+/// `CookOp.layer_id` was missing (`docs/PROTOCOL.md` v1.5.1: join 缺失 =>
+/// `output` = 条目 id). Counted in **characters**, not bytes, so a non-ASCII
+/// identifier is elided at a boundary a reader can see.
+pub fn output_summary(layer: &LayerNode) -> String {
+    elide(layer.output.as_deref().unwrap_or(layer.id.as_str()))
+}
+
+/// [`OUTPUT_SUMMARY_CHARS`] characters, then `…` when there was more.
+pub fn elide(id: &str) -> String {
+    let mut out: String = id.chars().take(OUTPUT_SUMMARY_CHARS).collect();
+    if id.chars().count() > OUTPUT_SUMMARY_CHARS {
+        out.push('…');
+    }
+    out
 }
 
 /// One `comp_node{id}` answer, parsed into the four shapes v1.2 defines.
@@ -726,6 +821,18 @@ fn string(value: &Value, key: &str, what: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .ok_or_else(|| format!("{what}: \"{key}\" (string) required"))
+}
+
+/// A string field that may be **absent**, and whose absence means `None` rather
+/// than an error (v1.5: `op_name`/`input`/`output` are additive).
+///
+/// An explicit JSON `null` is the same as absent here, which is what the contract
+/// spells for an op with no input (`input` = null). A present but non-string value
+/// is also `None`: a wrong type must not cost the whole report, since every reader
+/// of these three fields has a fallback (`op_name` -> the layer's own identifier,
+/// `output` -> the layer's own id).
+fn optional_string(value: &Value, key: &str) -> Option<String> {
+    value.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
 fn number(value: &Value, key: &str, what: &str) -> Result<u64, String> {
@@ -1417,6 +1524,220 @@ mod tests {
         assert_eq!(
             arc_id, "arc:1",
             "the later arc replaces the earlier one for one source"
+        );
+    }
+
+    // --- v1.5: an op row says which op it is, what it reads, what it writes ----
+
+    /// A stack with the two ops v1.5 puts in the mesh -> points -> instances chain:
+    /// the sample reads a mesh, the instances op reads the points the first wrote.
+    fn op_sample() -> Value {
+        json!({
+            "layers": [
+                {"id": "anon:session", "kind": "session", "strength": 0},
+                {"id": "mesh.usda", "kind": "root", "strength": 1},
+                {"id": "op:sample_points/0", "kind": "sublayer", "strength": 2,
+                 "op": true, "op_name": "RusdSamplePoints",
+                 "input": "/World/Mesh", "output": "op:sample_points/0"},
+                {"id": "op:instances/1", "kind": "sublayer", "strength": 3,
+                 "op": true, "op_name": "RusdInstances",
+                 "input": "/World/Mesh/points", "output": "op:instances/1"},
+            ],
+            "arcs": [],
+            "prim_nodes": [],
+            "variant_sets": [],
+        })
+    }
+
+    #[test]
+    fn an_op_layer_carries_its_generator_and_its_ends() {
+        let tree = CompositionTree::parse(&op_sample()).expect("parses");
+        let sample = tree.layer("op:sample_points/0").expect("the sample op");
+        assert!(sample.op, "still a preview control (v1.4)");
+        assert_eq!(sample.op_name.as_deref(), Some("RusdSamplePoints"));
+        assert_eq!(sample.input.as_deref(), Some("/World/Mesh"));
+        assert_eq!(sample.output.as_deref(), Some("op:sample_points/0"));
+        // A non-op layer sends none of the three, and reads as none: absence is not
+        // an error and nothing is invented (the contract says the field is off them).
+        let root = tree.layer("mesh.usda").expect("the root layer");
+        assert_eq!(root.op_name, None);
+        assert_eq!(root.input, None);
+        assert_eq!(root.output, None);
+    }
+
+    #[test]
+    fn an_op_rows_title_is_the_generator_and_its_subtitle_the_two_ends() {
+        let tree = CompositionTree::parse(&op_sample()).unwrap();
+        let rows = roots(&tree);
+        let by_id = |id: &str| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("no row {id}: {:?}", rows.iter().map(|r| &r.id)))
+        };
+
+        let sample = by_id("op:sample_points/0");
+        assert!(
+            sample.label.starts_with("≤ RusdSamplePoints"),
+            "{}",
+            sample.label
+        );
+        assert_eq!(
+            sample.secondary.as_deref(),
+            Some("/World/Mesh → op:sample_points/0"),
+            "the subtitle reads input -> output"
+        );
+        // The identifier is what the click sends, and the click still sends it: the
+        // label change did not touch the wire (v1.4 unchanged).
+        assert_eq!(sample.id, "op:sample_points/0");
+
+        // A structural row has no subtitle at all.
+        assert_eq!(by_id("mesh.usda").secondary, None);
+        assert_eq!(by_id("anon:session").secondary, None);
+    }
+
+    #[test]
+    fn an_op_with_no_input_reads_as_parametric() {
+        let tree = CompositionTree::parse(&json!({
+            "layers": [
+                {"id": "city.rusd.cooked.usda", "kind": "root", "strength": 0},
+                // The parametric scatter: `input` is the contract's explicit null.
+                {"id": "rusd_scatter", "kind": "sublayer", "strength": 1, "op": true,
+                 "op_name": "RusdScatter", "input": null, "output": "rusd_scatter"},
+            ],
+            "arcs": [], "prim_nodes": [], "variant_sets": [],
+        }))
+        .expect("parses");
+        let row = roots(&tree).into_iter().find(|r| r.op).expect("the op row");
+        assert_eq!(
+            row.secondary.as_deref(),
+            Some("(parametric) → rusd_scatter"),
+            "a null input is the contract's `(parametric)`"
+        );
+        // And an omitted `input` is the same thing, not an error: v1.5.1's join is
+        // additive, so a missing field falls back exactly like a null one.
+        assert_eq!(
+            op_row_subtitle(&LayerNode {
+                id: "op".to_owned(),
+                kind: "sublayer".to_owned(),
+                strength: 1,
+                op: true,
+                op_name: Some("RusdScatter".to_owned()),
+                input: None,
+                output: None,
+            }),
+            "(parametric) → op"
+        );
+    }
+
+    #[test]
+    fn a_pre_v15_answer_keeps_the_old_label_and_no_subtitle() {
+        // The whole point of tying this to the field's presence: a server that does
+        // not send `op_name` draws the rows it always drew, identifier and all.
+        let old = json!({
+            "layers": [
+                {"id": "anon:session", "kind": "session", "strength": 0},
+                {"id": "rusd_city", "kind": "sublayer", "strength": 1, "op": true},
+            ],
+            "arcs": [], "prim_nodes": [], "variant_sets": [],
+        });
+        let tree = CompositionTree::parse(&old).expect("parses");
+        let row = roots(&tree).into_iter().find(|r| r.op).expect("the op row");
+        assert_eq!(
+            row.label, "≤ rusd_city [sublayer · 1/2]",
+            "the pre-v1.5 label, character for character"
+        );
+        assert_eq!(
+            row.secondary.as_deref(),
+            Some("(parametric) → rusd_city"),
+            "the ends still read: the layer's own id is the output fallback"
+        );
+        assert_eq!(row.id, "rusd_city");
+    }
+
+    #[test]
+    fn an_output_identifier_is_elided_at_twenty_characters() {
+        assert_eq!(elide("short"), "short");
+        let twenty = "0123456789abcdefghij";
+        assert_eq!(twenty.chars().count(), OUTPUT_SUMMARY_CHARS);
+        assert_eq!(elide(twenty), twenty, "exactly the budget is not elided");
+        assert_eq!(
+            elide("0123456789abcdefghijk"),
+            "0123456789abcdefghij…",
+            "one over the budget gets the ellipsis"
+        );
+        // Counted in characters, not bytes: a multibyte identifier is cut on a
+        // character boundary and the result is still valid text.
+        let wide = "\u{89e3}\u{6790}\u{5c42}".repeat(10);
+        let cut = elide(&wide);
+        assert_eq!(cut.chars().count(), OUTPUT_SUMMARY_CHARS + 1);
+        assert!(cut.ends_with('…'), "{cut}");
+    }
+
+    #[test]
+    fn the_output_half_is_the_servers_output_and_the_layer_id_when_it_is_missing() {
+        let mut layer = LayerNode {
+            id: "anon:op:7".to_owned(),
+            kind: "sublayer".to_owned(),
+            strength: 2,
+            op: true,
+            op_name: Some("RusdInstances".to_owned()),
+            input: Some("/World/Mesh/points".to_owned()),
+            output: Some("a_really_long_output_layer_identifier".to_owned()),
+        };
+        assert_eq!(
+            op_row_subtitle(&layer),
+            "/World/Mesh/points → a_really_long_output…"
+        );
+        layer.output = None;
+        assert_eq!(
+            op_row_subtitle(&layer),
+            "/World/Mesh/points → anon:op:7",
+            "a missing join falls back to the entry's own id (v1.5.1)"
+        );
+        assert_eq!(op_row_title(&layer), "RusdInstances");
+        layer.op_name = None;
+        assert_eq!(
+            op_row_title(&layer),
+            "anon:op:7",
+            "no generator name falls back to the identifier"
+        );
+    }
+
+    #[test]
+    fn a_wrongly_typed_op_field_does_not_cost_the_whole_report() {
+        // `op_name` as a number is a server bug, not a reason to draw no tree: the
+        // three fields are additive and each has a fallback, so the row falls back.
+        let tree = CompositionTree::parse(&json!({
+            "layers": [
+                {"id": "op_layer", "kind": "sublayer", "strength": 0, "op": true,
+                 "op_name": 7, "input": ["/World/Mesh"], "output": null},
+            ],
+            "arcs": [], "prim_nodes": [], "variant_sets": [],
+        }))
+        .expect("the report still parses");
+        let layer = tree.layer("op_layer").expect("the layer");
+        assert_eq!(layer.op_name, None);
+        assert_eq!(layer.input, None);
+        assert_eq!(layer.output, None);
+        assert!(layer.op);
+    }
+
+    #[test]
+    fn the_rows_are_in_cook_order_and_the_op_metadata_does_not_reorder_them() {
+        // v1.5.1: 行序 = cook 顺序 (strength ascending), which is what the wire's order
+        // already is. The metadata rides along; it does not sort anything.
+        let tree = CompositionTree::parse(&op_sample()).unwrap();
+        let rows = roots(&tree);
+        let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "anon:session",
+                "mesh.usda",
+                "op:sample_points/0",
+                "op:instances/1"
+            ]
         );
     }
 }
