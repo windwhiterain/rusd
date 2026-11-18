@@ -11,7 +11,9 @@
 //! What the tree answers:
 //!
 //! - **layers** — every layer the stage opened, with its kind and its rank in
-//!   the strength order (0 strongest: the session layer first).
+//!   the strength order (0 strongest: the session layer first). A layer a
+//!   generator cooked is marked `op`, and carries that node's `op_name`, its
+//!   `input` and its `output` layer (v1.5.1).
 //! - **arcs** — the edges between them: `(source layer, source prim)` to
 //!   `(target layer, target prim)`, with the arc's kind. A sublayer edge runs
 //!   from `(parent layer, "/")` to `(sublayer, "/")`.
@@ -53,6 +55,7 @@ use std::collections::BTreeMap;
 
 use openusd::sdf::{self, ChildrenKey, FieldKey, SpecType, Value as SdfValue};
 use openusd::usd::{PrimPredicate, Stage};
+use rusd_proc::CookOp;
 use serde_json::{Value, json};
 
 /// The composition tree of one stage (`composition_tree{}`), and the details of
@@ -73,6 +76,15 @@ struct LayerEntry {
     /// v1.4): a generator's authored sublayer, which a preview can stop the
     /// composition at. See [`cook_output_layer`].
     op: bool,
+    /// The **generator** that wrote this layer (PROTOCOL v1.5.1), when the tree
+    /// was built with the cook's [`CookOp`] list and one of its rows names this
+    /// layer as its output. Always `None` on a layer that is not an op.
+    op_name: Option<String>,
+    /// The `input_points` prim the generator read. `None` when it read no
+    /// geometry at all — a parametric generator — and when no cook op answered
+    /// for this layer; the wire tells those two apart by [`LayerEntry::op`] and
+    /// reports both as `null`.
+    op_input: Option<String>,
 }
 
 /// Whether `id` is a cook output layer of this stage: a layer the cook inserted
@@ -140,8 +152,15 @@ struct LayerScan {
 }
 
 impl CompositionTree {
-    /// Build the tree of `stage`.
-    pub fn build(stage: &Stage) -> Self {
+    /// Build the tree of `stage`, naming each cook output layer after the
+    /// [`CookOp`] whose `layer_id` that layer is (PROTOCOL v1.5.1). `ops` is the
+    /// latest pass's list, in cook order; a layer no row names keeps the `null`
+    /// fallback rather than being left out.
+    ///
+    /// An empty `ops` is the join-fell-through case: a stage assembled by hand,
+    /// whose layers the cook never wrote, reports `null` generator and input on
+    /// every op row instead of being labelled with someone else's node.
+    pub fn build_with_ops(stage: &Stage, ops: &[CookOp]) -> Self {
         let _ = stage.traverse(PrimPredicate::ALL, |_| {});
         let root_id = stage.root_layer().identifier().to_owned();
         let session_id = stage.session_layer().map(|l| l.identifier().to_owned());
@@ -197,11 +216,22 @@ impl CompositionTree {
                 } else {
                     "sublayer"
                 };
+                let op = cook_output_layer(&scan.id, &root_id, &root_sublayers);
+                // The join: the cook names its output layers, and this layer's
+                // identifier is the key. A layer the cook did not write (or a
+                // tree built without the cook's list) matches nothing.
+                let joined = if op {
+                    ops.iter().find(|o| o.layer_id == scan.id)
+                } else {
+                    None
+                };
                 LayerEntry {
                     id: scan.id.clone(),
                     kind,
                     strength,
-                    op: cook_output_layer(&scan.id, &root_id, &root_sublayers),
+                    op,
+                    op_name: joined.map(|o| o.generator.clone()),
+                    op_input: joined.and_then(|o| o.input.clone()),
                 }
             })
             .collect();
@@ -218,12 +248,23 @@ impl CompositionTree {
     /// The wire shape of `composition_tree{}`.
     pub fn to_json(&self) -> Value {
         json!({
-            "layers": self.layers.iter().map(|l| json!({
-                "id": l.id,
-                "kind": l.kind,
-                "strength": l.strength,
-                "op": l.op,
-            })).collect::<Vec<_>>(),
+            "layers": self.layers.iter().map(|l| {
+                let mut row = json!({
+                    "id": l.id,
+                    "kind": l.kind,
+                    "strength": l.strength,
+                    "op": l.op,
+                });
+                // PROTOCOL v1.5.1: only an op row carries the generator's name
+                // and its input; the three fields are additive, so a client that
+                // predates them ignores what it does not know.
+                if l.op {
+                    row["op_name"] = json!(l.op_name);
+                    row["input"] = json!(l.op_input);
+                    row["output"] = json!(l.id);
+                }
+                row
+            }).collect::<Vec<_>>(),
             "arcs": self.arcs.iter().map(|a| json!({
                 "id": a.id,
                 "kind": a.kind,
@@ -1072,7 +1113,7 @@ mod tests {
         write_asset(scratch.path());
         write_root(scratch.path(), true);
         let stage = scratch.open();
-        let tree = CompositionTree::build(&stage).to_json();
+        let tree = CompositionTree::build_with_ops(&stage, &[]).to_json();
 
         let layers: Vec<&str> = tree["layers"]
             .as_array()
@@ -1129,7 +1170,7 @@ mod tests {
         write_asset(scratch.path());
         write_root(scratch.path(), true);
         let stage = scratch.open();
-        let tree = CompositionTree::build(&stage);
+        let tree = CompositionTree::build_with_ops(&stage, &[]);
         let json = tree.to_json();
         let id = json["arcs"]
             .as_array()
@@ -1231,7 +1272,7 @@ mod tests {
         layer.save().expect("save the root layer");
 
         let stage = scratch.open();
-        let tree = CompositionTree::build(&stage);
+        let tree = CompositionTree::build_with_ops(&stage, &[]);
         let json = tree.to_json();
         let sets = json["variant_sets"].as_array().expect("variant_sets");
         assert_eq!(sets.len(), 1, "one set: {json}");
@@ -1318,7 +1359,7 @@ mod tests {
         layer.save().expect("save the root layer");
 
         let stage = scratch.open();
-        let tree = CompositionTree::build(&stage).to_json();
+        let tree = CompositionTree::build_with_ops(&stage, &[]).to_json();
         let arc = tree["arcs"]
             .as_array()
             .unwrap()
@@ -1340,8 +1381,8 @@ mod tests {
         write_asset(scratch.path());
         write_root(scratch.path(), true);
         let stage = scratch.open();
-        let a = CompositionTree::build(&stage).to_json();
-        let b = CompositionTree::build(&stage).to_json();
+        let a = CompositionTree::build_with_ops(&stage, &[]).to_json();
+        let b = CompositionTree::build_with_ops(&stage, &[]).to_json();
         assert_eq!(a, b, "the tree is deterministic: no map order reaches it");
     }
 
@@ -1476,7 +1517,7 @@ mod tests {
     #[test]
     fn the_tree_flags_the_cook_output_layers() {
         let stage = cooked_stack(&["rusd_city.usda", "rusd_scatter.usda"]);
-        let tree = CompositionTree::build(&stage).to_json();
+        let tree = CompositionTree::build_with_ops(&stage, &[]).to_json();
         let rows: Vec<(String, bool)> = tree["layers"]
             .as_array()
             .expect("layers")
@@ -1499,10 +1540,139 @@ mod tests {
             "the root layer is not an op: {rows:?}"
         );
         // The flag survives to `comp_node`'s layer detail.
-        let tree = CompositionTree::build(&stage);
+        let tree = CompositionTree::build_with_ops(&stage, &[]);
         let detail = tree
             .node(&stage, ops[0])
             .expect("the op layer has a detail");
         assert_eq!(detail["op"].as_bool(), Some(true), "{detail}");
+    }
+
+    /// One `CookOp` of a pass's list, in cook order.
+    fn op(node: &str, generator: &str, input: Option<&str>, layer_id: &str) -> CookOp {
+        CookOp {
+            id: node.to_owned(),
+            generator: generator.to_owned(),
+            input: input.map(str::to_owned),
+            layer_id: layer_id.to_owned(),
+        }
+    }
+
+    /// The tree's `layers` rows that are ops, keyed by their id.
+    fn op_rows(json: &Value) -> BTreeMap<String, Value> {
+        json["layers"]
+            .as_array()
+            .expect("layers is an array")
+            .iter()
+            .filter(|l| l["op"].as_bool() == Some(true))
+            .map(|l| (l["id"].as_str().unwrap_or_default().to_owned(), l.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn an_op_row_is_joined_to_the_cook_op_whose_layer_id_it_is() {
+        let stage = cooked_stack(&["rusd_city.usda", "rusd_scatter.usda"]);
+        let ids = cook_output_layers(&stage);
+        let ops = [
+            op("/World/City", "RusdStreetGrid", None, &ids[0]),
+            op(
+                "/World/StreetProps",
+                "RusdScatter",
+                Some("/World/Dots"),
+                &ids[1],
+            ),
+        ];
+        let tree = CompositionTree::build_with_ops(&stage, &ops).to_json();
+        let rows = op_rows(&tree);
+        assert_eq!(rows.len(), 2, "one row per cook output layer: {tree}");
+
+        let city = &rows[&ids[0]];
+        assert_eq!(city["op_name"].as_str(), Some("RusdStreetGrid"), "{city}");
+        assert_eq!(city["input"], Value::Null, "a parametric generator: {city}");
+        assert_eq!(
+            city["output"].as_str(),
+            Some(ids[0].as_str()),
+            "output is the layer the generator wrote, and the row's own id: {city}"
+        );
+
+        let scatter = &rows[&ids[1]];
+        assert_eq!(
+            scatter["op_name"].as_str(),
+            Some("RusdScatter"),
+            "{scatter}"
+        );
+        assert_eq!(
+            scatter["input"].as_str(),
+            Some("/World/Dots"),
+            "the `input_points` parameter reaches the wire: {scatter}"
+        );
+        assert_eq!(
+            scatter["output"].as_str(),
+            Some(ids[1].as_str()),
+            "{scatter}"
+        );
+    }
+
+    #[test]
+    fn a_join_that_finds_nothing_reports_null_rather_than_guessing() {
+        // A stage assembled by hand: the cook never wrote these layers, so no
+        // `CookOp` names them, and PROTOCOL v1.5.1's fallback is what the wire
+        // says — the layer is still an op (it is a cook output sublayer), it
+        // just has no generator to name.
+        let stage = cooked_stack(&["rusd_city.usda"]);
+        let ids = cook_output_layers(&stage);
+        let tree = CompositionTree::build_with_ops(&stage, &[]).to_json();
+        let row = &op_rows(&tree)[&ids[0]];
+        assert_eq!(row["op"].as_bool(), Some(true), "still an op: {row}");
+        assert_eq!(row["op_name"], Value::Null, "{row}");
+        assert_eq!(row["input"], Value::Null, "{row}");
+        assert_eq!(
+            row["output"].as_str(),
+            Some(ids[0].as_str()),
+            "the fallback's output is the row's own id: {row}"
+        );
+    }
+
+    #[test]
+    fn the_join_keys_on_the_layer_id_not_on_position_or_name() {
+        // The list a rebuild threw away: its `layer_id`s name layers of a stage
+        // that no longer exists, and one of its rows does name this layer. The
+        // join must take that row and not the one that merely comes first.
+        let stage = cooked_stack(&["rusd_city.usda"]);
+        let ids = cook_output_layers(&stage);
+        let stale = [
+            op(
+                "/World/City",
+                "RusdStreetGrid",
+                None,
+                "anon:1:rusd_city.usda",
+            ),
+            op("/World/Elsewhere", "RusdScatter", None, &ids[0]),
+        ];
+        let tree = CompositionTree::build_with_ops(&stage, &stale).to_json();
+        let row = &op_rows(&tree)[&ids[0]];
+        assert_eq!(
+            row["op_name"].as_str(),
+            Some("RusdScatter"),
+            "the join is by layer id, not by position or file name: {row}"
+        );
+        assert_eq!(row["input"], Value::Null, "{row}");
+    }
+
+    #[test]
+    fn a_non_op_row_has_no_cook_metadata_at_all() {
+        let stage = cooked_stack(&["rusd_city.usda"]);
+        let ids = cook_output_layers(&stage);
+        let ops = [op("/World/City", "RusdStreetGrid", None, &ids[0])];
+        let tree = CompositionTree::build_with_ops(&stage, &ops).to_json();
+        for row in tree["layers"]
+            .as_array()
+            .expect("layers is an array")
+            .iter()
+            .filter(|l| l["op"].as_bool() != Some(true))
+        {
+            assert!(row.get("op_name").is_none(), "not an op: {row}");
+            assert!(row.get("input").is_none(), "not an op: {row}");
+            assert!(row.get("output").is_none(), "not an op: {row}");
+        }
     }
 }
