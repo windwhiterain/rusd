@@ -138,6 +138,7 @@ fn a_scene_and_its_fitted_view_with_no_input_draw_the_fitted_camera() {
     worker.send(RenderCommand::View {
         orbit: fit,
         selection: None,
+        only_selected: false,
     });
 
     // No input at all from here on: the thread must produce the fitted frame by
@@ -235,6 +236,7 @@ fn a_batch_of_commands_produces_one_frame_with_the_last_camera() {
     worker.send(RenderCommand::View {
         orbit: composed,
         selection: None,
+        only_selected: false,
     });
     // A camera that is neither the scene's nor the final one: it must not survive.
     let mut mid = composed;
@@ -242,10 +244,12 @@ fn a_batch_of_commands_produces_one_frame_with_the_last_camera() {
     worker.send(RenderCommand::View {
         orbit: mid,
         selection: None,
+        only_selected: false,
     });
     worker.send(RenderCommand::View {
         orbit: fit,
         selection: None,
+        only_selected: false,
     });
     worker.send(RenderCommand::Resize {
         width: 324,

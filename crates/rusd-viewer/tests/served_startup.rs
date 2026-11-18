@@ -220,6 +220,7 @@ fn a_real_server_delivers_the_snapshot_after_startup_is_finished() {
         worker.send(rusd_viewer::net::RenderCommand::View {
             orbit: rusd_viewer::camera::Orbit::from_camera(&cam),
             selection: None,
+            only_selected: false,
         });
     }
     let rendered = Instant::now() + Duration::from_secs(30);

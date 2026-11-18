@@ -373,10 +373,17 @@ fn row(
             }
         });
     } else {
-        // `default_open` only at the top: 434 prim rows under a layer must not all
-        // be laid out before the user has opened anything.
+        // **Collapsed unless the row is a layer root** (v1.5.4). A layer's children
+        // have to be visible -- they are the arcs and variant sets the panel exists
+        // to show -- but a row that stands for a *prim* is where a 240-instance
+        // cluster stops being 240 rows of noise: those open on a click, one at a
+        // time.
+        //
+        // The click on the header is the row's own click (`selectable` + `clicked`),
+        // and the arrow beside it is the only thing that expands: one row, one
+        // meaning, which is the same rule a control row follows.
         let header = egui::CollapsingHeader::new(text)
-            .id_salt(&node.id)
+            .id_salt((&node.id, depth))
             .default_open(depth == 0)
             .show(ui, |ui| {
                 for child in &node.children {
@@ -452,6 +459,17 @@ fn subtitle(ui: &mut egui::Ui, node: &TreeNode) {
 }
 
 /// Draw the detail of the selected node (`comp_node{id}`), or why there is none.
+///
+/// **A prim's detail is drawn by layer** (the user's ruling: 详情面板一律以「层」为主语).
+/// A picked mesh -- from the viewport, or from an arc class's opened instance row --
+/// is shown as one section per layer that authors it: the layer's own header (id, kind,
+/// strength, and a cook op's generator name), then that layer's specifier and the
+/// attributes it authors. The panel therefore answers "which layer says this", which
+/// is the question a composite stack is read with, rather than "what does this prim
+/// have".
+///
+/// Every other detail keeps its flat lines: a layer's own text, an arc's target spec,
+/// a variant set's variants -- each is already about one layer.
 pub fn detail_panel(ui: &mut egui::Ui, panel: &TreePanel) {
     ui.label(RichText::new("详情").strong());
     if let Some(err) = &panel.detail_error {
@@ -466,10 +484,49 @@ pub fn detail_panel(ui: &mut egui::Ui, panel: &TreePanel) {
         .id_salt("comp-node-detail")
         .auto_shrink([false, false])
         .show(ui, |ui| {
+            if let NodeDetail::Prim(p) = detail {
+                prim_detail(ui, p, panel.model.tree());
+                return;
+            }
             for line in detail.lines() {
                 ui.label(RichText::new(line).monospace());
             }
         });
+}
+
+/// One prim's detail, **by layer**: a header naming the prim, then a section per layer.
+///
+/// Pure text layout, no widgets that could take a click: a detail is read, not driven.
+/// The section order is `comp_node`'s own (strongest layer first), so what is at the top
+/// of the panel is what the composite is decided by.
+pub fn prim_detail(
+    ui: &mut egui::Ui,
+    detail: &crate::tree::PrimDetail,
+    tree: Option<&crate::tree::CompositionTree>,
+) {
+    ui.label(
+        RichText::new(format!("prim {}", detail.path))
+            .monospace()
+            .strong(),
+    );
+    ui.label(
+        RichText::new(format!(
+            "{} 层写过它 · {} arcs out · {} variant sets",
+            detail.opinions.len(),
+            detail.arcs_out.len(),
+            detail.variant_sets.len()
+        ))
+        .small()
+        .weak(),
+    );
+    ui.add_space(2.0);
+    for section in detail.layer_sections(tree) {
+        ui.add_space(4.0);
+        ui.label(RichText::new(format!("── {}", section.header)).strong());
+        for line in section.lines() {
+            ui.label(RichText::new(format!("    {line}")).monospace());
+        }
+    }
 }
 
 /// What the capture toolbar asks the shell to do.
@@ -658,15 +715,23 @@ mod tests {
 
     #[test]
     fn no_prim_rows_are_drawn_and_a_layer_row_copies_nothing() {
-        // v1.3 (`docs/PROTOCOL.md` 末节): the panel draws no prim rows — a picked prim
-        // is inspected in the viewport instead. The clipboard rule itself is unchanged
-        // and is covered from the pick side in `tests/tree_v13.rs`.
+        // v1.3 (`docs/PROTOCOL.md` 末节): a layer draws no rows for the prims it
+        // *authors* -- a picked prim is inspected in the viewport instead. v1.5.4
+        // adds one kind of prim row (an arc class's instances, under the arc), so the
+        // assertion is about what hangs off a **layer**, which is what v1.3 ruled out.
+        // The clipboard rule itself is unchanged and is covered from the pick side in
+        // `tests/tree_v13.rs`.
         let mut panel = TreePanel::new();
         panel.apply_tree(Ok(sample_tree()));
         let rows = rows(&panel);
+        let under_a_layer: Vec<&str> = rows
+            .iter()
+            .filter(|(depth, n)| *depth == 1 && n.kind == TreeNodeKind::Prim)
+            .map(|(_, n)| n.label.as_str())
+            .collect();
         assert!(
-            !rows.iter().any(|(_, n)| n.kind == TreeNodeKind::Prim),
-            "the tree panel must not draw prim rows"
+            under_a_layer.is_empty(),
+            "a layer must not draw the prims it authors: {under_a_layer:?}"
         );
         let layer = rows
             .iter()

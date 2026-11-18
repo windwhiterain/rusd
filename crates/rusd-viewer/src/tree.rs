@@ -111,6 +111,109 @@ impl ArcNode {
     }
 }
 
+/// The key v1.5.4 groups arcs by: **the edge class**, with `source_prim` left out
+/// (`docs/PROTOCOL.md` v1.5.4: the aggregation key is `(kind, source_layer,
+/// target_layer, target_prim)`).
+///
+/// `source_prim` is exactly the one field that tells 240 instances of a reference
+/// apart (`/World/Tufts/i000000` .. `i000239`), which is why it is not part of the
+/// key: the class is what the panel draws once, and the instances are what an
+/// opened row lists.
+///
+/// Ordered so grouping is deterministic, and so a group's place in the list is the
+/// place its first arc had -- never a hash's order.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ArcGroupKey {
+    pub kind: String,
+    pub source_layer: String,
+    pub target_layer: String,
+    pub target_prim: String,
+}
+
+impl ArcNode {
+    /// This arc's [`ArcGroupKey`].
+    pub fn group_key(&self) -> ArcGroupKey {
+        ArcGroupKey {
+            kind: self.kind.clone(),
+            source_layer: self.source_layer.clone(),
+            target_layer: self.target_layer.clone(),
+            target_prim: self.target_prim.clone(),
+        }
+    }
+}
+
+/// One row's worth of arcs: every arc of one class that one layer authors.
+///
+/// **The wire is untouched.** `docs/PROTOCOL.md` v1.5.4 keeps reporting each arc
+/// one per line ("wire 的 `arcs` 仍逐条上报（无损，其它 client 可自取）"), so
+/// [`CompositionTree::arcs`] still holds all 240 and the panel's "242 arc" count is
+/// still the true count. Grouping is a *drawing* decision, made here and nowhere
+/// else.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArcGroup<'a> {
+    pub key: ArcGroupKey,
+    /// The arcs of this class, in wire order.
+    pub arcs: Vec<&'a ArcNode>,
+}
+
+impl<'a> ArcGroup<'a> {
+    /// How many arcs the row stands for: the `N` of `xN`.
+    pub fn count(&self) -> usize {
+        self.arcs.len()
+    }
+
+    /// The arc a **single** row's id comes from: the first in wire order, so the id
+    /// a click sends is deterministic, and it is the id this row sent before there
+    /// were groups ([`ArcGroup::label`]'s N = 1 case).
+    pub fn representative(&self) -> &'a ArcNode {
+        self.arcs[0]
+    }
+
+    /// The prims the group's arcs are authored on, in wire order: the
+    /// `/World/Tufts/i000000` .. list an opened row shows.
+    ///
+    /// One entry per arc and not deduplicated: two arcs of one class authored on one
+    /// prim are two arcs the server reported, and the opened row must not hide one.
+    pub fn source_prims(&self) -> Vec<&'a str> {
+        self.arcs.iter().map(|a| a.source_prim.as_str()).collect()
+    }
+
+    /// The row's label: where the edge points, and `xN` when it stands for more than
+    /// one arc (v1.5.4: a group of N >= 2 gets the suffix, N = 1 does not).
+    pub fn label(&self) -> String {
+        let edge = format!(
+            "{} \u{2192} {}:{}",
+            self.key.kind, self.key.target_layer, self.key.target_prim
+        );
+        match self.count() {
+            1 => edge,
+            n => format!("{edge} \u{00d7}{n}"),
+        }
+    }
+}
+
+/// The arcs authored in `layer`, **grouped** by [`ArcGroupKey`] (v1.5.4), in the
+/// order each class first appears in the wire's list.
+///
+/// Grouping per layer rather than per tree is what keeps the rows where they were: an
+/// arc is drawn under the layer that authors it, and two layers referencing one
+/// target are two groups (their `source_layer` differs, so they were never one
+/// class).
+pub fn arc_groups<'a>(tree: &'a CompositionTree, layer: &str) -> Vec<ArcGroup<'a>> {
+    let mut out: Vec<ArcGroup<'a>> = Vec::new();
+    for arc in tree.arcs_from(layer) {
+        let key = arc.group_key();
+        match out.iter_mut().find(|g| g.key == key) {
+            Some(group) => group.arcs.push(arc),
+            None => out.push(ArcGroup {
+                key,
+                arcs: vec![arc],
+            }),
+        }
+    }
+    out
+}
+
 /// One composed prim, and the layers that author a spec for it, strongest first.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrimNode {
@@ -374,18 +477,32 @@ impl TreeNodeKind {
 
 /// Build the panel's roots: one subtree per layer, in **draw order** (the stack in
 /// strength order, each run of cook op rows in cook order), and under each layer its
-/// arcs and its variant sets.
+/// arcs and its variant sets. An arc class is one row, and the prims its arcs
+/// are authored on are that row's children (v1.5.4).
 ///
-/// The shape, in the order the panel draws it (v1.3, `docs/PROTOCOL.md` 末节 —
-/// **no prim rows**: a stacked city has hundreds, and a prim is inspected by picking
-/// it in the viewport, which resolves its path to a `prim_nodes[].id`):
+/// The shape, in the order the panel draws it (v1.3, `docs/PROTOCOL.md` 末节 --
+/// **no prim rows for the prims a layer *authors*:** a stacked city has hundreds, and
+/// such a prim is inspected by picking it in the viewport, which resolves its path to
+/// a `prim_nodes[].id`):
 ///
 /// ```text
-/// <layer id>  [kind, strength]        ← a root, strongest first (session on top)
-///   ↳ arc:<n>  kind → target_layer:target_prim
-///   ↳ vset:<n> name = selection       ← structure, so it stays
+/// <layer id>  [kind, strength]        <- a root, strongest first (session on top)
+///   ↳ arc:<n>  kind → target_layer:target_prim          <- one edge (N = 1)
+///   ↳ arc  kind → target_layer:target_prim ×N           <- N edges of one class
+///       ↳ prim:/World/Tufts/i000000                     <- the prims they author on
+///       ↳ prim:/World/Tufts/i000001
+///       ↳ ...
+///   ↳ vset:<n> name = selection       <- structure, so it stays
 ///       ↳ variant name
 /// ```
+///
+/// **An edge class is one row** (v1.5.4, `docs/PROTOCOL.md`): arcs that agree on
+/// `(kind, source_layer, target_layer, target_prim)` are drawn once, with `×N` when
+/// there are N >= 2 of them, and **the instances are the rows under it** -- a
+/// 240-instance reference cluster has to be walkable down to one mesh, which is what
+/// the user asked for after the dedup. Those instance rows are the *only* prim rows
+/// the tree draws, and they are there because their group was opened, not because a
+/// layer authors them.
 ///
 /// A layer row that is a **cook op** (v1.4) is drawn with `op: true` and a `≤` marker,
 /// so the panel can tell a preview control from a plain structural row. From v1.5 its
@@ -424,14 +541,14 @@ pub fn roots(tree: &CompositionTree) -> Vec<TreeNode> {
 fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     let mut children: Vec<TreeNode> = Vec::new();
 
-    for arc in tree.arcs_from(&layer.id) {
+    for group in arc_groups(tree, &layer.id) {
         // A leaf naming the target layer (see `roots`): the edge is visible, and
         // the branch it points at is not copied.
-        let target_row = if arc.crosses_layers() {
+        let mut kids: Vec<TreeNode> = if group.representative().crosses_layers() {
             vec![TreeNode {
-                id: arc.target_layer.clone(),
+                id: group.key.target_layer.clone(),
                 kind: TreeNodeKind::Layer,
-                label: format!("→ {}", arc.target_layer),
+                label: format!("\u{2192} {}", group.key.target_layer),
                 prim: None,
                 op: false,
                 root: false,
@@ -441,15 +558,71 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         } else {
             Vec::new()
         };
+        // **The group's instances, as rows** (v1.5.4, and the user's follow-up: a
+        // 240-way cluster has to be walkable down to one mesh). One row per arc,
+        // naming the prim that arc is authored on; the rows are collapsed until the
+        // row above is opened, which is the whole point of the aggregation.
+        //
+        // A clicked instance row is an ordinary prim row: its `prim` is the arc's
+        // `source_prim`, so `Shell::on_tree_select` selects that prim in the
+        // viewport, copies its path and asks `comp_node` for its detail -- the same
+        // path a viewport pick takes. An N = 1 group gets its one row too
+        // (v1.5.4: N = 1 时源 prim 行仍可展开).
+        //
+        // The **pseudo-root** authors no instance row: a `subLayer` arc reports
+        // `source_prim: "/"`, which is the stage itself and not a mesh an instance
+        // stands for ([`is_pseudo_root`]). Without that, every sublayer edge would
+        // grow a `prim:/` child that selects the whole stage.
+        kids.extend(
+            group
+                .arcs
+                .iter()
+                .filter(|arc| !is_pseudo_root(&arc.source_prim))
+                .map(|arc| TreeNode {
+                    // A row that stands for a prim carries that prim's node id, which is
+                    // the only id `comp_node` takes for one (the server's own spelling,
+                    // [`prim_node_id`]). Nothing is looked up in `prim_nodes` first: a
+                    // report may legitimately not describe a cook output's prims, and
+                    // then the ask earns one `-32602` detail line rather than the row
+                    // silently naming an arc instead of the prim it says it is.
+                    id: prim_node_id(&arc.source_prim),
+                    kind: TreeNodeKind::Prim,
+                    label: arc.source_prim.clone(),
+                    prim: Some(arc.source_prim.clone()),
+                    op: false,
+                    root: false,
+                    secondary: None,
+                    children: Vec::new(),
+                }),
+        );
+        // **What the row's click means** (v1.5.4 + the user's follow-up).
+        //
+        // A **single** edge keeps exactly the id and the selection it had before there
+        // were groups (v1.5.4: 点击语义不变): `arc:<n>`, and the prim it is authored on.
+        //
+        // A group of several is an edge *class*, and an edge selects **no** prim
+        // (「聚合行自身点击：仍不选 prim（它是一条边）」): `prim: None` is what says so
+        // -- `TreeSelection::prim` is the field every selection side effect reads
+        // (the viewport's selection, the clipboard toast, the re-render), so `None`
+        // there is the whole of "this click picks nothing". Its detail is still asked,
+        // of the prim the edges point at (`comp_node{目标}`), which is the node whose
+        // layer view says what the class is -- the contract's 「该行仍选择目标 prim
+        // （comp_node{目标}）」, honoured for the *ask* while the viewport stays put.
+        let (id, prim) = if group.count() == 1 {
+            let arc = group.representative();
+            (arc.id.clone(), Some(arc.source_prim.clone()))
+        } else {
+            (prim_node_id(&group.key.target_prim), None)
+        };
         children.push(TreeNode {
-            id: arc.id.clone(),
+            id,
             kind: TreeNodeKind::Arc,
-            label: format!("{} → {}:{}", arc.kind, arc.target_layer, arc.target_prim),
-            prim: Some(arc.source_prim.clone()),
+            label: group.label(),
+            prim,
             op: false,
             root: false,
             secondary: None,
-            children: target_row,
+            children: kids,
         });
     }
 
@@ -531,6 +704,48 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         root: is_root_layer(layer),
         secondary: layer.op.then(|| op_row_subtitle(layer)),
         children,
+    }
+}
+
+/// The `comp_node` id of the prim at `path`.
+///
+/// `prim:<path>` is the server's own spelling (`rusd-agent`'s `composition_tree`
+/// emits exactly this), so a row built here asks the same question a viewport pick
+/// asks: a pick resolves its path through `prim_nodes`
+/// ([`CompositionTree::prim_id`]), and this is that id's shape. It is **not** an
+/// invented id -- the alternative at the call sites is an arc id on a row whose
+/// click means "this prim", which is a different question with a different answer.
+pub fn prim_node_id(path: &str) -> String {
+    format!("prim:{path}")
+}
+
+/// Whether `path` is the **pseudo-root** -- `"/"`, the stage itself.
+///
+/// An arc reports the pseudo-root as its `source_prim` when the edge is authored
+/// *at the stage* rather than at a prim (`subLayer` always is: the root layer's
+/// sublayers are composed at `/`), and the stage is not a prim an instance stands
+/// for. So it gets no instance row: `prim:/` would select the whole stage.
+pub fn is_pseudo_root(path: &str) -> bool {
+    path == "/"
+}
+
+/// The header line of a layer section in a prim's detail: the layer, and what the tree
+/// knows about it.
+///
+/// ``{id} [{kind} \u{00b7} {strength}/{count}]`` with an op's generator name beside it
+/// -- the same facts, in the same words, that the layer's own row prints, so a section
+/// and the row it came from read as one thing. `None` is a layer the tree does not
+/// list: its identifier alone, because a kind or a rank would have to be invented.
+pub fn layer_header(id: &str, layer: Option<&LayerNode>) -> String {
+    let Some(layer) = layer else {
+        return id.to_owned();
+    };
+    match &layer.op_name {
+        Some(name) => format!(
+            "{} [{} \u{00b7} {}] {name}",
+            layer.id, layer.kind, layer.strength
+        ),
+        None => format!("{} [{} \u{00b7} {}]", layer.id, layer.kind, layer.strength),
     }
 }
 
@@ -638,6 +853,37 @@ pub struct PrimDetail {
     pub variant_sets: Vec<String>,
 }
 
+impl PrimDetail {
+    /// This detail as **layer sections**, layer first: one section per layer that
+    /// authors a spec for the prim, in the server's strength order (the user's ruling:
+    /// 详情面板一律以「层」为主语 -- 用户要看到的是 layer).
+    ///
+    /// `tree` supplies the header's own facts -- a layer's `kind` and `strength`, and
+    /// the generator name of a cook op's output layer. A layer `comp_node` names but the
+    /// tree does not list (a report that arrived before `composition_tree`, or a stack
+    /// that has since changed) still gets its section, headed by its identifier alone:
+    /// the opinion is a fact, and hiding it would be worse than a plain header.
+    ///
+    /// The sections are built by grouping `comp_node`'s own `opinions` while the server
+    /// has no `layer{id}` method (v1.5.5). `opinions` is already one entry per layer and
+    /// already in strength order, so grouping is a reformat: nothing is merged and
+    /// nothing re-sorted, which is what keeps "讲到哪一层就是哪一层" true by construction.
+    pub fn layer_sections(&self, tree: Option<&CompositionTree>) -> Vec<LayerSection> {
+        self.opinions
+            .iter()
+            .map(|op| {
+                let known = tree.and_then(|t| t.layer(&op.layer));
+                LayerSection {
+                    layer: op.layer.clone(),
+                    header: layer_header(&op.layer, known),
+                    specifier: op.specifier.clone(),
+                    fields: op.fields.clone(),
+                }
+            })
+            .collect()
+    }
+}
+
 /// One layer's opinion about a prim: its specifier and the fields it authors.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Opinion {
@@ -645,6 +891,47 @@ pub struct Opinion {
     /// `def` / `over` / `class` (empty when the spec carries none).
     pub specifier: String,
     pub fields: Vec<NamedValue>,
+}
+
+/// One **layer's section** of a prim's detail (the user's ruling: 详情面板一律以「层」
+/// 为主语 -- 用户要看到的是 layer).
+///
+/// The title is the layer -- its identifier, its kind and its strength, plus the
+/// generator's name when it is a cook op's output -- and the body is what **that
+/// layer** says about the prim: the spec's own type and the attributes it authors.
+///
+/// This is the shape the panel draws, and the shape a test asserts against, so the two
+/// cannot disagree about which layer says what. While the server has no
+/// `layer{id}` method (v1.5.5), the sections are built by grouping `comp_node`'s
+/// `opinions` on their `layer` field -- the wire keeps its own order, and the grouping
+/// only reformats it. When that method arrives, a section's fields come from it and the
+/// header keeps this spelling.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerSection {
+    /// The layer identifier, which is also the layer row's id.
+    pub layer: String,
+    /// The header line: the identifier and what the tree knows about it.
+    pub header: String,
+    /// `def` / `over` / `class`.
+    pub specifier: String,
+    /// The fields this layer authors on the prim, in the server's order.
+    pub fields: Vec<NamedValue>,
+}
+
+impl LayerSection {
+    /// The section's body: one line per authored attribute, `spec_type name = value`.
+    pub fn lines(&self) -> Vec<String> {
+        self.fields
+            .iter()
+            .map(|f| {
+                if self.specifier.is_empty() {
+                    format!("{} = {}", f.name, f.value_text())
+                } else {
+                    format!("{} {} = {}", self.specifier, f.name, f.value_text())
+                }
+            })
+            .collect()
+    }
 }
 
 /// A variant set's detail: its variants, the selection, and who authors each.
@@ -802,18 +1089,25 @@ impl NodeDetail {
                 out
             }
             NodeDetail::Prim(p) => {
-                let mut out = vec![
-                    format!("prim {}", p.path),
-                    format!(
-                        "{} opinions · {} arcs out · {} variant sets",
-                        p.opinions.len(),
-                        p.arcs_out.len(),
-                        p.variant_sets.len()
-                    ),
-                ];
-                for o in &p.opinions {
-                    out.push(format!("  {} ({})", o.layer, o.specifier));
-                    for f in &o.fields {
+                // **By layer, layer first** (the user's ruling): the detail says which
+                // *layer* says what, not which prim has opinions. Each section is headed
+                // by the layer and followed by that layer's spec line and attributes.
+                //
+                // `lines()` has no tree here, so the headers are the bare ones
+                // [`layer_header`] gives for an unknown layer; the panel draws
+                // [`PrimDetail::layer_sections`] with the tree, which is what knows a
+                // layer's kind and strength. Both share this body's grouping, and the
+                // panel's copy is the one with the fuller headers.
+                let mut out = vec![format!("prim {}", p.path)];
+                out.push(format!(
+                    "{} layers author it · {} arcs out · {} variant sets",
+                    p.opinions.len(),
+                    p.arcs_out.len(),
+                    p.variant_sets.len()
+                ));
+                for op in &p.opinions {
+                    out.push(format!("\u{2500}\u{2500} {} [{}]", op.layer, op.specifier));
+                    for f in &op.fields {
                         out.push(format!("    {} = {}", f.name, f.value_text()));
                     }
                 }
@@ -1295,15 +1589,25 @@ mod tests {
 
     #[test]
     fn the_variant_set_stays_even_though_its_prim_row_does_not() {
-        // v1.3: prim rows are gone from the tree (`docs/PROTOCOL.md` 末节), but a
-        // variant set is *structure* and must still be drawn and expandable —
+        // v1.3: a layer's *authored* prims get no rows (`docs/PROTOCOL.md` 末节), but a
+        // variant set is *structure* and must still be drawn and expandable --
         // otherwise dropping prim rows would silently drop variants too.
+        //
+        // v1.5.4 draws one more kind of prim row: an arc class's instances, under the
+        // arc. That is why the assertion below is about a prim row's *reason* rather
+        // than its presence: no prim row hangs off a layer as something the layer
+        // authors.
         let tree = CompositionTree::parse(&sample()).unwrap();
         let roots = roots(&tree);
         let rows = flatten(&roots);
+        let authored_rows: Vec<&str> = rows
+            .iter()
+            .filter(|(depth, n)| *depth == 1 && n.kind == TreeNodeKind::Prim)
+            .map(|(_, n)| n.label.as_str())
+            .collect();
         assert!(
-            !rows.iter().any(|(_, n)| n.kind == TreeNodeKind::Prim),
-            "no prim rows at all"
+            authored_rows.is_empty(),
+            "a layer draws no prim it authors, only what its arcs bring: {authored_rows:?}"
         );
         let vset = rows
             .into_iter()
@@ -1345,13 +1649,15 @@ mod tests {
         let tree = CompositionTree::parse(&cyclic).unwrap();
         let roots = roots(&tree);
         // Every layer is a root and an arc's target is a naming row, so a cycle in
-        // the layer graph costs two arc rows with one layer row under each — never a
-        // walk that follows the cycle.
+        // the layer graph costs two arc rows with one layer row under each -- never a
+        // walk that follows the cycle. v1.5.4 adds each arc's instance row under the
+        // arc (one per edge, `/A` and `/B`), so the count is 8 rather than 6; the
+        // property under test is that it is *finite* and bounded, not the number.
         let rows = flatten(&roots);
         assert_eq!(
             rows.len(),
-            6,
-            "two layer roots, two arcs, two target rows: {rows:?}"
+            8,
+            "two layer roots, two arcs, two target rows, two instance rows: {rows:?}"
         );
         assert!(row_count(&roots) < 10);
     }

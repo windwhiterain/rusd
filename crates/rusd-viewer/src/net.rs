@@ -713,10 +713,22 @@ pub enum RenderCommand {
         geometry: Box<SceneGeometry>,
         bounds: ([f64; 3], [f64; 3]),
     },
-    /// A camera move: re-render only (no upload).
+    /// A camera move: re-render only (usually no upload).
+    ///
+    /// `only_selected` is what 「只看选中」 asks for: when it is set and `selection`
+    /// names a prim, the frame shows that prim's subtree and nothing else. It
+    /// travels **with the camera** rather than in a command of its own because it is
+    /// a display argument like the orbit -- the two arrive from one user action, and
+    /// one batch of commands is one frame (`RenderWorker::spawn`'s drain), so a
+    /// separate command would be a second way to ask for the same re-render.
+    ///
+    /// It **re-bakes** when it differs from what the GPU holds: a filter is a subset
+    /// of the vertices, so it cannot be a draw-time uniform. A camera move alone
+    /// still uploads nothing.
     View {
         orbit: Orbit,
         selection: Option<String>,
+        only_selected: bool,
     },
     /// A gizmo drag's local preview: re-bake with these prims moved, then draw.
     /// It is the one command that re-uploads geometry, and it exists so a drag
@@ -797,6 +809,10 @@ impl RenderWorker {
             let mut scene: Option<SceneGeometry> = None;
             let mut orbit: Option<Orbit> = None;
             let mut selection: Option<String> = None;
+            // What the GPU's geometry is filtered to: the prim's path when 「只看选中」
+            // is on and something is selected, `None` for the whole scene. Kept beside
+            // `selection` because the two together decide whether a `View` re-bakes.
+            let mut isolated: Option<String> = None;
             let mut bounds: ([f64; 3], [f64; 3]) = ([0.0; 3], [0.0; 3]);
             // `dirty` says the display arguments changed since the last frame;
             // `uploaded` says the scene on the GPU is the one in `scene` (it is
@@ -851,14 +867,34 @@ impl RenderWorker {
                                 orbit = Some(Orbit::from_camera(&cam));
                             }
                             scene = Some(*geometry);
+                            // A new scene arrives whole (`set_scene` above), so the filter
+                            // the GPU held is gone with it: the next `View` re-applies it
+                            // instead of believing it is already there.
+                            isolated = None;
                             dirty = true;
                         }
                         RenderCommand::View {
                             orbit: o,
                             selection: sel,
+                            only_selected,
                         } => {
                             orbit = Some(o);
                             selection = sel;
+                            // The filter is part of what is on the GPU, so a change to it
+                            // is a re-bake; an unchanged one costs nothing, which is what
+                            // keeps a plain orbit a redraw.
+                            let wanted = if only_selected {
+                                selection.clone()
+                            } else {
+                                None
+                            };
+                            if wanted != isolated {
+                                isolated = wanted;
+                                if let Some(geo) = &scene {
+                                    let filter = isolated.as_deref();
+                                    viewport.set_scene(&crate::scene::isolate(geo, filter));
+                                }
+                            }
                             dirty = true;
                         }
                         RenderCommand::Preview {

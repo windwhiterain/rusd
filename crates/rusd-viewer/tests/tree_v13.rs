@@ -79,16 +79,22 @@ fn rows(m: &TreeModel) -> Vec<(usize, rusd_viewer::tree::TreeNode)> {
 
 #[test]
 fn the_tree_draws_no_prim_rows() {
+    // v1.3's rule, still in force: a layer draws no row for the prims it **authors**
+    // (a city stack has hundreds, and such a prim is inspected by picking it). v1.5.4
+    // adds exactly one kind of prim row -- an arc class's instances, under the arc,
+    // which is how a 240-way cluster is walked down to one mesh -- so the rule is
+    // asserted where it still means something: at depth 1, which is where a layer's
+    // own children are.
     let rows = rows(&model());
     assert!(!rows.is_empty(), "the tree has rows to draw");
-    let prim_rows: Vec<&str> = rows
+    let under_a_layer: Vec<&str> = rows
         .iter()
-        .filter(|(_, n)| n.kind == TreeNodeKind::Prim)
+        .filter(|(depth, n)| *depth == 1 && n.kind == TreeNodeKind::Prim)
         .map(|(_, n)| n.label.as_str())
         .collect();
     assert!(
-        prim_rows.is_empty(),
-        "v1.3: the tree must not list prims, but it drew {prim_rows:?}"
+        under_a_layer.is_empty(),
+        "v1.3: a layer must not list the prims it authors, but it drew {under_a_layer:?}"
     );
 }
 
@@ -108,15 +114,18 @@ fn the_tree_draws_layers_arcs_and_variant_sets() {
         kinds.contains(&TreeNodeKind::VariantSet),
         "variant sets are structure too, and stay: {kinds:?}"
     );
-    for (_, node) in &rows {
+    // The kinds v1.3 ruled out are the ones a *layer* draws; v1.5.4 adds a prim row
+    // under an **arc** (that edge's instances), which is a row about structure and
+    // not a listing of a layer's prims.
+    for (depth, node) in &rows {
+        let allowed = match node.kind {
+            TreeNodeKind::Layer | TreeNodeKind::Arc | TreeNodeKind::VariantSet => true,
+            TreeNodeKind::Prim => *depth >= 2,
+        };
         assert!(
-            matches!(
-                node.kind,
-                TreeNodeKind::Layer | TreeNodeKind::Arc | TreeNodeKind::VariantSet
-            ),
-            "row {} has kind {:?}, which v1.3 does not draw",
-            node.label,
-            node.kind
+            allowed,
+            "row {} has kind {:?} at depth {depth}, which the tree does not draw there",
+            node.label, node.kind
         );
     }
 }

@@ -229,6 +229,58 @@ fn norm(v: [f64; 3]) -> [f64; 3] {
     }
 }
 
+/// Whether `path` is `selected` or lies under it -- the **subtree** test, on a path
+/// boundary.
+///
+/// `starts_with` alone would make `/World/City/Tufts2` a child of
+/// `/World/City/Tufts`; a prim path's children are its path plus `/`, and nothing
+/// else is.
+pub fn is_in_subtree(path: &str, selected: &str) -> bool {
+    if path == selected {
+        return true;
+    }
+    // `/` is the stage: every prim is under it, which is the honest answer.
+    if selected == "/" {
+        return true;
+    }
+    path.strip_prefix(selected)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// The scene with every prim outside `selected`'s subtree removed: 「只看选中」.
+///
+/// **A pure function of the geometry**, because the rule is the whole of the
+/// feature and a rule that lived inside a render loop could not be asserted
+/// without a GPU. The render thread re-bakes through this; the tests call it
+/// directly.
+///
+/// - `selected: None` is the **full scene**, item for item and in the same order.
+///   That is the state with nothing selected, and it is also what the toggle falls
+///   back to, so "only the selection" never means "an empty picture".
+/// - `bounds` and `camera` are carried **unchanged**: this is a filter on what is
+///   drawn, not a re-frame. The user toggled a lens, not the view -- and a fit that
+///   jumped when the toggle flipped would make the two pictures impossible to
+///   compare.
+/// - The kept items keep their order, so a re-bake assigns them the same relative
+///   ids and a pick still resolves to the path under the pointer.
+pub fn isolate(geo: &SceneGeometry, selected: Option<&str>) -> SceneGeometry {
+    let Some(sel) = selected else {
+        return geo.clone();
+    };
+    SceneGeometry {
+        items: geo
+            .items
+            .iter()
+            .filter(|it| is_in_subtree(&it.path, sel))
+            .cloned()
+            .collect(),
+        camera: geo.camera,
+        // The whole scene's box: see the note above on why this is not a re-frame.
+        bounds: geo.bounds,
+        diags: geo.diags.clone(),
+    }
+}
+
 /// Extract `stage`'s renderable geometry and replace its camera with the fitted
 /// one, so a cook output with no `Camera` prim still frames correctly.
 ///

@@ -290,13 +290,14 @@ fn composition_tree_is_asked_with_no_params_and_becomes_the_panels_rows() {
     assert!(!panel.model.is_unavailable(), "{}", panel.model.status_zh());
     let rows = flatten(&panel.roots());
     // The rows, counted from the shape rather than from the tree's own idea of it.
-    // v1.3 draws **no prim rows** (a prim is inspected by picking it), so:
+    // v1.3 draws **no row for a prim a layer authors** (such a prim is inspected by
+    // picking it); v1.5.4 adds one **instance row per arc of an edge class**:
     //   three layer roots
     //   session layer: nothing of its own                         = 0
-    //   root layer:    the arc, its naming row                    = 2
+    //   root layer:    the arc, its naming row, its instance row  = 3
     //   prototypes:    the variant set and its 2 variants          = 3
     // No branch is duplicated, so no row appears twice for one reason.
-    let root_layer_rows = 1 /* arc */ + 1 /* naming row */;
+    let root_layer_rows = 1 /* arc */ + 1 /* naming row */ + 1 /* the arc's instance */;
     let prototypes_rows = 1 /* vset */ + 2 /* variants */;
     assert_eq!(
         rows.len(),
@@ -311,10 +312,27 @@ fn composition_tree_is_asked_with_no_params_and_becomes_the_panels_rows() {
     );
     assert!(ids.contains(&"arc:0"), "the arc is a row: {ids:?}");
     assert!(ids.contains(&"vset:0"), "{ids:?}");
-    // v1.3: and the prim rows are gone.
+    // v1.3: no row for a prim a layer **authors**. v1.5.4's instance row is the one
+    // prim row the tree draws, and it hangs off the arc rather than off the layer --
+    // which is what the depth-1 assertion says, since a layer's own children are at
+    // depth 1 and an arc's are at depth 2.
+    let under_a_layer: Vec<&str> = rows
+        .iter()
+        .filter(|(depth, n)| *depth == 1 && n.kind == TreeNodeKind::Prim)
+        .map(|(_, n)| n.label.as_str())
+        .collect();
     assert!(
-        !rows.iter().any(|(_, n)| n.kind == TreeNodeKind::Prim),
-        "no prim rows: {ids:?}"
+        under_a_layer.is_empty(),
+        "a layer draws no prim it authors: {under_a_layer:?}"
+    );
+    let instance = rows
+        .iter()
+        .find(|(_, n)| n.id == "prim:/World/City/Block_01")
+        .expect("the arc's instance row names the prim it is authored on");
+    assert_eq!(
+        instance.1.prim.as_deref(),
+        Some("/World/City/Block_01"),
+        "and selecting it selects that prim"
     );
 }
 
@@ -361,15 +379,20 @@ fn a_comp_node_asks_with_the_id_the_tree_printed() {
 
     let detail = NodeDetail::parse(&reply).expect("a prim detail");
     let lines = detail.lines();
+    // **By layer** (the user's ruling): the section header names the layer and its
+    // specifier, and the layer's own attribute lines follow it. The session layer is
+    // strongest, so its section is first -- the composite's order, not an alphabet.
     assert!(
-        lines.iter().any(|l| l.contains("anon:session (over)")),
-        "{lines:?}"
+        lines
+            .iter()
+            .any(|l| l.contains("anon:session") && l.contains("[over]")),
+        "the strongest layer heads a section: {lines:?}"
     );
     assert!(
         lines
             .iter()
             .any(|l| l.contains("xformOp:translate = [3.0,0.0,7.0]")),
-        "the session layer's override is the first opinion and is shown: {lines:?}"
+        "the session layer's override is the first section and is shown: {lines:?}"
     );
 }
 

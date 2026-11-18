@@ -102,6 +102,7 @@ fn a_scene_is_drawn_and_wakes_the_ui_once() {
     worker.send(RenderCommand::View {
         orbit,
         selection: None,
+        only_selected: false,
     });
 
     let deadline = Instant::now() + Duration::from_secs(20);
