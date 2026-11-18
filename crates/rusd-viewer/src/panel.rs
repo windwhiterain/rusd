@@ -383,27 +383,62 @@ fn row(
             }
         });
     } else {
-        // **Collapsed unless the row is a layer root** (v1.5.4). A layer's children
-        // have to be visible -- they are the arcs and variant sets the panel exists
-        // to show -- but a row that stands for a *prim* is where a 240-instance
-        // cluster stops being 240 rows of noise: those open on a click, one at a
-        // time.
+        // **A chevron expands, the label selects** (v1.5.4: 「聚合行自身点击：仍不选
+        // prim（它是一条边）；展开箭头/行内 chevron 负责展开」). Two hit areas, two jobs --
+        // which is why `CollapsingHeader` is not used here: its whole header is one
+        // target, so a click meant to open the row would also be reported as a click on
+        // the row, and the row's own click is a `comp_node` ask.
         //
-        // The click on the header is the row's own click (`selectable` + `clicked`),
-        // and the arrow beside it is the only thing that expands: one row, one
-        // meaning, which is the same rule a control row follows.
-        let header = egui::CollapsingHeader::new(text)
-            .id_salt((&node.id, root, depth))
-            .default_open(depth == 0)
-            .show(ui, |ui| {
-                for child in &node.children {
-                    if let Some(a) = row(ui, child, depth + 1, root, selected, preview) {
-                        clicked = Some(a);
+        // Collapsed unless the row is a **layer root**: a layer's children have to be
+        // visible (they are the arcs and variant sets the panel exists to show), while a
+        // 240-instance class's children are the noise the aggregation removes -- those
+        // open when the user asks, one row at a time.
+        let id = ui.make_persistent_id((&node.id, root, depth));
+        let mut open = ui.data(|d| d.get_temp::<bool>(id.with("open")).unwrap_or(depth == 0));
+        ui.horizontal(|ui| {
+            indent(ui, depth);
+            // The chevron. A row with nothing to open still gets the column's width, so
+            // the titles of a tree line up whatever branch they are on.
+            let chevron = if node.children.is_empty() {
+                "  "
+            } else if open {
+                "\u{25be}"
+            } else {
+                "\u{25b8}"
+            };
+            let enabled = !node.children.is_empty();
+            let arrow = ui
+                .add_enabled_ui(enabled, |ui| {
+                    ui.add(egui::Button::new(chevron).frame(false))
+                })
+                .inner
+                .on_hover_text(if enabled {
+                    if open {
+                        "收起"
+                    } else {
+                        "展开这一行的子节点"
                     }
+                } else {
+                    ""
+                });
+            if arrow.clicked() && enabled {
+                open = !open;
+                ui.data_mut(|d| d.insert_temp(id.with("open"), open));
+            }
+            if ui
+                .selectable_label(is_selected || is_current_preview, text)
+                .clicked()
+            {
+                clicked = Some(click_action(node));
+            }
+            subtitle(ui, node);
+        });
+        if open {
+            for child in &node.children {
+                if let Some(a) = row(ui, child, depth + 1, root, selected, preview) {
+                    clicked = Some(a);
                 }
-            });
-        if header.header_response.clicked() {
-            clicked = Some(click_action(node));
+            }
         }
     }
     clicked
@@ -816,24 +851,46 @@ mod tests {
         })
     }
 
-    /// Run one headless pass over the panel with the production widget, from a pointer
-    /// at `pos`. Returns the painted texts and what the pass reported.
-    fn pass(tree: serde_json::Value, pos: egui::Pos2) -> (Vec<String>, TreeAction) {
-        let ctx = egui::Context::default();
+    /// Run one headless pass over `panel`, with the pointer at `pos` and, when
+    /// `click` is set, a click there. Returns the painted texts and what the pass
+    /// reported.
+    ///
+    /// The `egui::Context` is the caller's, so widget state (a row's open flag, a
+    /// collapsed row's persisted id) **survives between passes** -- which is the only
+    /// way a test can tell one row's expansion from another's.
+    fn pass(
+        ctx: &egui::Context,
+        panel: &TreePanel,
+        pos: egui::Pos2,
+        click: bool,
+    ) -> (Vec<String>, TreeAction) {
+        let mut events = vec![egui::Event::PointerMoved(pos)];
+        if click {
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            });
+            events.push(egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            });
+        }
         let raw = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(900.0, 800.0),
             )),
-            events: vec![egui::Event::PointerMoved(pos)],
+            events,
             ..Default::default()
         };
-        let mut panel = TreePanel::new();
-        panel.apply_tree(Ok(tree));
         let mut action = TreeAction::None;
         let out = ctx.run_ui(raw, |root| {
             egui::CentralPanel::no_frame().show(root, |ui| {
-                action = tree_panel(ui, &panel);
+                action = tree_panel(ui, panel);
             });
         });
         let mut delta = out.textures_delta;
@@ -849,22 +906,56 @@ mod tests {
         (texts, action)
     }
 
+    /// The painted rect of the first text whose content is exactly `glyph`.
+    fn glyph_rect(ctx: &egui::Context, panel: &TreePanel, glyph: &str) -> Option<egui::Rect> {
+        rect_of_text(ctx, panel, |t| t == glyph)
+    }
+
+    /// The painted rect of the first text that satisfies `want`.
+    fn rect_of_text(
+        ctx: &egui::Context,
+        panel: &TreePanel,
+        want: impl Fn(&str) -> bool,
+    ) -> Option<egui::Rect> {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let mut found = None;
+        let out = ctx.run_ui(raw, |root| {
+            egui::CentralPanel::no_frame().show(root, |ui| {
+                let _ = tree_panel(ui, panel);
+            });
+        });
+        let mut delta = out.textures_delta;
+        delta.clear();
+        for clipped in &out.shapes {
+            if let egui::epaint::Shape::Text(t) = &clipped.shape
+                && want(t.galley.text())
+                && found.is_none()
+            {
+                found = Some(t.galley.rect.translate(t.pos.to_vec2()).expand(2.0));
+            }
+        }
+        found
+    }
+
     #[test]
-    fn two_rows_with_one_comp_node_id_are_not_one_widget() {
-        // **The case this pins**: two authors of one target give two rows the same
-        // `comp_node` id, so a row's widget id cannot be that id alone -- egui is keyed
-        // by `id_salt`, and one salt for two rows means one collapse state shared by
-        // both (opening one opens the other, and a click on one is reported for the
-        // other). The drawn tree therefore tells the two apart by where they sit, which
-        // is why `row` is handed the root index.
+    fn two_rows_with_one_comp_node_id_expand_and_select_separately() {
+        // **The case this pins**: two layers referencing one target draw two arc
+        // classes, and both are named by that target prim's id -- so a row's widget id
+        // cannot be that id alone. The fix is two-fold and both halves are asserted
+        // here, across passes, with a real click:
         //
-        // What is asserted here is the **structure** the fix rests on: that the case is
-        // real (two rows, one id) and that both classes are drawn, each with its own
-        // count. The salt itself is not observable from a scripted pass -- reversing the
-        // fix leaves this test green, because a single uninteracted frame never opens
-        // either header -- so this is a guard on the shape, not proof of the fix. The
-        // proof would need a second pass with real pointer events against a persisted
-        // widget state; that is a window-level check.
+        // 1. a row's widget id is its **place** in the tree (`(id, root, depth)`), so
+        //    opening one of two same-id rows leaves the other closed;
+        // 2. a row's label and its chevron are **two hit areas**: clicking the chevron
+        //    opens the row and reports no action, while clicking the label reports the
+        //    row's own click (v1.5.4: chevron 负责展开, the row itself selects).
+        let ctx = egui::Context::default();
         let mut panel = TreePanel::new();
         panel.apply_tree(Ok(two_authors_of_one_target()));
         let rows = rows(&panel);
@@ -875,14 +966,39 @@ mod tests {
             .collect();
         assert_eq!(shared.len(), 2, "the case has to be real: two rows, one id");
 
-        let (texts, _) = pass(two_authors_of_one_target(), egui::pos2(5.0, 5.0));
+        // Pass 1: nothing is open, so no instance is painted.
+        let (texts, _) = pass(&ctx, &panel, egui::pos2(1.0, 1.0), false);
         assert!(
             !texts.iter().any(|t| t == "/A1" || t == "/B1"),
-            "nothing is expanded on the first pass: {texts:?}"
+            "nothing is expanded before a click: {texts:?}"
+        );
+
+        // Click the **chevron** of the first group row: a closed row paints one "▸".
+        let chevron = glyph_rect(&ctx, &panel, "\u{25b8}").expect("a closed row's chevron");
+        let (texts, action) = pass(&ctx, &panel, chevron.center(), true);
+        assert!(
+            texts.iter().any(|t| t == "/A1") && texts.iter().any(|t| t == "/A2"),
+            "the clicked row's instances are painted: {texts:?}"
         );
         assert!(
-            texts.iter().filter(|t| t.contains("\u{00d7}2")).count() == 2,
-            "both classes are drawn, each with its count: {texts:?}"
+            !texts.iter().any(|t| t == "/B1"),
+            "and **only** that row's: the other same-id row is still closed: {texts:?}"
         );
+        assert_eq!(
+            action,
+            TreeAction::None,
+            "a chevron click expands and reports nothing: it is not the row's click"
+        );
+
+        // And the **label** of the same row is its own click: selecting the edge class,
+        // which selects no prim.
+        let label =
+            rect_of_text(&ctx, &panel, |t| t.contains("\u{00d7}2")).expect("the open row's label");
+        let (_, action) = pass(&ctx, &panel, label.center(), true);
+        let TreeAction::Select(sel) = action else {
+            panic!("a label click is the row's own click, got {action:?}");
+        };
+        assert_eq!(sel.id, "prim:/Prototypes/Tuft");
+        assert_eq!(sel.prim, None, "an edge class selects no prim");
     }
 }

@@ -732,10 +732,10 @@ pub fn is_pseudo_root(path: &str) -> bool {
 /// The header line of a layer section in a prim's detail: the layer, and what the tree
 /// knows about it.
 ///
-/// ``{id} [{kind} \u{00b7} {strength}/{count}]`` with an op's generator name beside it
-/// -- the same facts, in the same words, that the layer's own row prints, so a section
-/// and the row it came from read as one thing. `None` is a layer the tree does not
-/// list: its identifier alone, because a kind or a rank would have to be invented.
+/// `{id} [{kind} · {strength}]`, with a cook op's generator name after it -- the same
+/// facts, in the same words, that the layer's own row prints, so a section and the row
+/// it came from read as one thing. `None` is a layer the tree does not list: its
+/// identifier alone, because a kind or a rank would have to be invented.
 pub fn layer_header(id: &str, layer: Option<&LayerNode>) -> String {
     let Some(layer) = layer else {
         return id.to_owned();
