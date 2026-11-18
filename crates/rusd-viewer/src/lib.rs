@@ -27,6 +27,9 @@
 //!   frame was drawn with, and the clipboard payloads.
 //! - [`panel`]: the tree and capture panels' widgets, which only draw and report —
 //!   the shell carries out what they ask.
+//! - [`overlay`]: the `--debug-ui` overlay's plan — font, width and area bounds, the
+//!   wrap rule that keeps a long line whole, and the collapsed one-row form
+//!   (`docs/PROTOCOL.md` v1.4's overlay compact).
 
 //! - [`camera`]: the client's own orbit / pan / zoom and the screen↔world
 //!   mapping a pick needs.
@@ -58,6 +61,7 @@ pub mod gizmo;
 pub mod gpu;
 pub mod memresolver;
 pub mod net;
+pub mod overlay;
 pub mod panel;
 pub mod platform_metrics;
 pub mod protocol;

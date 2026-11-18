@@ -111,6 +111,9 @@ const GIZMO_HZ: f64 = 30.0;
 const TREE_TAG: &str = "composition_tree";
 const NODE_TAG: &str = "comp_node";
 const CAPTURE_TAG: &str = "capture";
+/// `preview{upto}` (v1.4). Its answer is `{version}`, which the *notification* is the
+/// authority for: the prefix itself arrives as a `stage_snapshot` carrying `upto`.
+const PREVIEW_TAG: &str = "preview";
 
 /// What wakes the window thread.
 #[derive(Debug, Clone, PartialEq)]
@@ -196,6 +199,10 @@ pub struct Shell {
     frames_received: u64,
     /// Whether `--debug-ui` draws the size/frame overlay.
     debug_ui: bool,
+    /// Whether the user has collapsed the overlay to one row (v1.4's overlay compact:
+    /// 可折叠，键 `o` 或按钮). Only meaningful with `debug_ui`; the key and the button
+    /// flip it either way, and `plan` turns it into a one-row box.
+    overlay_collapsed: bool,
 
     drag: Option<DragState>,
     /// The prim a gizmo drag is moving, with the anchor it started from (world
@@ -376,6 +383,11 @@ impl Shell {
             last_frame_at: Instant::now(),
             offline_usdc: args.usdc.clone(),
             debug_ui: args.debug_ui,
+            // **Expanded by default**, because the numbers are what the overlay exists
+            // for, and the area bound already keeps it to a quarter of the viewport.
+            // Collapsing is the extra affordance (`o`, or the bar's button) for when
+            // even that is in the way; `--debug-ui` no longer needs it to be usable.
+            overlay_collapsed: false,
             tree: crate::panel::TreePanel::new(),
             tree_open: true,
             tree_asked: false,
@@ -451,6 +463,11 @@ impl Shell {
     /// orbit; the render thread receives the geometry alone (the stage stays here,
     /// `!Send`), and a drag's local preview is dropped (the server's answer replaces
     /// it).
+    ///
+    /// **A prefix frame is a scene like any other**: it takes the same path, so the
+    /// geometry on screen and the camera rules are the same for a `preview{upto}` as
+    /// for a mutation — except that no later frame re-fits, which is exactly what a
+    /// prefix needs (it is the same scene seen earlier, and the user was looking at it).
     fn adopt_scene(&mut self, made: MadeScene) {
         self.bounds = made.bounds;
         // One function decides whether this scene frames the view or keeps the
@@ -463,6 +480,9 @@ impl Shell {
             self.orbit = Some(orbit);
         }
         self.model.adopt(&made);
+        // The composition on screen, echoed to the panel so its op row can be marked
+        // and its 「final」 button reads the state the viewport is actually in (v1.4).
+        self.tree.preview = self.model.preview.clone();
         self.status = self.model.status_line_zh();
         self.preview = None;
         self.gizmo = None;
@@ -551,6 +571,32 @@ impl Shell {
         });
     }
 
+    /// Ask `preview{upto}` for an op row's click (v1.4), or `preview{null}` for the
+    /// 「final」 control.
+    ///
+    /// The scene the server answers with arrives as an ordinary `stage_snapshot` whose
+    /// `upto` says which prefix it is; this request only *asks*, so nothing here changes
+    /// `model.preview`. That field follows the frame (`ClientModel::apply`), which is
+    /// what keeps a refused `upto` (`-32602`) from leaving the status bar claiming a
+    /// prefix the viewport never showed.
+    ///
+    /// The camera does **not** re-fit: a prefix is the same scene, smaller, and the
+    /// user who asked for it was looking at it. `ClientModel::wants_first_fit` already
+    /// says one fit per connection, so this falls out of `adopt_scene` rather than
+    /// needing a rule of its own.
+    fn ask_preview(&mut self, upto: Option<String>) {
+        let label = match &upto {
+            Some(u) => format!("preview ≤ {u}"),
+            None => "final".to_owned(),
+        };
+        self.status = format!("{label}: 请求中…");
+        self.net.send(NetCommand::Call {
+            tag: PREVIEW_TAG.to_owned(),
+            method: "preview".to_owned(),
+            params: protocol::preview_params(upto.as_deref()),
+        });
+    }
+
     /// A `NetCommand::Call` was answered: route it by its tag.
     fn on_reply(&mut self, tag: String, result: Result<serde_json::Value, protocol::RpcError>) {
         let reply = match result {
@@ -563,6 +609,35 @@ impl Shell {
                 self.status = self.tree.model.status_zh();
             }
             NODE_TAG => self.tree.apply_node(reply),
+            PREVIEW_TAG => match reply {
+                Ok(value) => {
+                    // The prefix itself arrives as a `stage_snapshot` whose `upto` is the
+                    // authority (see `ask_preview`); the reply only says the request was
+                    // accepted, so this line reports it without claiming a frame.
+                    let version = value
+                        .get("version")
+                        .and_then(serde_json::Value::as_u64)
+                        .map_or_else(
+                            || "accepted".to_owned(),
+                            |v| format!("accepted → server v{v}"),
+                        );
+                    self.status = format!("preview {version}");
+                }
+                Err((crate::protocol::TIMEOUT_CODE, _)) => {
+                    self.status = "preview: 服务器未在时限内应答".to_owned();
+                }
+                Err((crate::tree::METHOD_NOT_FOUND, _)) => {
+                    // A server from before v1.4: the op rows it sent (it sent none) are
+                    // the only preview controls, and the button says why it did nothing.
+                    self.status = "preview：服务器无此方法（server 版本）".to_owned();
+                }
+                Err((code, message)) => {
+                    // `-32602` for an unknown `upto`: the panel keeps the previous frame,
+                    // and `model.preview` still names it — which is why the field follows
+                    // the snapshot rather than the request.
+                    self.status = format!("preview failed: {message} (code {code})");
+                }
+            },
             CAPTURE_TAG => match reply {
                 Ok(value) => match value.get("id").and_then(|v| v.as_str()) {
                     Some(id) => {
@@ -602,6 +677,10 @@ impl Shell {
 
     /// A click in the tree: select the row, ask its detail, and — when the row
     /// stands for a prim — select that prim in the viewport and copy its path.
+    ///
+    /// **The preview is not touched** (`docs/PROTOCOL.md` v1.4: 点非 op 节点仍走
+    /// `comp_node` 详情，不改预览). Only `TreeAction::Preview` asks `preview`, so
+    /// inspecting a layer cannot silently change which composition is on screen.
     fn on_tree_select(&mut self, sel: crate::tree::TreeSelection) {
         self.ask_node(&sel.id);
         if let Some(path) = crate::panel::copy_payload(&sel) {
@@ -792,6 +871,7 @@ impl Shell {
                     });
                     match crate::panel::tree_panel(ui, &self.tree) {
                         crate::panel::TreeAction::Select(sel) => self.on_tree_select(sel),
+                        crate::panel::TreeAction::Preview(upto) => self.ask_preview(upto),
                         crate::panel::TreeAction::Refresh => self.ask_tree(),
                         crate::panel::TreeAction::None => {}
                     }
@@ -832,6 +912,26 @@ impl Shell {
                     self.capture_start = None;
                 }
                 ui.separator();
+                // The overlay's collapse button (v1.4's overlay compact: 可折叠，键 `o`
+                // 或按钮). Only drawn with `--debug-ui`: without it there is no overlay,
+                // and a button that toggles an invisible state is worse than none.
+                // `o` is the key that does the same, and the label names it so the
+                // keyboard path is discoverable from the picture.
+                if self.debug_ui {
+                    let label = if self.overlay_collapsed {
+                        "overlay: 1 行 (o)"
+                    } else {
+                        "overlay: 全展开 (o)"
+                    };
+                    if ui
+                        .small_button(label)
+                        .on_hover_text("折叠/展开 --debug-ui 叠层（键 o）")
+                        .clicked()
+                    {
+                        self.overlay_collapsed = !self.overlay_collapsed;
+                    }
+                    ui.separator();
+                }
                 match self.model.selection.clone() {
                     Some(sel) => {
                         ui.label(format!("selected {sel}"));
@@ -1235,6 +1335,11 @@ impl Shell {
     /// viewport, and it must be readable in a screenshot. The text comes from
     /// [`crate::viewport::OverlayReport::lines`] so what a test asserts and what a
     /// screenshot shows are the same strings.
+    ///
+    /// **Size lives in [`crate::overlay`], not here** (v1.4's overlay compact): this
+    /// function measures, wraps and draws, and the font, width and area bounds are the
+    /// module's constants, so the box a screenshot shows and the box a test asserts
+    /// cannot drift apart. Collapsing (`o`, or the tree panel's button) is one row.
     fn paint_debug_overlay(&self, ui: &egui::Ui, rect: egui::Rect) {
         let vp = self.viewport;
         let frame_texels = self
@@ -1263,6 +1368,10 @@ impl Shell {
             drawn_target: drawn.map(|c| c.look_at),
         };
         let mut lines = report.lines();
+        // The composition the viewport is showing (v1.4's preview), first line: it is
+        // the one fact a prefix preview changes, and a screenshot of a prefix must say
+        // so without being compared against another screenshot.
+        lines.insert(0, format!("composition {}", self.model.preview_label()));
         // The two groups that name a DPI defect as a number rather than a story:
         // what the platform said against what the contract expects, and whether the
         // panels and the viewport partition the window. A screenshot of a settled
@@ -1286,34 +1395,65 @@ impl Shell {
             }
             .lines(),
         );
-        let font = egui::FontId::monospace(12.0);
-        let pad = 6.0;
         let painter = ui.painter().clone();
-        let galleys: Vec<_> = lines
+        let font = egui::FontId::monospace(crate::overlay::FONT_PT);
+        // The wrap width comes from the **viewport** (`overlay::row_width`), the same
+        // number the box is sized by: a fixed 460 pt wrap on a 300 pt viewport would
+        // draw rows wider than the box they sit in.
+        let max_row = crate::overlay::row_width(rect);
+        // Wrap every line to the box's width, then measure the rows. `layout_no_wrap`
+        // is the measurement the wrap rule itself uses, so what fits is what is drawn.
+        let rows: Vec<String> = lines
             .iter()
-            .map(|l| painter.layout_no_wrap(l.clone(), font.clone(), egui::Color32::WHITE))
+            .flat_map(|l| {
+                crate::overlay::wrap(l, max_row, |s| {
+                    painter
+                        .layout_no_wrap(s.to_owned(), font.clone(), egui::Color32::WHITE)
+                        .size()
+                        .x
+                })
+            })
             .collect();
-        let line_h = galleys.first().map(|g| g.size().y).unwrap_or(14.0).max(1.0) + 2.0;
-        let width = galleys.iter().map(|g| g.size().x).fold(0.0f32, f32::max) + pad * 2.0;
-        let height = line_h * lines.len() as f32 + pad * 2.0;
-        let bg =
-            egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 8.0), egui::vec2(width, height));
+        let measured: Vec<egui::Vec2> = rows
+            .iter()
+            .map(|r| {
+                painter
+                    .layout_no_wrap(r.clone(), font.clone(), egui::Color32::WHITE)
+                    .size()
+            })
+            .collect();
+        let plan = crate::overlay::plan(rect, &measured, self.overlay_collapsed);
+        if plan.rect == egui::Rect::NOTHING {
+            return;
+        }
+        let bg = plan.rect.translate(rect.min.to_vec2());
         painter.rect_filled(bg, 3.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190));
-        for (i, line) in lines.iter().enumerate() {
+        let draw = |row: usize, text: &str| {
             // `1:1 NO` and `fresh NO` are failures: colour them so a screenshot
-            // cannot be mistaken for a healthy one.
-            let colour = if line.contains("NO") {
+            // cannot be mistaken for a healthy one. Rows that are part of a wrapped
+            // line inherit their line's colour, which is why the check is on the
+            // row's own text.
+            let colour = if text.contains("NO") {
                 egui::Color32::from_rgb(255, 120, 120)
             } else {
                 egui::Color32::from_rgb(200, 240, 200)
             };
             painter.text(
-                bg.min + egui::vec2(pad, pad + line_h * i as f32),
+                bg.min + egui::vec2(crate::overlay::PAD_PT, crate::overlay::row_y(row)),
                 egui::Align2::LEFT_TOP,
-                line.clone(),
+                text.to_owned(),
                 font.clone(),
                 colour,
             );
+        };
+        for r in plan.rows() {
+            match r.input {
+                Some(idx) => draw(r.row, &rows[idx]),
+                None => draw(
+                    r.row,
+                    &crate::overlay::marker_text(plan.hidden, plan.collapsed),
+                ),
+            }
         }
     }
 
@@ -1620,6 +1760,14 @@ impl ApplicationHandler<AppEvent> for App {
                     Key::Character(c) if c.as_str() == "z" => shell.send_net(NetCommand::Undo),
                     Key::Character(c) if c.as_str() == "y" => shell.send_net(NetCommand::Redo),
                     Key::Character(c) if c.as_str() == "f" => shell.fit(),
+                    // `o` collapses/expands the `--debug-ui` overlay (v1.4's overlay
+                    // compact). It does nothing without `--debug-ui`: the overlay is
+                    // not drawn then, so a toggle would be a key that silently
+                    // changes an invisible state.
+                    Key::Character(c) if c.as_str() == "o" && shell.debug_ui => {
+                        shell.overlay_collapsed = !shell.overlay_collapsed;
+                        shell.window.request_redraw();
+                    }
                     _ => {}
                 }
             }

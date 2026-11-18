@@ -148,6 +148,37 @@ pub fn opinion_line(id: u64, ops: &[OpinionOp]) -> String {
     request_line(id, "opinion", json!({"ops": ops}))
 }
 
+/// `preview{upto}`: ask this connection to be fed the **prefix** composition up to
+/// one cook op layer, or the final one.
+///
+/// `upto` is a cook op's output layer identifier, exactly as `composition_tree`'s
+/// `layers[]` prints it (v1.4: `preview{upto: <layer identifier> | null}`, 按连接维护
+/// 预览态). `None` is the final composition, i.e. the protocol's `null`.
+///
+/// The preview does **not** move the scene version: it is a view of the same scene, not
+/// an edit of it. So the request is one of the panel's [`NetCommand::Call`]s, answered
+/// with `{version}` (or an error for an unknown `upto`, `-32602`), rather than an edit
+/// reported as [`crate::net::NetEvent::Applied`].
+///
+/// # The one place the `null` is written
+///
+/// `params` always carries the key, `null` included: `{"upto": null}` is "final" and
+/// `{}` would be an omission the server has to guess about. A client that leaves it out
+/// on the last click would leave the server's preview state where it was.
+pub fn preview_line(id: u64, upto: Option<&str>) -> String {
+    request_line(
+        id,
+        "preview",
+        json!({"upto": upto.map(|u| Value::String(u.to_owned())).unwrap_or(Value::Null)}),
+    )
+}
+
+/// The `params` object [`preview_line`] writes, as data — what a test asserts and
+/// what [`crate::net::NetCommand::Call`] carries.
+pub fn preview_params(upto: Option<&str>) -> Value {
+    json!({"upto": upto.map(|u| Value::String(u.to_owned())).unwrap_or(Value::Null)})
+}
+
 /// `undo` / `redo`: server-side, over both edit surfaces.
 pub fn edit_line(id: u64, redo: bool) -> String {
     request_line(
@@ -161,17 +192,36 @@ pub fn edit_line(id: u64, redo: bool) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     /// Monotonic u64; the client discards a version it has already passed.
+    ///
+    /// **A preview frame does not move it** (`docs/PROTOCOL.md` v1.4: `preview` 不推进
+    /// scene version), so the same version can arrive twice — once as a prefix and once
+    /// as the final frame. That is why the preview state, not the version, decides
+    /// whether a repeated version is a new frame ([`crate::session::ClientModel::apply`]).
     pub version: u64,
     /// `"usdc"` or `"usda"`, per [`SNAPSHOT_FORMATS`].
     pub format: String,
     /// Base64 of the flattened layer's bytes.
     pub data: String,
+    /// The cook-op layer this frame was composed up to, or `None` for the final
+    /// composition (v1.4: `stage_snapshot` 增可选字段 `upto`，缺省 = final).
+    ///
+    /// It is what the viewport is showing, so the status bar and the overlay say it;
+    /// the client never *derives* it, because which ops a prefix contains is the
+    /// server's composition decision, not something a flattened layer can reveal.
+    pub upto: Option<String>,
 }
 
 impl Snapshot {
+    /// Whether this frame is a prefix (composed up to one cook op) rather than the
+    /// final composition.
+    pub fn is_prefix(&self) -> bool {
+        self.upto.is_some()
+    }
+
     /// The layer bytes this snapshot carries.
     pub fn decode(&self) -> Result<Vec<u8>, Vec<Diagnostic>> {
         if !SNAPSHOT_FORMATS.contains(&self.format.as_str()) {
+            // (prefix frames obey the same format rule as final ones)
             return Err(vec![diag(
                 "E_WIRE_FORMAT",
                 format!(
@@ -309,6 +359,21 @@ fn parse_notification(method: &str, params: &Value) -> Result<Notification, Diag
                 version,
                 format: format.to_owned(),
                 data: data.to_owned(),
+                // v1.4's optional field: absent (or `null`) is the final composition.
+                // A *present* value must be a string — a number here is a server
+                // bug, and treating it as "final" would silently show the wrong frame.
+                upto: match params.get("upto") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(s)) => Some(s.clone()),
+                    Some(other) => {
+                        return Err(diag(
+                            "E_WIRE_SHAPE",
+                            format!(
+                                "stage_snapshot \"upto\" must be a string or null, not {other}"
+                            ),
+                        ));
+                    }
+                },
             }))
         }
         "state_changed" => {
@@ -564,6 +629,7 @@ mod tests {
             version: 3,
             format: "usdc".to_owned(),
             data: crate::compose::base64_encode(&bytes),
+            upto: None,
         };
         assert_eq!(snap.decode().expect("decodes"), bytes);
     }
@@ -574,6 +640,7 @@ mod tests {
             version: 3,
             format: "usdz".to_owned(),
             data: "AAAA".to_owned(),
+            upto: None,
         };
         let diags = snap.decode().expect_err("usdz is not on the wire");
         assert_eq!(diags[0].code, "E_WIRE_FORMAT");
@@ -585,6 +652,7 @@ mod tests {
             version: 3,
             format: "usdc".to_owned(),
             data: "not base64 !!".to_owned(),
+            upto: None,
         };
         assert_eq!(snap.decode().expect_err("refused")[0].code, "E_WIRE_BASE64");
     }
@@ -600,7 +668,8 @@ mod tests {
             Wire::Notification(Notification::Snapshot(Snapshot {
                 version: 5,
                 format: "usdc".to_owned(),
-                data: "AA==".to_owned()
+                data: "AA==".to_owned(),
+                upto: None,
             }))
         );
 
