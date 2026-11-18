@@ -108,7 +108,10 @@ const GIZMO_HZ: f64 = 30.0;
 
 /// The tags a `NetCommand::Call` is answered under, so [`Shell::on_reply`] knows
 /// which of its own requests a reply belongs to.
-const TREE_TAG: &str = "composition_tree";
+/// The tag a `composition_tree` request is answered under: **one spelling**, in
+/// `crate::view::TREE_TAG`, because the request itself is sent from there (the shell
+/// and its tests share the one copy) and this `match` reads the same constant.
+const TREE_TAG: &str = crate::view::TREE_TAG;
 const NODE_TAG: &str = "comp_node";
 const CAPTURE_TAG: &str = "capture";
 /// `preview{upto}` (v1.4). Its answer is `{version}`, which the *notification* is the
@@ -446,6 +449,9 @@ impl Shell {
     fn on_notification(&mut self, n: Notification) {
         match self.model.apply(&n) {
             Effect::NewScene(made) => self.adopt_scene(*made),
+            Effect::StateChanged { version, reason } => {
+                self.on_state_changed(version, &reason);
+            }
             Effect::Status => {
                 self.status = self.model.status_line_zh();
                 self.request_repaint();
@@ -456,6 +462,49 @@ impl Shell {
                 self.request_repaint();
             }
         }
+    }
+
+    /// A `state_changed`: the reason decides what has to follow it.
+    ///
+    /// Two things can be stale when the server re-composes, and each reason says
+    /// whether it is (the rules are `crate::view`'s, so the window and its tests run
+    /// one copy of them):
+    ///
+    /// - **the composition tree** — asked again for every reason that can move the
+    ///   layer stack (`crate::view::asks_tree`), because a tree read once per
+    ///   connection showed the previous document's layers after an `open` and only
+    ///   「刷新」 fixed it;
+    /// - **the camera** — refitted for `open` alone (`crate::view::camera_for_state_change`),
+    ///   whose scene is the first frame of a new document. The contract orders
+    ///   `stage_snapshot` *before* `state_changed`, so the new document's scene is
+    ///   already on screen (adopted as a later scene, which keeps the orbit); the fit
+    ///   is taken here from the bounds now in hand, and the render thread is told.
+    ///
+    /// A `preview` never gets here: it is not a mutation, it advances no version, so
+    /// it raises no `state_changed` at all (v1.4), and neither rule runs.
+    fn on_state_changed(&mut self, version: u64, reason: &str) {
+        let aspect = self.viewport_aspect();
+        let plan = crate::view::apply_state_change(
+            &mut self.model,
+            &mut self.tree,
+            &self.net,
+            version,
+            reason,
+            aspect,
+        );
+        if let Some(orbit) = plan.refit {
+            self.orbit = Some(orbit);
+            self.render.send(RenderCommand::View {
+                orbit,
+                selection: self.model.selection.clone(),
+            });
+        }
+        if plan.asked_tree {
+            // The rows are on screen until the answer replaces them (`view::ask_tree`).
+            self.tree_asked = true;
+        }
+        self.status = self.model.status_line_zh();
+        self.request_repaint();
     }
 
     /// A new scene: the **first one of a connection** frames the camera to this
@@ -487,7 +536,9 @@ impl Shell {
         self.preview = None;
         self.gizmo = None;
         // The first scene of a session is when `composition_tree{}` becomes
-        // answerable (the server needs an open stage). Asked once; 「刷新」 asks again.
+        // answerable (the server needs an open stage). Asked once here; a
+        // `state_changed` asks again when its reason can move the layers
+        // (`Shell::on_state_changed`), and 「刷新」 asks on demand.
         if !self.tree_asked {
             self.ask_tree();
         }
@@ -542,24 +593,23 @@ impl Shell {
 
     // --- the composition tree and the capture (D13) -----------------------
 
-    /// Ask `composition_tree{}` when the session becomes live and there is a scene.
+    /// Ask `composition_tree{}` for the authority stack's layers.
     ///
-    /// The tree is built from the server's authority stack, so it only exists once
-    /// the server has opened something; asking before that would only earn a "no
-    /// scene open". `tree_asked` keeps it to one request per connection (plus each
-    /// 「刷新」), not one per snapshot: the tree is a structural read, and a
-    /// re-composite after an opinion leaves the layers unchanged.
+    /// Asked once when the first scene arrives (the server needs an open stage, so
+    /// asking earlier only earns a "no scene open"), again on every `state_changed`
+    /// whose reason can move the layers (`crate::view::asks_tree` — an `open` is a
+    /// different document entirely, and a patch or an opinion can add or drop a cook
+    /// op's output layer), and on 「刷新」. Not once per snapshot: an identical layer
+    /// stack replaced under the same rows costs the pending selection and the open
+    /// detail panel, which is a visible loss for no gain. `tree_asked` therefore only
+    /// records that the first ask happened; it no longer gates the later ones, since
+    /// a tree that stops following the server is the defect this fixes.
     fn ask_tree(&mut self) {
         if self.model.version.is_none() {
             return;
         }
         self.tree_asked = true;
-        self.tree.model = crate::tree::TreeModel::Loading;
-        self.net.send(NetCommand::Call {
-            tag: TREE_TAG.to_owned(),
-            method: "composition_tree".to_owned(),
-            params: crate::tree::tree_params(),
-        });
+        crate::view::ask_tree(&self.net, &mut self.tree);
     }
 
     /// Ask `comp_node{id}` for a clicked row.

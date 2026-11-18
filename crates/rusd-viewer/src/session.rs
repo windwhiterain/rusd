@@ -205,6 +205,18 @@ pub struct ClientModel {
 /// and a caller compares the *kind* (`matches!(effect, Effect::Nothing)`), which
 /// is the question a UI actually asks.
 pub enum Effect {
+    /// The server said it re-composed, and this is why.
+    ///
+    /// A variant of its own rather than `Status`, because the reason is not a
+    /// label: it is what decides whether the shell must do something. An `open`
+    /// is a **new document** — its scene is the first frame of one, so the camera
+    /// is fitted to it as it would be for a first connection, and the composition
+    /// tree is re-read because the layers are another document's. The other
+    /// reasons re-read the tree (the layers may have gained a cook op) and leave
+    /// the camera alone. `Status` could not say any of that, and inferring it from
+    /// `ClientModel::last_reason` afterwards would have fired on a following
+    /// `diagnostics`, which leaves that field standing.
+    StateChanged { version: u64, reason: String },
     /// A new scene: upload the geometry, render it, show the version.
     NewScene(Box<MadeScene>),
     /// The scene is unchanged; only the status changed (a reason, a diagnostic
@@ -266,6 +278,24 @@ impl ClientModel {
         true
     }
 
+    /// Call the next scene a first one again, without fitting anything yet.
+    ///
+    /// An `open` is a **new document**: its scene has a camera of its own, so the
+    /// fit of the previous document must not be kept. This is the armed half of
+    /// that decision — it says "the next scene frames the view" — and a caller that
+    /// already holds the scene fits it straight away with
+    /// [`ClientModel::mark_framed`] instead. Both halves live here so the rule is
+    /// one field (`framed`) and not a second flag beside it.
+    pub fn rearm_first_fit(&mut self) {
+        self.framed = false;
+    }
+
+    /// Say the view holds a real fit, so a later scene keeps it (the used half of
+    /// [`ClientModel::rearm_first_fit`]).
+    pub fn mark_framed(&mut self) {
+        self.framed = true;
+    }
+
     /// Set the aspect a following snapshot will be fitted at. The view calls this
     /// from the window's real size before the snapshot arrives.
     pub fn set_aspect(&mut self, aspect: f64) {
@@ -322,7 +352,9 @@ impl ClientModel {
                 }
             }
             Notification::StateChanged { version, reason } => {
-                if !self.state.accept(*version) {
+                // `accept_state_change`, not `accept`: the server pushes the snapshot and
+                // the reason at the **same** version (see that method).
+                if !self.state.accept_state_change(*version) {
                     return Effect::Nothing;
                 }
                 self.state.last_reason = Some(reason.clone());
@@ -330,7 +362,10 @@ impl ClientModel {
                 if reason == "reload" {
                     self.reload_badge = true;
                 }
-                Effect::Status
+                Effect::StateChanged {
+                    version: *version,
+                    reason: reason.clone(),
+                }
             }
             Notification::Diagnostics { items } => {
                 self.diags = items
@@ -654,7 +689,10 @@ mod tests {
             version: 2,
             reason: "reload".to_owned(),
         });
-        assert!(matches!(e, Effect::Status));
+        assert!(
+            matches!(e, Effect::StateChanged { version: 2, ref reason } if reason == "reload"),
+            "a state_changed says which change it was"
+        );
         assert!(m.reload_badge, "a reload shows the badge");
         assert_eq!(m.last_reason.as_deref(), Some("reload"));
 
