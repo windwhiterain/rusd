@@ -385,3 +385,55 @@ layers（strength 序，session 最强）+ arcs（边/命名行指向目标层�
   （mesh / points / instances 互斥可见）；旧 RusdScatter 回退回归不变。
 - agent：op_name/input/output 上 wire；cook 顺序正确；未知字段不破坏旧 client。
 - viewer：op 行标签含 op_name 与 input→output；点击仍发 preview{upto}（mock 断言）。
+## v1.5.1 增补（派活前裁定：钉死跨 crate 表面；2026-11-18 父会话裁定）
+
+v1.5 的实现拆给三个并行 subagent（proc / agent / viewer）。下列裁定把跨 crate 表面钉死，
+各 crate 只改自己的；偏离先报告父会话，不私自改契约。
+
+### 参数与替换语义（proc）
+
+- `RusdSamplePoints` 与 `RusdInstances` 的输入参数都拼作 `input_points = <prim path>`
+  （与 `RusdScatter` 同名）。sample 只吃 **Mesh surface**（无 mesh 拓扑 ⇒ `E_INPUT_GEOMETRY`）；
+  instances 只吃 **Points / point3f[] 点云**（无 points ⇒ `E_INPUT_GEOMETRY`）。
+- sample 参数：`count` + `seed`（面积加权采样，纪律同 v1.4.1）；instances 参数：
+  `prototype` + `scale` + `max_prims`（逐点实例，超预算截断保原序 + `W_BUDGET`），无 `count`。
+- **替换语义逐 op 成立**：sample 的输出层对输入 mesh 写 `visibility = "invisible"` over；
+  instances 的输出层对输入 points 写同样的 over。⇒ 三档前缀**互斥可见**：
+  root = 仅 mesh；upto=sample = 仅点云；upto=instances = 仅实例。输入 spec 不删。
+- 输出 prim 路径沿用 RusdScatter 现有约定（proc 内部一致）；旧单步 RusdScatter 与
+  city/forest 示例不动。`examples/mesh_scatter.rusd` 重写为 sample → instances 两段 op。
+
+### cook 暴露 op 元数据（proc → agent）
+
+- `CookResult` 增 `pub ops: Vec<CookOp>`；`CookOp { pub id: String, pub generator: String,
+  pub input: Option<String>, pub layer_id: String }`：
+  - `id` = node prim path；`generator` = schema 名；`input` = `input_points` 参数值（无则 None）；
+    `layer_id` = 该 node **当前**输出层 identifier。
+  - `ops` = 本次 pass 后**所有有 memo 输出层的 node**（含 reused 的），按 cook 顺序（topo）。
+    rebuild 后 layer_id 必换；调用方每次 cook 后整体替换，不得累积。
+- 父会话已在 main 落了该 API 的机械 stub（最小填充），proc subagent 负责 generators、
+  示例重写、三段前缀测试，以及 ops 的回归测试（含 reused 场景）。
+
+### composition_tree join（agent）
+
+- op 层条目增 `op_name` / `input` / `output`：join 键 = `CookOp.layer_id == 条目 id`；
+  `op_name` = generator，`input` = input（None ⇒ JSON null），`output` = layer_id。
+- join 缺失（手工构造的 stage 等）⇒ `op_name`/`input` = null，`output` = 条目 id。
+  非 op 层不带三字段。additive：旧 client 忽略未知字段，wire 既有字段不改。
+- agent 每次 cook 后保存最新 `CookResult.ops` 供 join；预览前缀不改变 ops（ops 是全量 cook 的）。
+
+### op 行标签（viewer）
+
+- 主标签 = `op_name`（null 时回退 anon identifier，现状行为）；
+  副文本 = `{input} → {output 摘要}`：input null ⇒ `(parametric)`；output 摘要 = identifier
+  截断 ≤ 20 字符 + `…`（不再整行 anon id）。
+- 行序 = cook 顺序（现状已对）；点击仍发 `preview{upto: 该层 id}`，final 行/按钮语义不变。
+- mock server 断言：标签含 op_name 与 input→output；点击 wire 不变。
+
+### 验收补充
+
+- proc：ops 含 reused node（增量 pass 后 ops 不丢旧 node）；三段前缀互斥可见（composed
+  visibility 断言）；sample 点数==count 且落在输入表面；instances 逐点变换一致。
+- agent：op_name/input/output 上 wire 且 join 正确（含 input=null 的参数式 scatter）；
+  未知字段不破坏旧 client（既有 wire 回归）。
+- viewer：op 行标签断言（op_name + input→output + parametric 回退 + anon 回退）。
