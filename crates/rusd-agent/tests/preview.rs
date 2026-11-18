@@ -531,22 +531,30 @@ fn an_unknown_upto_is_invalid_params() {
         .expect("the root layer")
         .clone();
 
-    // A layer that is not an op — the root — is not a place a cook can stop.
-    let id = client.send("preview", json!({"upto": root_layer}));
+    // A name nothing in the stage answers to is refused, and the message names
+    // **both** kinds of stop that would have worked: the cook output layers and,
+    // since PROTOCOL v1.5.3, the root layer.
+    let id = client.send("preview", json!({ "upto": "anon:404:nowhere.usda" }));
     let error = client.error(id);
     assert_eq!(error["code"].as_i64(), Some(-32602), "{error}");
+    let message = error["message"].as_str().unwrap_or_default().to_owned();
     assert!(
-        error["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("not a cook output layer"),
+        message.contains("neither a cook output layer nor the root layer"),
         "the message says what went wrong: {error}"
     );
+    assert!(
+        message.contains(root_layer.as_str()),
+        "the message names the root layer `{root_layer}`: {error}"
+    );
+    for op in &ops {
+        assert!(
+            message.contains(op.as_str()),
+            "the message lists the op layer `{op}`: {error}"
+        );
+    }
 
-    // Neither is a name nothing answers to.
-    let id = client.send("preview", json!({"upto": "anon:404:nowhere.usda"}));
-    let error = client.error(id);
-    assert_eq!(error["code"].as_i64(), Some(-32602), "{error}");
+    // The root layer on its own is a stop now, not an error — a separate test
+    // covers what it composes — so it is not repeated here.
 
     // `upto` itself is required: `{}` is not "the final composition".
     let id = client.send("preview", json!({}));
@@ -568,6 +576,234 @@ fn an_unknown_upto_is_invalid_params() {
     );
 }
 
+// --- the root stop (PROTOCOL v1.5.3) ---------------------------------------
+
+/// The id of the tree's `kind = "root"` layer, or the row naming `rusd_root`.
+fn root_layer_of(tree: &Value) -> String {
+    let rows = tree["layers"].as_array().expect("layers is an array");
+    rows.iter()
+        .find(|row| row["kind"].as_str() == Some("root"))
+        .or_else(|| {
+            rows.iter()
+                .find(|row| row["id"].as_str().unwrap_or_default().contains("rusd_root"))
+        })
+        .and_then(|row| row["id"].as_str())
+        .expect("the tree lists the root layer")
+        .to_owned()
+}
+
+#[test]
+fn a_preview_stopping_at_the_root_layer_shows_the_pipelines_input() {
+    // The root stop PROTOCOL v1.5.3 requires to be reachable: the root layer and
+    // the session overrides, with **every** cook output layer muted. What a
+    // viewer sees is the document's own scene — the geometry the cook reads —
+    // and none of what the generators wrote.
+    let (_server, mut client, full, version) = opened();
+    let tree = client.call("composition_tree", json!({}));
+    let (ops, _) = tree_layers(&tree);
+    let root_layer = root_layer_of(&tree);
+
+    let answer = client.call("preview", json!({ "upto": root_layer }));
+    assert_eq!(answer["upto"].as_str(), Some(root_layer.as_str()));
+    assert_eq!(
+        answer["root"].as_bool(),
+        Some(true),
+        "the answer says this stop is the root layer, not a cook op: {answer}"
+    );
+
+    let pushed = client.notification();
+    assert_eq!(
+        pushed["method"].as_str(),
+        Some("stage_snapshot"),
+        "{pushed}"
+    );
+    let snapshot = pushed["params"].clone();
+    assert_eq!(
+        snapshot["upto"].as_str(),
+        Some(root_layer.as_str()),
+        "the snapshot names the layer the preview stops at: {snapshot}"
+    );
+    assert_eq!(
+        snapshot["version"].as_u64(),
+        Some(version),
+        "a preview is not a scene mutation: the version must not move"
+    );
+
+    let stage = compose(&snapshot);
+    // Nothing a generator authored is here: the street grid's ground and the
+    // scatter's instances both come from cook output layers.
+    assert!(
+        !has_prim(&stage, "/World/City/Ground"),
+        "the street grid's output is muted at the root stop: {} prims",
+        prim_count(&stage)
+    );
+    assert!(
+        !has_prim(&stage, "/World/StreetProps/i"),
+        "the scatter's instances are muted at the root stop"
+    );
+    // The document's own prims are, which is what makes the stop useful: they
+    // are the input the pipeline reads.
+    for path in ["/World", "/World/City", "/World/Prototypes"] {
+        assert!(
+            has_prim(&stage, path),
+            "{path} is authored by the document, so it survives: {} prims",
+            prim_count(&stage)
+        );
+    }
+    let root_count = prim_count(&stage);
+    let root_bounds = bounds_of(&stage);
+
+    // The stop after the first op is strictly bigger: it holds the street grid.
+    client.call("preview", json!({ "upto": ops[0].clone() }));
+    let city_stage = compose(&client.notification()["params"].clone());
+    assert!(
+        has_prim(&city_stage, "/World/City/Ground"),
+        "the first op's prefix does hold the street grid"
+    );
+    assert!(
+        root_count < prim_count(&city_stage),
+        "the root stop composes fewer prims than the first op's prefix: {root_count} vs {}",
+        prim_count(&city_stage)
+    );
+    assert_ne!(
+        root_bounds,
+        bounds_of(&city_stage),
+        "the missing street grid must change the composed bbox: {root_bounds:?}"
+    );
+    assert_ne!(
+        root_bounds,
+        bounds_of(&compose(&full)),
+        "and it is not the final composition either"
+    );
+
+    // The version never moved through any of it.
+    let hello = client.call("hello", json!({ "protocol": 1 }));
+    assert_eq!(
+        hello["version"].as_u64(),
+        Some(version),
+        "preview does not advance the version"
+    );
+}
+
+#[test]
+fn the_root_stop_survives_a_rebuild() {
+    // The root stop is remembered as **a position no cook reaches** (`-1`), not
+    // as the identifier the client sent: a rebuild mints a new anonymous root
+    // layer, and the stop must mean the same thing on the new stack.
+    let (_server, mut client, _snapshot, _version) = opened();
+    let tree = client.call("composition_tree", json!({}));
+    let root_layer = root_layer_of(&tree);
+    client.call("preview", json!({ "upto": root_layer }));
+    let pushed = client.notification()["params"].clone();
+    assert_eq!(pushed["upto"].as_str(), Some(root_layer.as_str()));
+
+    // A document edit rebuilds the stack, and every anon identifier with it.
+    let (_, snapshot, state) = client.mutate(
+        "patch",
+        json!({"ops": [{"op": "set", "prim": "/World/City", "property": "blocks_x", "value": 3}]}),
+    );
+    assert!(state["version"].as_u64().unwrap() > 0);
+    assert_eq!(state["reason"].as_str(), Some("patch"));
+    let rebuilt_root = snapshot["upto"].as_str().unwrap_or_default().to_owned();
+    assert!(
+        rebuilt_root.contains("rusd_root"),
+        "the rebuilt snapshot still stops at the root layer: {snapshot}"
+    );
+    assert_ne!(
+        rebuilt_root, root_layer,
+        "the rebuild really did mint a new anonymous root layer, so the stop \
+         surviving is the position and not the spelling: {root_layer} vs {rebuilt_root}"
+    );
+    assert!(
+        !has_prim(&compose(&snapshot), "/World/City/Ground"),
+        "and no cook output is composed there"
+    );
+
+    // The state itself is still in force, not just the one snapshot: a further
+    // mutation (the undo re-cooks the restored document) carries it too.
+    let (_, snapshot, _) = client.mutate("undo", json!({}));
+    assert!(
+        snapshot["upto"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("rusd_root"),
+        "the root stop is remembered across rebuilds: {snapshot}"
+    );
+    assert!(!has_prim(&compose(&snapshot), "/World/City/Ground"));
+
+    // The identifiers the connection is *sent* keep moving with each rebuild,
+    // while what it asked for does not. This is the property `-1` buys.
+    assert_ne!(
+        snapshot["upto"].as_str().unwrap_or_default(),
+        rebuilt_root,
+        "a second rebuild mints yet another root layer: {}",
+        snapshot["upto"]
+    );
+
+    // And `null` still leaves it for the final composition.
+    let answer = client.call("preview", json!({ "upto": Value::Null }));
+    assert_eq!(answer["upto"], Value::Null);
+    let final_snapshot = client.notification()["params"].clone();
+    assert!(final_snapshot.get("upto").is_none(), "{final_snapshot}");
+}
+// --- the root stop and the session layer -----------------------------------
+
+#[test]
+fn the_root_stop_keeps_the_session_overrides() {
+    // PROTOCOL v1.5.3: the root stop = the root layer **plus** the session
+    // overrides, and no cook op. The overrides belong to the session layer, which
+    // is not a sublayer of the root layer, so muting the whole cook leaves them
+    // in force — a human's gizmo drag is stronger than every layer of the stack.
+    let (_server, mut client, _full, _opened_version) = opened();
+    let tree = client.call("composition_tree", json!({}));
+    let root_layer = root_layer_of(&tree);
+
+    let target = [7.0f32, 8.0, 9.0];
+    let (_, _, state) = client.mutate(
+        "opinion",
+        json!({"ops": [{"path": "/World/City", "field": "xformOp:translate", "value": target, "op": "set"}]}),
+    );
+    let version = state["version"].as_u64().expect("a version");
+
+    client.call("preview", json!({ "upto": root_layer }));
+    let snapshot = client.notification()["params"].clone();
+    assert_eq!(snapshot["upto"].as_str(), Some(root_layer.as_str()));
+    assert_eq!(snapshot["version"].as_u64(), Some(version));
+
+    // The override is composed, and none of the cook's output is.
+    let stage = compose(&snapshot);
+    let path = openusd::sdf::path("/World/City").expect("a prim path");
+    let prim = stage.prim(path).expect("the prim composes");
+    let translate = match prim
+        .attribute("xformOp:translate")
+        .get::<openusd::sdf::Value>()
+        .expect("the attribute is readable")
+    {
+        Some(openusd::sdf::Value::Vec3f(v)) => Some([v[0], v[1], v[2]]),
+        other => panic!("the composed translate is a vec3f, got {other:?}"),
+    };
+    assert_eq!(
+        translate,
+        Some(target),
+        "the root stop carries the session override"
+    );
+    assert!(
+        !has_prim(&stage, "/World/City/Ground"),
+        "and none of the street grid's own output"
+    );
+
+    // The override survives the return to the final composition: the preview
+    // neither consumed nor perturbed it.
+    client.call("preview", json!({ "upto": Value::Null }));
+    let final_snapshot = client.notification()["params"].clone();
+    assert!(final_snapshot.get("upto").is_none(), "{final_snapshot}");
+    assert!(
+        has_prim(&compose(&final_snapshot), "/World/City/Ground"),
+        "the whole composition is back"
+    );
+    let hello = client.call("hello", json!({ "protocol": 1 }));
+    assert_eq!(hello["version"].as_u64(), Some(version));
+}
 #[test]
 fn each_connection_keeps_its_own_preview() {
     let (server, mut full_viewer, _snapshot, version) = opened();
@@ -628,6 +864,91 @@ fn each_connection_keeps_its_own_preview() {
     assert!(has_prim(&compose(&full_after), "/World/StreetProps/i"));
 }
 
+#[test]
+fn three_viewers_on_three_stops_get_three_snapshots() {
+    // `publish` builds one snapshot per **distinct** preview state, and the root
+    // stop is an ordinary state in that set (PROTOCOL v1.5.3): two viewers both
+    // on `-1` share one flatten, and the one on the final composition must still
+    // get its own. A mutation is where all three are told at once.
+    let (server, mut full_viewer, _snapshot, version) = opened();
+    let tree = full_viewer.call("composition_tree", json!({}));
+    let root_layer = root_layer_of(&tree);
+
+    let mut root_a = Client::connect(server.local_addr());
+    root_a.call("hello", json!({ "client": "root-a", "protocol": 1 }));
+    root_a.call("subscribe", json!({ "client": "root-a" }));
+    let _ = root_a.notification();
+    root_a.call("preview", json!({ "upto": root_layer }));
+    let first = root_a.notification()["params"].clone();
+    assert_eq!(first["upto"].as_str(), Some(root_layer.as_str()));
+
+    let mut root_b = Client::connect(server.local_addr());
+    root_b.call("hello", json!({ "client": "root-b", "protocol": 1 }));
+    root_b.call("subscribe", json!({ "client": "root-b" }));
+    let _ = root_b.notification();
+    root_b.call("preview", json!({ "upto": root_layer }));
+    let second = root_b.notification()["params"].clone();
+    assert_eq!(second["upto"].as_str(), Some(root_layer.as_str()));
+
+    // One mutation: three connections, three stops.
+    full_viewer.call(
+        "patch",
+        json!({"ops": [{"op": "set", "prim": "/World/City", "property": "blocks_x", "value": 3}]}),
+    );
+    let (a_after, a_state) = root_a.mutation();
+    let (b_after, b_state) = root_b.mutation();
+    let (full_after, full_state) = full_viewer.mutation();
+    assert_eq!(a_state["version"].as_u64(), Some(version + 1));
+    assert_eq!(b_state["version"].as_u64(), Some(version + 1));
+    assert_eq!(full_state["version"].as_u64(), Some(version + 1));
+
+    // Both root-stopped viewers see the same root composition, with no cook
+    // output in it, and the third sees the whole scene.
+    for after in [&a_after, &b_after] {
+        assert!(
+            after["upto"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rusd_root"),
+            "a root-stopped viewer keeps its stop: {after}"
+        );
+        assert!(!has_prim(&compose(after), "/World/City/Ground"));
+    }
+    assert_eq!(
+        a_after, b_after,
+        "two viewers on the same stop share the one snapshot"
+    );
+    assert!(
+        full_after.get("upto").is_none(),
+        "the viewer that never previewed still gets the final composition: {full_after}"
+    );
+    assert!(has_prim(&compose(&full_after), "/World/City/Ground"));
+
+    // And the scene each of them holds is what its own stop composes: a later
+    // snapshot request from the full viewer does not move the others. The patch
+    // rebuilt the stack and minted new anonymous layer ids, so the op to stop at
+    // is the one the tree names **now**.
+    let tree = full_viewer.call("composition_tree", json!({}));
+    let (ops, _) = tree_layers(&tree);
+    full_viewer.call("preview", json!({ "upto": ops[0].clone() }));
+    let op_snapshot = full_viewer.notification()["params"].clone();
+    assert_eq!(op_snapshot["upto"].as_str(), Some(ops[0].as_str()));
+    assert!(has_prim(&compose(&op_snapshot), "/World/City/Ground"));
+    assert!(
+        !has_prim(&compose(&op_snapshot), "/World/StreetProps/i"),
+        "the op stop holds the street grid but not the scatter"
+    );
+
+    // The root-stopped viewers were not touched by that: a notification to one
+    // connection is not a state change for the others, and there was none to
+    // send — a preview moves no version.
+    let hello = root_a.call("hello", json!({ "protocol": 1 }));
+    assert_eq!(
+        hello["version"].as_u64(),
+        Some(version + 1),
+        "the version is the patch's, not the preview's"
+    );
+}
 #[test]
 fn a_preview_from_an_unsubscribed_connection_sends_no_snapshot() {
     // A snapshot is what a subscription is for. A connection that asked to
