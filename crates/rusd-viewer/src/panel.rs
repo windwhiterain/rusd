@@ -251,6 +251,7 @@ fn row(
     // `comp_node` ask).
     let is_current_preview = is_current_preview(node, preview);
     let text = match node.kind {
+        TreeNodeKind::Layer if node.op => RichText::new(&node.label).strong().underline(),
         TreeNodeKind::Layer => RichText::new(&node.label).strong(),
         TreeNodeKind::Arc => RichText::new(&node.label).italics(),
         TreeNodeKind::Prim | TreeNodeKind::VariantSet => RichText::new(&node.label),
@@ -267,7 +268,31 @@ fn row(
     let click_action = action_for;
 
     let mut clicked: Option<TreeAction> = None;
-    if node.children.is_empty() {
+    if node.op {
+        // **An op row is a control, not a twisty.** Its click previews; if it also
+        // collapsed its subtree, one click would mean two things and the user could not
+        // expand without changing what the viewport composes. An op layer's children are
+        // a couple of variant sets at most (v1.3 draws no prim rows), so it is drawn as a
+        // plain row with its subtree always visible.
+        ui.horizontal(|ui| {
+            indent(ui, depth);
+            if ui
+                .selectable_label(is_current_preview, text)
+                .on_hover_text(format!(
+                    "预览到此 op 之前：preview{{upto: \"{}\"}}",
+                    node.id
+                ))
+                .clicked()
+            {
+                clicked = Some(TreeAction::Preview(Some(node.id.clone())));
+            }
+        });
+        for child in &node.children {
+            if let Some(a) = row(ui, child, depth + 1, selected, preview) {
+                clicked = Some(a);
+            }
+        }
+    } else if node.children.is_empty() {
         ui.horizontal(|ui| {
             indent(ui, depth);
             if ui
