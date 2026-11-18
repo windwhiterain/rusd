@@ -358,3 +358,30 @@ layers（strength 序，session 最强）+ arcs（边/命名行指向目标层�
 ### 收口
 
 - main 上 rusd-viewer/window.rs 的 fmt 漂移由父会话统一 `cargo fmt --all` 收口。
+## v1.5 增补（用户裁定：viewer 要看到 mesh→points→instances 三段管线；2026-11-18）
+
+**scatter 拆成两个显式 op**，中间点云必须是一个真实 layer，前缀预览才看得到中间态：
+
+- `RusdSamplePoints`（mesh → points）：读输入 mesh，面积加权采样 count 个点（seed），
+  在**自己的输出 layer** 写 Points prim（point3f[]，采样位置）。
+- `RusdInstances`（points → instances）：读输入 points，逐点写原型实例到**自己的输出
+  layer**，并对输入 points prim 写 visibility override（替换语义）。
+- 链：作者 mesh 层 → sample op 层（points）→ instances op 层（instances）。
+  `examples/mesh_scatter.rusd` 重写为两段 op；旧单步 RusdScatter 保留回退（city/forest 不动）。
+
+### 管线可读性（agent ↔ viewer）
+
+- `composition_tree` 的 op 层条目增：`op_name`（generator schema 名，如
+  `RusdSamplePoints`/`RusdInstances`/`RusdScatter`）、`input`（输入 prim path 或层）、
+  `output`（输出层 identifier）。非 op 层不带这些字段。
+- viewer op 行标签 = `op_name`＋`input → output` 摘要（不再只显示 anon identifier）；
+  行顺序 = cook 顺序；前缀预览语义不变（v1.4）。
+- 三档前缀可见：upto=null 之前（root）= 输入 mesh；upto=sample 层 = 点云；
+  upto=instances 层 = 实例（final 同）。
+
+### 验收（各 crate）
+
+- proc：sample 点数==count 且落在输入表面；instances 逐点变换一致；三段前缀几何断言
+  （mesh / points / instances 互斥可见）；旧 RusdScatter 回退回归不变。
+- agent：op_name/input/output 上 wire；cook 顺序正确；未知字段不破坏旧 client。
+- viewer：op 行标签含 op_name 与 input→output；点击仍发 preview{upto}（mock 断言）。
