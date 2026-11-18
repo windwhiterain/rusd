@@ -508,8 +508,10 @@ impl Shell {
                 only_selected: self.only_selected,
             });
         }
-        // The rows are on screen until the answer replaces them (`view::ask_tree`).
-        self.tree_asked = true;
+        if plan.asked_tree {
+            // The rows are on screen until the answer replaces them (`view::ask_tree`).
+            self.tree_asked = true;
+        }
         self.status = self.model.status_line_zh();
         self.request_repaint();
     }
