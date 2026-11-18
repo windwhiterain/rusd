@@ -1,13 +1,14 @@
-# Rusd 独立验证记录（M6 导出桥 · D13 viewer UX）
+# Rusd 独立验证记录（M6 导出桥 · D13 viewer UX · D14 几何 PCG 与预览）
 
-状态：完成（post-fix 复测）· 2026-11-17 · 对应 ROADMAP M6 导出桥验收、M4' D13 viewer UX 验收
+状态：完成（post-fix 复测）· 2026-11-18 · 对应 ROADMAP M6 导出桥、M4' D13 viewer UX 与 D14 验收
 
-本文记录两类**独立验证**，都不自证：
+本文记录三类**独立验证**，都不自证：
 
 - **§1–§8：M6 导出桥（展开→flatten→usda/usdc/usdz）的验证链**。用第三方参考实现
   （pxr / usd-core）读回 Rusd 导出的 USD，再用路径追踪渲染器（Cycles）出图，对照
   `rusd expand` 的 prim 数与几何。验证链不依赖 openusd（Rusd 自己的后端）。
 - **§9：D13 viewer UX 的真窗验收**。真窗口 + 真剪切板 + `capture_get`，读系统状态而非看截图。
+- **§10：D14 几何 PCG + 管线预览的真窗验收**。分面 scatter 贴 mesh 表面、点 op 行看前缀。
 
 脚本在 `scripts/verify/`（tracked）；产物在 `target/`（gitignored，本地产物，需先跑
 `rusd export` 才会出现）。
@@ -263,3 +264,103 @@ Get-Clipboard            # 期望 /World/City/b3_1/lot1_0
 **mask 白区 bbox 验收**：把 `mask` 解码成 PNG，统计白色像素的包围盒，应等于拖选矩形在
 viewport texels 下的位置（本轮 `(773,665)-(1073,855)`）。这一条能同时验出"选区算子正确"和
 "截图与视口同尺寸同坐标系"。
+
+## 10. D14 几何 PCG + 管线预览真窗验收（2026-11-18）
+
+D14 把「过程化」从参数式采样推到**真正的几何驱动**（scatter 贴输入 mesh 表面），并把管线
+的**中间态**搬进 viewer（按 op 前缀预览）。两条都是**在真窗口里看的**，不是只跑单测。
+
+### 10.1 几何 scatter：实例贴满输入 mesh 表面（merge `a8a93b9` ← `ada1a73`）
+
+`examples/mesh_scatter.rusd` 里 Terrain 是 3×3 顶点 / 4 四边形的起伏地面，`RusdScatter` 用
+`input_points = "/World/Terrain"` 读它，输出 **240** 个原型实例：
+
+- **面积加权**：按三角形累积面积选面、再取重心坐标选点 ⇒ 实例密度与面积成正比，不是均匀
+  撒在包围盒里。「贴满表面」是肉眼可验的（着色起伏与地形一致）。
+- **合成树 241 reference 弧** = 240 实例 + 1 条：全部是 **same-stack 引用**
+  `/World/Prototypes/Tuft`（不是外链），所以匿名安全也成立。
+- **替换语义** = 输出层写实例 **+ 对输入 prim 的 `visibility` override**（`"invisible"`）。
+  停下看时输入 mesh 的 spec 没被删除，只被更强的层盖住——这就是 §10.2 里「前缀仍看到原 mesh」
+  能成立的原因。
+- **points 模式逐点**（`examples/points_scatter.rusd`）：点云形态不做面积加权，逐点落。
+- **参数式回退逐字节不变**：不用 `input_points` 时走原路径，输出与 D13 前**逐字节相同**。
+- **rusd-scene 表面支撑照准**（真缺口）：此前 **Mesh 根本不可作者**——points 映射不到 USD 类型、
+  索引落成 `int64[]`；修完才有 `world_points` / `world_triangles`，`extract` 也遵守 composed
+  visibility（否则被覆盖的输入 mesh 仍会被提取）。
+
+### 10.2 前缀预览：点 op 行 ⇒ 看上游（merge `db8d93f` ← `3d44246`）
+
+在 city 文档上点合成树里的 city op 行：
+
+| 动作 | 结果 |
+| --- | --- |
+| 点 op 行 | **134 prim**，状态显示「预览 ≤ `anon:15:rusd_city.usda`」 |
+| 同上，scatter 实例 | **301 个消失**（scatter op 在 city 之后，前缀不含它） |
+| 同上，root 层原型 prim | **仍可见**（root 不在前缀之外——本该如此） |
+| 点「final」 | **434 恢复**（回到全量） |
+
+- **按连接隔离**：预览态是订阅连接自己的，别的 client 不受影响（`preview` 不向非订阅连接补推
+  快照）。
+- **跨 patch/undo 存活**：预览态**存 cook 顺序位置**而非 layer identifier——op 层是匿名 id，
+  每次 rebuild 必换，存 identifier 会让预览在第一个 patch 后失效；存位置则跨 patch/undo 稳定
+  （v1.4.2 裁定）。快照仍报当前 identifier 供显示。
+
+### 10.3 overlay compact（merge `5364aba` ← `588c069`）
+
+预览态 / 状态信息的面板收缩到 **11pt 字号、宽 ≤460pt、按 `o` 折叠、占屏 ≤25% 面积**，
+不挡画面主体。
+
+### 10.4 viewer-ui2：`reason` 从未到达模型（merge `d3b819b` = `6d861a6` + `289de6e`）
+
+**真根因**：server 先发 `stage_snapshot{version:n}`、再发 `state_changed{version:n}`——**同一个
+version**。viewer 两侧都用严格的 `>` 判重，于是快照把计数器抬到 `n` 之后，紧随其后的
+`state_changed` 被当成重复**全部丢弃** ⇒ `reason` 从未到达模型 ⇒ 合成树与相机都不跟。
+
+之所以长期没被发现：测试里喂的 `state_changed` 版本，没有任何快照携带过。是被**同时发两者的
+mock**（`tests/state_change_v142.rs`）抓出来的。
+
+**修复** = 新增 `accept_state_change`（`crates/rusd-viewer/src/protocol.rs`）：
+
+| 情形 | 处置 | 理由 |
+| --- | --- | --- |
+| 同 version | **接受**，且**不抬 floor** | 它不携带场景，不会把画面回滚 |
+| 更旧 | 丢弃 | 讲的是已被越过的那个场景 |
+| 更新 | 接受，`note_version` 抬 floor（`max`） | 正常推进 |
+
+**`reason` 驱动刷新**（`crate::view`，窗口与测试共用一份规则）：
+
+| reason | 重取合成树 | 重拟合相机 |
+| --- | --- | --- |
+| `open` | **是** | **是**（新文档，首帧） |
+| `patch` / `opinion` / `undo` / `redo` / `reload` | **是** | 否（同一文档，用户的 orbit 优先） |
+| `preview` | 否 | 否（它不是 mutation，不推进 version，根本不产生 `state_changed`） |
+
+- **相机重拟合只在 `open`**：a city framed at 23 units, then a single-mesh scatter document —
+  第二个会落进第一个的取景角落。其余 reason 重合成的是**同一文档**，用户的 orbit 应当保住
+  （REMOTE §6「相机归 client」）。
+- **opinion 触发树重取按往返合并**（`289de6e`）：≤30Hz 的拖动不会每个 opinion 都打一次
+  `composition_tree`，否则拖动会打爆 server。
+- **真窗结果**：连续 `open mesh_scatter → city`，合成树自动更新、相机自动重拟合到整城居中
+  （`dist 1537.9`、`target = center`），不再需要手动点「刷新」。
+
+### 10.5 复现命令
+
+```bash
+# 1) 开两份文档，看树自动跟随 + open 时相机重拟合（不需要手动刷新）
+rusd-viewer.exe view --connect 127.0.0.1:8765
+#    → File ▸ Open examples/mesh_scatter.rusd，再 Open examples/city.rusd
+#    预期：合成树行自动换成新文档的层；相机自动 fit 整城居中
+
+# 2) 点合成树里的 city op 行 ⇒ 前缀预览
+#    预期：134 prim / 状态「预览 ≤ anon:15:rusd_city.usda」/ 301 scatter 实例消失 /
+#          root 层原型 prim 仍在
+
+# 3) 点「final」⇒ 434 恢复（与 2 交替点，可反复验证）
+```
+
+§9 的 `Get-Clipboard` 判据**不适用**于此节：D14 验的是**画面与树的状态**，不是剪切板。
+
+### 10.6 测试
+
+merge 后全 workspace **468 绿**，其中 `rusd-viewer` **282**（含 mock server 协议集成与
+`tests/state_change_v142.rs` 的同 version 回归）。

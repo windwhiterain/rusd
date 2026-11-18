@@ -376,3 +376,52 @@ viewer 不再是 server 进程内的一个窗口，而是一个**独立 client �
   误判为产品缺陷。
 
 报告"窗口/渲染有 bug"之前，先用 aware 探针复量一遍——否则量到的是虚拟化后的尺子。
+
+## 14. 通知驱动的 client 刷新（D14 viewer-ui2 根因与规则）
+
+### 14.1 同 version 的 `state_changed` 必须接受（真根因，merge `d3b819b`）
+
+server 的发送顺序是 **`stage_snapshot{version:n}` → `state_changed{version:n}`**——**同一个
+version**，正是这个同号让 `reason` 能描述刚推来的那个场景（PROTOCOL「消息顺序」）。
+
+viewer 两侧原先都用严格 `>` 判重，于是快照先把计数器抬到 `n`，紧随其后的 `state_changed`
+被当作重复**全部丢弃** ⇒ **`reason` 从未到达模型** ⇒ 合成树与相机都不跟（真窗表现为
+「open 了新文档，树还是旧的，相机不动」）。
+
+**规则**（`ClientState::accept_state_change`，`crates/rusd-viewer/src/protocol.rs`）：
+
+| 入参 version | 处置 |
+| --- | --- |
+| **等于**已见最大 | **接受**；**不抬 floor** |
+| 旧于已见最大 | 丢弃（讲的是已被越过的场景） |
+| 新于已见最大 | 接受；`note_version` 抬 floor（取 `max`） |
+
+两条不对称的理由：
+
+- **快照**必须严格更新——它**携带场景**，同 version 重放会把画面回滚；
+- **`state_changed`** 不携带场景，接受它**动不了画面**，所以同 version 安全；
+  **不抬 floor** 是必须的，否则下一次同 version 的真 mutation 会被误判 stale，画面永久冻住。
+
+floor 是 `Option`：没有 floor 时 version 0 是**首帧**，不是重复。
+
+### 14.2 `reason` 驱动刷新（`crate::view`，窗口与测试共用一份）
+
+| reason | 重取合成树 | 重拟合相机 | 说明 |
+| --- | --- | --- | --- |
+| `open` | 是 | **是** | 新**文档**：上一份的取景对新文档毫无意义 |
+| `patch` / `opinion` / `undo` / `redo` / `reload` | 是 | 否 | 重合成的是**同一文档**，用户的 orbit 优先（§6「相机归 client」） |
+| `preview` | 否 | 否 | 不是 mutation、不推进 version，**根本不产生 `state_changed`** |
+
+- **为什么 `open` 要重拟合**：city framed at 23 units 之后 `open` 一个单 mesh scatter 文档，
+  后者会落进前者的取景角落。实测连续 `open mesh_scatter → city`：树自动更新、相机重拟合到
+  整城居中（`dist 1537.9`、`target = center`）。
+- **树的重取为什么不能省**：树是**按连接**读的，只读一次会在 `open` 之后继续显示上一份文档
+  的层——这正是用户必须手点「刷新」才对的旧症状。
+- 已上屏的树行在答复到达前**不清空**：每个 mutation 都有 `state_changed`，每次都清成
+  loading 行会闪烁用户正在读的东西。
+
+### 14.3 opinion 触发树重取：按往返合并（merge `d3b819b`）
+
+拖动 gizmo 时 opinion 以 ≤30Hz 出站。若每个 `state_changed` 都发一次 `composition_tree`，
+拖动就会打爆 server。规则：**同一往返窗口内只保留一个在途的树请求**，答复到达后若有新请求
+待发则合并为一次；拖动期间树的内容不变，所以合并不会漏掉可见变化。

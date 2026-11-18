@@ -118,6 +118,29 @@ peer 构建 scp 分发）。server 不再拥有相机——相机归 client，se
   - [x] 底栏可见：开窗改用 `GetMonitorInfoW` `rcWork` 夹取居中（底栏不再被任务栏遮）；修 `480227d`
   - [x] 合成树面板真数据（v1.3 只画结构）：4 层 / 2 arc / 475 prim / 0 variant set；点 prim 走
         `pick → prim_id → comp_node`
+- [x] **D14 几何 PCG + 管线预览真窗验收**（2026-11-18；证据见 `docs/VERIFICATION.md` §10，
+      捕获规则见 `REMOTE.md` §14）：
+  - [x] 几何 scatter（merge `a8a93b9` ← `ada1a73`）：`examples/mesh_scatter.rusd` 实例**贴满
+        输入 mesh 表面**（三角形面积加权 + 重心坐标）；合成树 **241 reference 弧**，全部是
+        same-stack 引用 `/World/Prototypes/Tuft`；**替换语义** = 输出层实例 + 输入 prim 的
+        `visibility` override；`points_scatter.rusd` 逐点模式；**参数式回退逐字节不变**。
+        rusd-scene 表面支撑照准（Mesh 此前不可作者：points 映射不到 USD 类型、索引落
+        `int64[]`）；新增 `world_points`/`world_triangles`，`extract` 遵守 composed visibility
+  - [x] 前缀预览（merge `db8d93f` ← `3d44246`）：点 city op 行 ⇒ **134 prim**（「预览 ≤
+        `anon:15:rusd_city.usda`」）、**301 个 scatter 实例消失**（root 层原型 prim 仍可见，
+        本该如此）；点「final」⇒ **434 恢复**；按连接隔离、**跨 patch/undo 存活**（存 cook
+        顺序位置而非 identifier）
+  - [x] overlay compact（merge `5364aba` ← `588c069`）：11pt / 宽 ≤460pt / `o` 折叠 / 占屏 ≤25%
+  - [x] **viewer-ui2 真根因修复**（merge `d3b819b` = `6d861a6` + `289de6e`）：`state_changed`
+        与快照**同 version** 被严格 `>` accept 丢弃 ⇒ `reason` 从未到模型 ⇒ 树/相机不跟。
+        修 `accept_state_change`（同 version 接受 / 更旧丢 / 不抬 floor）；`reason` 驱动刷新
+        （`open` ⇒ 重取树 + 重拟合；patch/opinion/undo/redo/reload ⇒ 只重取树；preview ⇒ 都不动）；
+        opinion 树重取按往返合并（≤30Hz 拖动不打爆 server）。真窗：连续 `open mesh_scatter→city`
+        树自动更新 + 相机重拟合整城居中（`dist 1537.9`、`target=center`）
+  - [x] 裁定 v1.4.2（`6c19755`）：visibility 非 active；预览存位置非 identifier；非订阅不补推；
+        同 version 前缀帧 accept=stale 当旧于 floor 或同 floor 同合成、前缀不抬 floor
+  - [x] 测试：merge 后全 workspace **468 绿**（`rusd-viewer` **282**，含同 version 回归
+        `tests/state_change_v142.rs`）
 - [ ] SSH 隧道文档（`ssh -L`）与分发说明（peer 构建 → scp，同 win-x64）
 - [ ] 后置：`Diff`/`apply_diff` 细粒度增量（`sdf::Value`/`Diff` 无 serde，需自定义 codec）；
       `--bind LAN`
