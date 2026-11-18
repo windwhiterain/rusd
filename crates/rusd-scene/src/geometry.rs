@@ -226,22 +226,22 @@ pub fn triangle_point(t: Triangle, u: f64, v: f64) -> [f64; 3] {
 /// wants the prim's own transform to apply instead reverses it or passes local
 /// points).
 pub fn points_mesh(points: &[[f64; 3]], size: f64) -> Mesh {
-    let box_mesh = cube_mesh(size.max(1e-6));
-    let mut positions = Vec::with_capacity(points.len() * box_mesh.positions.len());
-    let mut normals = Vec::with_capacity(points.len() * box_mesh.normals.len());
-    let mut indices = Vec::with_capacity(points.len() * box_mesh.indices.len());
-    let per = box_mesh.positions.len() as u32;
+    // A marker is a **flat square** in the cloud's plane with one constant normal:
+    // it shades uniformly (a dot of colour) instead of reading as a shaded solid.
+    // v1.5 shipped a little cube per point and a user rightly mistook the cloud for
+    // a pile of instances; a point must never look like geometry.
+    let h = (size.max(1e-6) / 2.0) as f32;
+    let mut positions = Vec::with_capacity(points.len() * 4);
+    let mut normals = Vec::with_capacity(points.len() * 4);
+    let mut indices = Vec::with_capacity(points.len() * 6);
     for (i, p) in points.iter().enumerate() {
-        for pos in &box_mesh.positions {
-            positions.push([
-                pos[0] + p[0] as f32,
-                pos[1] + p[1] as f32,
-                pos[2] + p[2] as f32,
-            ]);
+        let c = [p[0] as f32, p[1] as f32, p[2] as f32];
+        for (dx, dy) in [(-1.0f32, -1.0f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            positions.push([c[0] + dx * h, c[1] + dy * h, c[2]]);
+            normals.push([0.0, 0.0, 1.0]);
         }
-        normals.extend_from_slice(&box_mesh.normals);
-        let base = i as u32 * per;
-        indices.extend(box_mesh.indices.iter().map(|i| i + base));
+        let base = i as u32 * 4;
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
     }
     Mesh {
         positions,
@@ -344,7 +344,7 @@ pub fn extract(stage: &Stage) -> SceneGeometry {
         match type_name.as_str() {
             "Camera" => camera = Some(read_camera(&prim)),
             "Cube" | "Sphere" | "Cylinder" | "Mesh" | "Points" => {
-                let color = read_color(&prim);
+                let mut color = read_color(&prim);
                 let mesh = match type_name.as_str() {
                     "Cube" => cube_mesh(read_f64(&prim, "size").unwrap_or(2.0)),
                     "Sphere" => sphere_mesh(read_f64(&prim, "radius").unwrap_or(1.0), 24, 16),
@@ -371,7 +371,10 @@ pub fn extract(stage: &Stage) -> SceneGeometry {
                     // The marker's size is derived from the cloud's own spread so an
                     // unscaled scene and a kilometre-wide one both read.
                     "Points" => match local_points(&prim) {
-                        Some(pts) if !pts.is_empty() => points_mesh(&pts, marker_size(&pts)),
+                        Some(pts) if !pts.is_empty() => {
+                            color = [0.95, 0.72, 0.15];
+                            points_mesh(&pts, marker_size(&pts))
+                        }
                         _ => {
                             diags.push(
                                 Diagnostic::warning(

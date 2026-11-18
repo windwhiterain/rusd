@@ -239,6 +239,13 @@ pub struct Shell {
 
     /// Whether the capture toolbar's selection mode is armed.
     capture_armed: bool,
+    /// Whether 「只看选中」 is on (the user's isolation ruling): the viewport then draws
+    /// only the selected prim's subtree, and nothing when nothing is selected.
+    ///
+    /// A **display** flag on this side alone. The wire, the composite and the scene
+    /// version are untouched by it -- it is the same geometry, filtered at bake time
+    /// (`crate::scene::isolate`), which is what keeps it a client-only lens.
+    only_selected: bool,
     /// Where the capture drag started, in viewport points.
     capture_start: Option<egui::Pos2>,
     /// The optional note that goes into the next capture.
@@ -395,6 +402,7 @@ impl Shell {
             tree_open: true,
             tree_asked: false,
             capture_armed: false,
+            only_selected: false,
             capture_start: None,
             capture_note: String::new(),
             toast: None,
@@ -497,6 +505,7 @@ impl Shell {
             self.render.send(RenderCommand::View {
                 orbit,
                 selection: self.model.selection.clone(),
+                only_selected: self.only_selected,
             });
         }
         if plan.asked_tree {
@@ -557,6 +566,7 @@ impl Shell {
             self.render.send(RenderCommand::View {
                 orbit,
                 selection: self.model.selection.clone(),
+                only_selected: self.only_selected,
             });
         }
         self.request_repaint();
@@ -860,8 +870,32 @@ impl Shell {
             self.render.send(RenderCommand::View {
                 orbit,
                 selection: self.model.selection.clone(),
+                only_selected: self.only_selected,
             });
         }
+    }
+
+    /// Flip 「只看选中」: the viewport draws the selected prim's subtree, or the whole
+    /// scene when nothing is selected.
+    ///
+    /// **It asks for a frame and nothing else.** No request goes to the server, no
+    /// version moves, and the camera is untouched: the filter is applied to the
+    /// geometry this client already holds (`crate::scene::isolate`, through the render
+    /// thread's re-bake), which is what makes it a lens rather than a composite.
+    ///
+    /// **A new selection is a new picture** even while the switch stays on: every path
+    /// that changes `model.selection` ends in `ask_render`, and that command carries
+    /// the flag, so the render thread filters to whatever is selected now. This method
+    /// therefore has nothing to do about selection -- only about the switch.
+    fn toggle_only_selected(&mut self) {
+        self.only_selected = !self.only_selected;
+        self.status = match (self.only_selected, self.model.selection.is_some()) {
+            (true, true) => "只看选中：开".to_owned(),
+            (true, false) => "只看选中：开（无选中，仍画整场景）".to_owned(),
+            (false, _) => "只看选中：关".to_owned(),
+        };
+        self.ask_render();
+        self.window.request_redraw();
     }
 
     // --- UI ---------------------------------------------------------------
@@ -1010,6 +1044,30 @@ impl Shell {
                     }
                     None => {
                         ui.label("click a prim · LMB orbit · RMB pan · wheel zoom · drag a selected prim to move it");
+                    }
+                }
+                ui.separator();
+                // 「只看选中 (i)」: one switch, and the label says the key so the
+                // keyboard path is discoverable from the picture (the overlay's `o`
+                // button sets the same precedent). Green while it is on, so whether
+                // the viewport is filtered is visible without clicking anything.
+                {
+                    let text = if self.only_selected {
+                        "只看选中 (i) ✓"
+                    } else {
+                        "只看选中 (i)"
+                    };
+                    let button = egui::Button::new(text).fill(if self.only_selected {
+                        egui::Color32::from_rgb(40, 80, 60)
+                    } else {
+                        egui::Color32::TRANSPARENT
+                    });
+                    if ui
+                        .add(button)
+                        .on_hover_text("只画选中的 prim（含其子树）；无选中时画整场景")
+                        .clicked()
+                    {
+                        self.toggle_only_selected();
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1827,6 +1885,10 @@ impl ApplicationHandler<AppEvent> for App {
                     Key::Character(c) if c.as_str() == "z" => shell.send_net(NetCommand::Undo),
                     Key::Character(c) if c.as_str() == "y" => shell.send_net(NetCommand::Redo),
                     Key::Character(c) if c.as_str() == "f" => shell.fit(),
+                    // `i` is 「只看选中」: the viewport draws only the selected prim's
+                    // subtree. It flips the lens and nothing else -- no request, no
+                    // version, and the camera stays where the user put it.
+                    Key::Character(c) if c.as_str() == "i" => shell.toggle_only_selected(),
                     // `o` collapses/expands the `--debug-ui` overlay (v1.4's overlay
                     // compact). It does nothing without `--debug-ui`: the overlay is
                     // not drawn then, so a toggle would be a key that silently

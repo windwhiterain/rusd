@@ -344,7 +344,7 @@ impl CompositionTree {
                     "kind": layer.kind,
                     "strength": layer.strength,
                     "op": layer.op,
-                    "usda_text": borrow.export_to_string().unwrap_or_default(),
+                    "usda_text": match borrow.export_to_string() { Ok(s) => s, Err(e) => format!("<usda export error: {e:?}>") },
                     "spec_count": borrow.data().spec_paths().len(),
                 })
             });
