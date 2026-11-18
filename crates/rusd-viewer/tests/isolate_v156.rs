@@ -303,4 +303,41 @@ fn a_view_with_only_selected_draws_only_the_subtree() {
     });
     let back = drawn(&worker).expect("the restored frame");
     assert_eq!(back, whole, "off is the whole scene again");
+
+    // **A drag must not flash the hidden prims back.** A gizmo drag's `Preview`
+    // re-bakes the geometry, and it has to re-bake the *filtered* one: the prim being
+    // dragged is the selection, so it is inside the filter, and everything else must
+    // stay off screen for the length of the drag.
+    worker.send(RenderCommand::View {
+        orbit,
+        selection: Some("/World/City/Block_01".to_owned()),
+        only_selected: true,
+    });
+    let _ = drawn(&worker).expect("the filtered frame before the drag");
+    let mut overrides = std::collections::BTreeMap::new();
+    overrides.insert("/World/City/Block_01".to_owned(), [0.0, 0.5, 0.0]);
+    worker.send(RenderCommand::Preview {
+        overrides,
+        selection: Some("/World/City/Block_01".to_owned()),
+    });
+    let during = drawn(&worker).expect("the dragged frame");
+    assert_eq!(
+        during, only,
+        "a drag under the lens re-bakes the same subtree: the hidden prims stay hidden"
+    );
+
+    // **Switching the selection switches the picture** while the switch stays on: the
+    // flag travels with every `View`, and every path that changes the selection sends
+    // one, so the lens simply follows.
+    worker.send(RenderCommand::View {
+        orbit,
+        selection: Some("/World/Other".to_owned()),
+        only_selected: true,
+    });
+    let other = drawn(&worker).expect("the re-filtered frame");
+    assert_eq!(
+        other,
+        vec!["/World/Other".to_owned()],
+        "the new selection is what is drawn now"
+    );
 }

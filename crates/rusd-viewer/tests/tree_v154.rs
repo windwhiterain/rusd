@@ -393,6 +393,79 @@ fn the_panel_paints_one_row_for_the_cluster_and_none_of_its_instances() {
 }
 
 #[test]
+fn two_layers_referencing_one_target_draw_two_independently_openable_rows() {
+    // Why a row's widget id is its **place** in the tree and not just its `comp_node`
+    // id: both layers draw an arc class pointing at `/Prototypes/Tuft`, so both classes
+    // are named by that prim's id. With the id alone as egui's salt, one collapse state
+    // would serve both rows -- opening one would open the other, and a click on one
+    // would be reported for the other.
+    let tree = json!({
+        "layers": [
+            {"id": "a.usda", "kind": "root", "strength": 0},
+            {"id": "b.usda", "kind": "sublayer", "strength": 1},
+            {"id": "prototypes.usda", "kind": "reference", "strength": 2},
+        ],
+        "arcs": [
+            {"id": "arc:0", "kind": "reference", "source_layer": "a.usda",
+             "source_prim": "/A1", "target_layer": "prototypes.usda",
+             "target_prim": "/Prototypes/Tuft"},
+            {"id": "arc:1", "kind": "reference", "source_layer": "a.usda",
+             "source_prim": "/A2", "target_layer": "prototypes.usda",
+             "target_prim": "/Prototypes/Tuft"},
+            {"id": "arc:2", "kind": "reference", "source_layer": "b.usda",
+             "source_prim": "/B1", "target_layer": "prototypes.usda",
+             "target_prim": "/Prototypes/Tuft"},
+            {"id": "arc:3", "kind": "reference", "source_layer": "b.usda",
+             "source_prim": "/B2", "target_layer": "prototypes.usda",
+             "target_prim": "/Prototypes/Tuft"},
+        ],
+        "prim_nodes": [
+            {"id": "prim:/Prototypes/Tuft", "path": "/Prototypes/Tuft",
+             "authored_in": ["prototypes.usda"]},
+        ],
+        "variant_sets": [],
+    });
+    let rows = rows_of(&tree);
+    let arcs = arc_rows(&rows);
+    let shared: Vec<&TreeNode> = arcs
+        .iter()
+        .filter(|r| r.id == "prim:/Prototypes/Tuft")
+        .collect();
+    assert_eq!(
+        shared.len(),
+        2,
+        "one class per authoring layer, both naming the shared target: {:?}",
+        arcs.iter().map(|r| r.id.as_str()).collect::<Vec<_>>()
+    );
+    // Each group is its own class: its own `x2` label and its own instances.
+    for group in &shared {
+        assert!(group.label.ends_with("\u{00d7}2"), "{:?}", group.label);
+        assert_eq!(
+            group
+                .children
+                .iter()
+                .filter(|c| c.kind == TreeNodeKind::Prim)
+                .count(),
+            2,
+            "each layer's two instances are its own"
+        );
+    }
+    // And they are different rows in the model: same id, different instances.
+    let a: Vec<&str> = shared[0]
+        .children
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+    let b: Vec<&str> = shared[1]
+        .children
+        .iter()
+        .map(|c| c.label.as_str())
+        .collect();
+    assert_ne!(a, b, "the two rows' children are the two layers'");
+    assert!(a.contains(&"/A1") && b.contains(&"/B1"), "{a:?} {b:?}");
+}
+
+#[test]
 fn the_panel_paints_a_single_edge_exactly_as_before() {
     // The pre-v1.5.4 picture for a stack with no cluster: the edge's own label, with
     // no count on it.

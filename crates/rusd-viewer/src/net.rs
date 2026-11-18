@@ -902,7 +902,16 @@ impl RenderWorker {
                             selection: sel,
                         } => {
                             if let Some(geo) = &scene {
-                                viewport.set_scene_with_translates(geo, &overrides);
+                                // **The isolation filter survives a drag.** A drag's
+                                // preview re-bakes the geometry, and baking the whole
+                                // scene here would flash every hidden prim back on
+                                // screen for the length of the drag. The filter the
+                                // GPU holds is `isolated`, which a `View` sets -- so a
+                                // drag under 「只看选中」 re-bakes the same subtree, and
+                                // the prim being dragged is in it (it is the
+                                // selection).
+                                let shown = crate::scene::isolate(geo, isolated.as_deref());
+                                viewport.set_scene_with_translates(&shown, &overrides);
                                 selection = sel;
                                 dirty = true;
                             }

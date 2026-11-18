@@ -282,12 +282,13 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &TreePanel) -> TreeAction {
         .id_salt("composition-tree")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for root in &roots {
+            for (root_index, root) in roots.iter().enumerate() {
                 if let TreeAction::None = &action
                     && let Some(a) = row(
                         ui,
                         root,
                         0,
+                        root_index,
                         panel.selection.as_ref(),
                         panel.preview.as_deref(),
                     )
@@ -300,10 +301,19 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &TreePanel) -> TreeAction {
 }
 
 /// One row, and its subtree. Returns what a click asked for, if anything.
+///
+/// `root` -- the index of the top-level row this subtree hangs from -- is part of the
+/// row's **widget id**, not of what it means. Two layer roots can legitimately hold a
+/// row with the same `comp_node` id (two layers referencing one target both draw an arc
+/// class whose id is that target's prim, v1.5.4), and egui would then share one
+/// collapsed/expanded state between them: opening one would open the other, and a
+/// click on one would be read as a click on the other. `(id, root, depth)` is unique
+/// per row of a drawn tree, because a row's depth and its root each have one path.
 fn row(
     ui: &mut egui::Ui,
     node: &TreeNode,
     depth: usize,
+    root: usize,
     selected: Option<&TreeSelection>,
     preview: Option<&str>,
 ) -> Option<TreeAction> {
@@ -358,7 +368,7 @@ fn row(
             subtitle(ui, node);
         });
         for child in &node.children {
-            if let Some(a) = row(ui, child, depth + 1, selected, preview) {
+            if let Some(a) = row(ui, child, depth + 1, root, selected, preview) {
                 clicked = Some(a);
             }
         }
@@ -383,11 +393,11 @@ fn row(
         // and the arrow beside it is the only thing that expands: one row, one
         // meaning, which is the same rule a control row follows.
         let header = egui::CollapsingHeader::new(text)
-            .id_salt((&node.id, depth))
+            .id_salt((&node.id, root, depth))
             .default_open(depth == 0)
             .show(ui, |ui| {
                 for child in &node.children {
-                    if let Some(a) = row(ui, child, depth + 1, selected, preview) {
+                    if let Some(a) = row(ui, child, depth + 1, root, selected, preview) {
                         clicked = Some(a);
                     }
                 }
@@ -776,5 +786,103 @@ mod tests {
         let now = std::time::Instant::now();
         assert!(toast_visible(now + TOAST_FOR / 2, now));
         assert!(!toast_visible(now + TOAST_FOR * 2, now));
+    }
+
+    /// A stack in which **two layers** draw an arc class naming the same target prim,
+    /// so two rows of one drawn tree carry the same `comp_node` id (v1.5.4).
+    fn two_authors_of_one_target() -> serde_json::Value {
+        json!({
+            "layers": [
+                {"id": "a.usda", "kind": "root", "strength": 0},
+                {"id": "b.usda", "kind": "sublayer", "strength": 1},
+                {"id": "prototypes.usda", "kind": "reference", "strength": 2},
+            ],
+            "arcs": [
+                {"id": "arc:0", "kind": "reference", "source_layer": "a.usda",
+                 "source_prim": "/A1", "target_layer": "prototypes.usda",
+                 "target_prim": "/Prototypes/Tuft"},
+                {"id": "arc:1", "kind": "reference", "source_layer": "a.usda",
+                 "source_prim": "/A2", "target_layer": "prototypes.usda",
+                 "target_prim": "/Prototypes/Tuft"},
+                {"id": "arc:2", "kind": "reference", "source_layer": "b.usda",
+                 "source_prim": "/B1", "target_layer": "prototypes.usda",
+                 "target_prim": "/Prototypes/Tuft"},
+                {"id": "arc:3", "kind": "reference", "source_layer": "b.usda",
+                 "source_prim": "/B2", "target_layer": "prototypes.usda",
+                 "target_prim": "/Prototypes/Tuft"},
+            ],
+            "prim_nodes": [],
+            "variant_sets": [],
+        })
+    }
+
+    /// Run one headless pass over the panel with the production widget, from a pointer
+    /// at `pos`. Returns the painted texts and what the pass reported.
+    fn pass(tree: serde_json::Value, pos: egui::Pos2) -> (Vec<String>, TreeAction) {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 800.0),
+            )),
+            events: vec![egui::Event::PointerMoved(pos)],
+            ..Default::default()
+        };
+        let mut panel = TreePanel::new();
+        panel.apply_tree(Ok(tree));
+        let mut action = TreeAction::None;
+        let out = ctx.run_ui(raw, |root| {
+            egui::CentralPanel::no_frame().show(root, |ui| {
+                action = tree_panel(ui, &panel);
+            });
+        });
+        let mut delta = out.textures_delta;
+        delta.clear();
+        let texts = out
+            .shapes
+            .iter()
+            .filter_map(|c| match &c.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        (texts, action)
+    }
+
+    #[test]
+    fn two_rows_with_one_comp_node_id_are_not_one_widget() {
+        // **The case this pins**: two authors of one target give two rows the same
+        // `comp_node` id, so a row's widget id cannot be that id alone -- egui is keyed
+        // by `id_salt`, and one salt for two rows means one collapse state shared by
+        // both (opening one opens the other, and a click on one is reported for the
+        // other). The drawn tree therefore tells the two apart by where they sit, which
+        // is why `row` is handed the root index.
+        //
+        // What is asserted here is the **structure** the fix rests on: that the case is
+        // real (two rows, one id) and that both classes are drawn, each with its own
+        // count. The salt itself is not observable from a scripted pass -- reversing the
+        // fix leaves this test green, because a single uninteracted frame never opens
+        // either header -- so this is a guard on the shape, not proof of the fix. The
+        // proof would need a second pass with real pointer events against a persisted
+        // widget state; that is a window-level check.
+        let mut panel = TreePanel::new();
+        panel.apply_tree(Ok(two_authors_of_one_target()));
+        let rows = rows(&panel);
+        let shared: Vec<&TreeNode> = rows
+            .iter()
+            .filter(|(_, n)| n.id == "prim:/Prototypes/Tuft")
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(shared.len(), 2, "the case has to be real: two rows, one id");
+
+        let (texts, _) = pass(two_authors_of_one_target(), egui::pos2(5.0, 5.0));
+        assert!(
+            !texts.iter().any(|t| t == "/A1" || t == "/B1"),
+            "nothing is expanded on the first pass: {texts:?}"
+        );
+        assert!(
+            texts.iter().filter(|t| t.contains("\u{00d7}2")).count() == 2,
+            "both classes are drawn, each with its count: {texts:?}"
+        );
     }
 }
