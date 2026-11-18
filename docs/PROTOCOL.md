@@ -505,3 +505,41 @@ session overrides；root 档 = 只有 root 与 overrides、不含任何 op。
   结果一致。payload / inherit 等弧同理按此键聚合。
 - 验收（viewer）：mock 树 240 条同键 reference 弧 ⇒ 渲染 1 行带 `×240`；不同键不合并；
   单击仍发 comp_node 目标的 wire 断言；既有 312 测试不破坏。
+
+## v1.5.5 增补（用户裁定：合成图每个节点都要能看；2026-11-18）
+
+**详情面板（detail panel）的规则：树里点任何一个节点，详���面板都必须显示这个节点自己的东西；
+不允许点了没反应。** 分种类落定：
+
+### 层行（session / root / sublayer / op）
+
+- 发新请求 `layer{id: <层 identifier>}` → `{"id", "kind", "specs": [...]}`。`specs` 按层内
+  spec 的 traversal 顺序，每项：`path`、`spec_type`（"def"/"over"/"class"/"variant_set" 等）、
+  `type_name?`、`properties`（该 spec 作者的属性/字段名，如 `points`、`radius`、
+  `xformOp:translate`）、`references`（该 spec 带的引用弧：`[{layer?, prim}]`）。
+- 详情面板显示「层内容 · N 个 spec」，每行 `spec_type type_name path · properties…`，带引用的
+  行尾 `→ 目标`；**层内容列表不聚合**（它就是层的事实内容，滚动查看）。
+- 控制行（root/op 行）的那一次点击**同时**做两件事：视口换档（preview，不变）+ 详情换层内容
+  （同一层，一次点击一个对象，不歧义）。
+- 未知 id ⇒ -32602（列已开的层 id）。纯读：不动 version、不推快照、确定性输出。
+
+### 弧行（reference / payload / inherit / sublayer…）
+
+- 详情面板显示**这条弧本身**：kind、`source_layer:source_prim → target_layer:target_prim`；
+  并显示**目标 prim 在目标层的 spec**（该弧指向的东西在被指层里写了什么——取自
+  `comp_node{目标 prim}` 的对应层 opinion，不新增 wire）。
+- 弧行点击**不改预览、不改视口选中**（它描述一条边，不是选一个 prim）。
+- 去重后的弧行（v1.5.4 `×N`）详情报 N 与源 prim 范围（首/尾各一条）。
+
+### prim 行 / variant set 行
+
+- 不变：`comp_node{id}` 的 opinions 视图；prim 行点击同时视口选中（既有）。
+
+### 验收
+
+- agent：`layer{id}` 对每层返回完整 spec 集（root 层含 `/World/Terrain` 的 points 与
+  `/World/Prototypes/Tuft` 的 Sphere/radius；instances 层含 240 个实例 spec 及各自到
+  `/World/Prototypes/Tuft` 的 reference）；未知 id -32602；version 不动；同层同输出。
+- viewer：mock 断言——点 root/op/sublayer 行发 `layer{id}` 且详情渲染 spec 列表；点弧行
+  详情含 kind 与 source→target（发 `comp_node{目标}`，不发 layer、不改预览）；点 prim 行
+  行为不变；既有测试不破坏。
