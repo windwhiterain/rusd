@@ -332,3 +332,29 @@ layers（strength 序，session 最强）+ arcs（边/命名行指向目标层�
 - points 输入：逐点世界变换一致；
 - 替换语义：scatter 后输入 prim 的 composed visibility = invisible；前缀之前 = visible；
 - 同 seed 同输入 ⇒ 同输出（确定性回归）。
+## v1.4.2 增补（切片裁定与集成语义；2026-11-18 父会话裁定）
+
+### pcg-slice 偏差裁定（全部照准）
+
+1. 替换语义用 **visibility="invisible"** 而非 active=false（active 被合成压制后弱层拿不回来）。
+2. `input_points` 一个参数吃 Mesh 与 Points 两形态（probe 顺序 surface → cloud）。
+3. 诊断 code `E_INPUT_GEOMETRY` 保留。
+4. surface 模式 `kept = min(count, max_prims)`，超预算 `W_BUDGET`；cloud 模式截断保原序。
+5. Mesh 的 surface 优先于其 vertices 点云（否则既不"在表面"也不加权）。
+6. **rusd-scene 支撑照准**：Points schema / mesh 读取修复（此前 points 映射不到 USD 类型、
+   索引落 int64[]，Mesh 根本不可作者——真缺口）/ world_points/world_triangles /
+   extract 遵守 composed visibility。
+
+### agent-preview 偏差裁定（照准）
+
+1. 预览态**存 cook 顺序位置**而非 identifier（op 层是 anon id，rebuild 必换；位置跨
+   patch/undo 稳定）。契约字面"按 identifier"改为"按 cook 顺序位置，快照报当前 identifier"。
+2. `preview` 不向非订阅连接补推快照（快照是订阅的东西）。
+3. **同 version 前缀帧的 accept 规则**（viewer 侧，session.rs apply 已实现）：
+   stale = 旧于 floor，或（等于 floor 且与屏上合成相同）；**前缀不抬 floor**——否则下一次
+   同 version 的真 mutation 会被误判 stale、画面永久冻住。floor 为 Option（无 floor 时
+   version 0 是首帧而非重复）。
+
+### 收口
+
+- main 上 rusd-viewer/window.rs 的 fmt 漂移由父会话统一 `cargo fmt --all` 收口。
