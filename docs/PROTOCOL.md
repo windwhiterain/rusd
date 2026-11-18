@@ -543,3 +543,11 @@ session overrides；root 档 = 只有 root 与 overrides、不含任何 op。
 - viewer：mock 断言——点 root/op/sublayer 行发 `layer{id}` 且详情渲染 spec 列表；点弧行
   详情含 kind 与 source→target（发 `comp_node{目标}`，不发 layer、不改预览）；点 prim 行
   行为不变；既有测试不破坏。
+
+### v1.5.5 修订（弧行详情只讲层，不涉 prim；同日父会话裁定）
+
+弧行点击的详情**只讲层**：源层与目标层各取该弧端点 spec 的层内容（`layer{源层}` /
+`layer{目标层}` 过滤到端点路径），并排显示「源层 · 端点 spec 的字段」与「目标层 · 端点
+spec 的字段」——这条边在两层里各自的样子。**不发 `comp_node`、不选 prim、不改预览。**
+上一节弧行里的「目标 prim 的目标层 spec（取 comp_node opinion）」**作废**。去重行（v1.5.4
+`×N`）同样按两端层显示，并报 N 与源 prim 范围。
