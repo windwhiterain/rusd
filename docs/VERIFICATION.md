@@ -432,3 +432,18 @@ cargo test                       # 521 绿（rusd-viewer 303）
 
 merge 后全 workspace **521 绿**（`rusd-viewer` **303**，含 v1.5.2 真实形状绘制顺序回归）；
 clippy 0、fmt 无漂移。
+
+### 11.8 root 预览档（v1.5.3，用户裁定后补）
+
+用户裁定「合成图每档前缀都要看到」后补 `preview{upto: <root id>}`（merge `16f8764` server /
+`ad00b7e` viewer；契约 PROTOCOL v1.5.3）：预览态存 cook 顺序位置 **-1**（rebuild 换 anon id
+不掉档）；viewer 的 root 行（`kind = "root"`）成为预览控制行（高亮 + `≤`）。真窗四档实测
+（同窗口连续点击）：
+- root 行 ⇒ 「2 prim · 预览 ≤ anon:1:rusd_root.usda」+ overlay「composition 预览 ≤ …」+
+  视口 **起伏地面 mesh**（Terrain + 原点原型球；op 层全 mute）；
+- sample 行 ⇒ 「2 prim · 预览 ≤ anon:5:rusd_sample_points.usda」+ 贴表面点云（mesh 已隐）；
+- instances 行 ⇒ 「241 prim · 预览 ≤ anon:9:rusd_instances.usda」+ 240 球；
+- final ⇒ 「241 prim · 无预览」+ composition 最终。
+截图在 server `C:/Users/17124/rusd-client/`（`live-v153-*.png`）。测试：agent preview **11**
+（root 档 4 新：快照无 op 层/upto=root id/跨两次 rebuild 存活且 root id 确实换过/三观众三档位），
+viewer **312**（`tests/root_preview_v153.rs` 8 条 + tree 单测）；merge 后全 workspace **534 绿**。

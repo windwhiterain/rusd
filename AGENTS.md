@@ -105,3 +105,9 @@ cargo run -p spike-openusd    # O6 增量合成实证基准（SPEC §6）
   曾出现文件干净但提交信息被写坏（`feature（`→`feature<FFFD><FFFD>`），靠提交后顺手扫才发现。
 - `edit` 工具偶发损坏传入的 `old` 锚点（中文→FFFD）而被服务器拒绝（不改文件）；
   稳妥插入法：`head -N file / cat block / tail -n +N+1 file` 行号拼接写回。
+- **真窗点击坐标按屏幕 px 校准**：截图给人看是缩放过的，从图里量的行 y 直接当屏幕坐标会偏
+  ~×1.4；先用一格已知效果的行标定（点一行读顶栏），再按行距递推（viewer 行距 ≈33 px@2560 屏）。
+- **viewer 没有 Open 入口**：文档由 server 侧客户端发 `open{path}` 载入（viewer 订阅者跟随）；
+  走隧道用 `python open_doc.py` 即可，路径按 peer 解析（例 `C:/resource/rusd/examples/...`）。
+- **置前台被前台锁拒绝时**用 AttachThreadInput（本线程与前景窗口线程）再 SetForegroundWindow；
+  `GetCurrentThreadId` 在 kernel32（P/Invoke 方法名须与导出名一致，或写 `EntryPoint`）。

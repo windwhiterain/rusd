@@ -155,8 +155,10 @@ peer 构建 scp 分发）。server 不再拥有相机——相机归 client，se
         strength 序，cook 顺序 = op 行 strength 降序；mock 夹具摆反致真窗读反管线 ⇒
         `draw_order()` 最大连续 op 段就地反转 + 真实形状绘制回归（red-check 6 条）
   - [x] 测试：merge 后全 workspace **521 绿**（`rusd-viewer` **303**）；clippy 0、fmt 无漂移
-  - [ ] 开放 UX：root-only（只见 mesh）预览档不可达（`preview{upto}` 只收 op id/null）——
-        要不要加 root 预览档留用户裁定
+  - [x] **root 预览档**（merge `16f8764` + `ad00b7e`，用户裁定「合成图每档前缀都要看到」）：
+        `preview{upto}` 接受 root 层 identifier（位置 -1，rebuild 不掉档）；viewer root 行
+        成为预览控制行；真窗四档：root = 起伏地面 mesh（2 prim）/ sample = 点云 /
+        instances = 240 球 / final 恢复。merge 后全 workspace **534 绿**（`rusd-viewer` **312**）
 - [ ] SSH 隧道文档（`ssh -L`）与分发说明（peer 构建 → scp，同 win-x64）
 - [ ] 后置：`Diff`/`apply_diff` 细粒度增量（`sdf::Value`/`Diff` 无 serde，需自定义 codec）；
       `--bind LAN`

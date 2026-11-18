@@ -432,9 +432,10 @@ floor 是 `Option`：没有 floor 时 version 0 是**首帧**，不是重复。
 
 `composition_tree` 的 op 层带 `op_name`/`input`/`output`（server 用 `CookResult.ops` join，
 键 = layer_id）。client 画 op 行用这些字段，不再只显 anon identifier。**预览档可达性**：
-`preview{upto}` 只接受 op 层 id 或 null，所以 viewer 实际可达 sample / instances / final 三态；
-**root-only（只见输入 mesh）档不可达**——sample 档里 mesh 已被逐 op visibility over 隐藏。
-三档互斥可见在 proc 级（mute 测试）已证；要不要给 viewer 加 root 预览档是开放 UX 决策。
+`preview{upto}` 接受 op 层 id、root 层 identifier 或 null（v1.5.3）⇒ viewer **四档全可达**：
+root（只见输入 mesh）/ sample / instances / final。v1.5 曾只到 sample 档（root 不可达，mesh
+被逐 op visibility over 隐藏）；v1.5.3 按用户裁定补齐（root 行 = 预览控制行，预览态存位置
+-1）。三档互斥可见在 proc 级（mute 测试）已证，真窗四档见 VERIFICATION §11.8。
 
 ### 15.2 op 行绘制顺序（v1.5.2）
 
