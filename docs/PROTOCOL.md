@@ -276,3 +276,39 @@ layers（strength 序，session 最强）+ arcs（边/命名行指向目标层�
 - tree 模型/面板回归：断言渲染行只含 layer/arc/variant 三类，**无 prim 行**；
 - pick→path→id→comp_node 详情链路测试（mock server）；
 - 剪切板条款回归保持。
+## v1.4 增补（D14 垂直切片契约：三 crate 并行切分；2026-11-18 父会话定）
+
+切分：**rusd-proc**（几何进几何出）/ **rusd-agent**（前缀预览 server）/ **rusd-viewer**
+（预览 client + overlay compact）。三者 crate 不相交，契约如下，各自对契约写测试。
+
+### 前缀预览（server ↔ client）
+
+- `preview{upto: <layer identifier> | null}`：**按连接**维护预览态。upto = cook op 输出层
+  identifier（见 composition_tree layers）；null = 最终全量。未知 upto = -32602。
+- server 合成前缀 = root + **cook 顺序中 ≤ upto 的 op sublayer** + session overrides；
+  推 `stage_snapshot` 增可选字段 `upto`（缺省 = final）。preview 不推进 scene version。
+- `composition_tree` 的 layers 条目增 `op: true` 标记 cook generator 输出层（kind 仍
+  sublayer），viewer 依 strength 序画 op 行。
+- client：op 行可点 → 发 preview{upto}；「final」行/按钮 → preview{null}；status/overlay
+  显示当前 upto。点非 op 节点仍走 comp_node 详情，不改预览。
+
+### 几何进几何出（proc）
+
+- RusdScatter 增可选 `input_points = <prim path>`：输入层上的点几何（UsdGeom.Points 或
+  point3f[] 属性，含世界变换）。有时：读点 → 在**自己的输出 layer** 写原型实例 prim
+  （替换点语义：点留在输入层；前缀预览 scatter 之前见点、之后见实例）。
+- 无 input_points 时保持现参数式回退，现有场景不破坏。
+- 新增 examples/points_scatter.rusd（点层 + scatter op）。
+
+### overlay compact（viewer）
+
+- `--debug-ui` 保留但默认 ≤11pt 字号、≤460pt 宽、可折叠（键 `o` 或按钮）；
+  面积 ≤ viewport 25%（纯函数回归）。
+
+### 验收（各 crate）
+
+- proc：点→实例 count/逐点世界变换一致；参数式回退回归保持。
+- agent：前缀排除后续 op（city upto=rusd_city 层 ⇒ 无 scatter 树）；null 恢复；
+  未知 upto -32602；preview 不动 version。
+- viewer：op 行点击发 preview（mock server 断言 wire）；final 恢复；overlay 面积界；
+  真窗终验归父会话。
