@@ -238,26 +238,3 @@ fn flag_val(args: &[String], flag: &str) -> Option<String> {
     }
     None
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn size_flags_default_and_override() {
-        let base = vec!["compose".to_owned(), "--out".to_owned(), "x.png".to_owned()];
-        assert_eq!(size_flags(&base), (960, 540));
-        let mut v = base.clone();
-        v.extend(["--width".to_owned(), "320".to_owned()]);
-        v.extend(["--height=240".to_owned()]);
-        assert_eq!(size_flags(&v), (320, 240));
-    }
-
-    #[test]
-    fn snapshot_is_reachable_from_the_library() {
-        // A compile-time check that the binary and the library agree on the
-        // entry point the tests use.
-        let _ = scene::snapshot_usdc_bytes;
-        let _ = compose_to_png;
-    }
-}

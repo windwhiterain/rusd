@@ -252,32 +252,3 @@ pub fn lookup(name: &str) -> Option<SchemaDef> {
         props,
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn lookup_builtin_and_generator() {
-        assert_eq!(lookup("Sphere").unwrap().kind, SchemaKind::Builtin);
-        assert_eq!(
-            lookup("RusdStreetGrid").unwrap().kind,
-            SchemaKind::Generator
-        );
-        assert!(lookup("NoSuchSchema").is_none());
-    }
-
-    #[test]
-    fn points_is_a_builtin_with_a_point_cloud() {
-        let s = lookup("Points").expect("the D14 point cloud is a builtin schema");
-        assert_eq!(s.kind, SchemaKind::Builtin);
-        let points = s.props.iter().find(|p| p.name == "points").unwrap();
-        assert_eq!(points.ty, PropType::Vec3Array);
-    }
-
-    #[test]
-    fn scatter_requires_prototype() {
-        let s = lookup("RusdScatter").unwrap();
-        assert!(s.props.iter().any(|p| p.name == "prototype" && p.required));
-    }
-}

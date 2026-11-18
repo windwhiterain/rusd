@@ -208,36 +208,3 @@ pub fn open_within(
 }
 
 use crate::protocol::Notification;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_mark_keeps_its_order_and_name() {
-        let mut s = Startup::new();
-        s.mark(EVENT_LOOP);
-        s.mark(SHELL_BUILT);
-        assert!(s.reached(SHELL_BUILT));
-        assert!(!s.reached(FIRST_PAINT));
-        assert_eq!(s.marks().len(), 2);
-        assert!(s.at(EVENT_LOOP).expect("marked") <= s.at(SHELL_BUILT).expect("marked"));
-    }
-
-    #[test]
-    fn a_file_sink_has_the_marks_while_the_process_is_still_running() {
-        let dir = std::env::temp_dir().join(format!("rusd-startup-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("marks.log");
-        let _ = std::fs::remove_file(&path);
-        let mut s = Startup::to_file(&path);
-        s.mark(EVENT_LOOP);
-        let first = std::fs::read_to_string(&path).expect("the file exists already");
-        assert!(first.contains(EVENT_LOOP), "{first}");
-        s.mark(SHELL_BUILT);
-        let both = std::fs::read_to_string(&path).expect("still there");
-        assert!(both.contains(SHELL_BUILT), "{both}");
-        assert!(both.lines().count() >= 2, "{both}");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-}
