@@ -364,6 +364,38 @@ fn as_nums(items: &[Value]) -> Option<Vec<f64>> {
 
 fn array_to_usd(items: &[Value], ty: Option<PropType>) -> Option<(SdfValue, &'static str)> {
     use PropType::*;
+    // A `point3f[]` (D14's `Points.points`, a `Mesh`'s vertices): each element is
+    // one point, written as `[x, y, z]` (or `vec3`). This must be tested **before**
+    // the flat-number path, which would otherwise try to read the nested arrays as
+    // numbers and give up.
+    if ty == Some(Vec3Array) {
+        let mut points = Vec::with_capacity(items.len());
+        for item in items {
+            let v = match item {
+                Value::Vec3(v) => *v,
+                Value::Array(nums) if nums.len() == 3 => {
+                    let a = as_nums(nums)?;
+                    [a[0], a[1], a[2]]
+                }
+                _ => return None,
+            };
+            points.push(vec3f(&v));
+        }
+        return Some((SdfValue::Vec3fVec(points), "point3f[]"));
+    }
+    // `int[]`: a mesh's face counts and vertex indices. Before the generic number
+    // path as well — that one writes `int64[]` for integer lists, which the USD
+    // topology is not authored as.
+    if ty == Some(IntArray) {
+        let ints: Option<Vec<i32>> = items
+            .iter()
+            .map(|v| match v {
+                Value::Int(i) => i32::try_from(*i).ok(),
+                _ => None,
+            })
+            .collect();
+        return ints.map(|v| (SdfValue::IntVec(v), "int[]"));
+    }
     if let Some(nums) = as_nums(items) {
         match ty {
             Some(Vec3) if nums.len() == 3 => {

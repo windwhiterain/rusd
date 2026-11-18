@@ -17,6 +17,12 @@ pub enum PropType {
     Vec2,
     Vec3,
     Vec4,
+    /// `point3f[]` / `vector3f[]`: an array of 3-vectors, one USD array value
+    /// (D14: a `Points` prim's `points`, which a scatter reads as geometry in).
+    Vec3Array,
+    /// `int[]`: an array of integers, one USD array value (a `Mesh`'s
+    /// `faceVertexCounts` / `faceVertexIndices`).
+    IntArray,
     Color3f,
     Array,
     Dict,
@@ -39,6 +45,8 @@ impl PropType {
             Self::Vec2 => "vec2",
             Self::Vec3 => "vec3",
             Self::Vec4 => "vec4",
+            Self::Vec3Array => "vec3[]",
+            Self::IntArray => "int[]",
             Self::Color3f => "color3f",
             Self::Array => "array",
             Self::Dict => "dict",
@@ -93,10 +101,23 @@ static SPHERE: &[PropDef] = &[p("radius", F64), p("extent", Array)];
 static CUBE: &[PropDef] = &[p("size", F64), p("extent", Array)];
 static CYLINDER: &[PropDef] = &[p("radius", F64), p("height", F64)];
 static MESH: &[PropDef] = &[
-    p("points", Array),
-    p("faceVertexCounts", Array),
-    p("faceVertexIndices", Array),
+    // D14.1: a mesh had no usable surface spelling before this — `points` as a
+    // plain `Array` coerced to nothing (`[[x,y,z], …]` is not a flat number list)
+    // and the indices went to `int64[]`, which the mesh reader does not accept. A
+    // mesh a scatter can sample has to be authorable first.
+    p("points", Vec3Array),
+    p("faceVertexCounts", IntArray),
+    p("faceVertexIndices", IntArray),
     p("normals", Array),
+    p("extent", Array),
+];
+// D14 (geometry in, geometry out): a bare point cloud. `UsdGeom.Points` in USD;
+// the renderer draws each point as a small marker so a pipeline prefix that ends
+// before a scatter still shows something.
+static POINTS: &[PropDef] = &[
+    p("points", Vec3Array),
+    p("widths", Array),
+    p("ids", Array),
     p("extent", Array),
 ];
 static CAMERA: &[PropDef] = &[
@@ -117,6 +138,9 @@ static SCATTER: &[PropDef] = &[
     p("count", U64),
     p("seed", U64),
     req("prototype", Path),
+    // D14 geometry-in: the prim whose `points` become one instance each. Optional —
+    // without it the scatter is parametric, exactly as before.
+    p("input_points", Path),
     p("domain", Distribution),
     p("scale", Distribution),
     p("yaw", Distribution),
@@ -189,6 +213,7 @@ pub fn lookup(name: &str) -> Option<SchemaDef> {
         "Material" => ("Material", SchemaKind::Builtin, MATERIAL),
         "DirectionalLight" => ("DirectionalLight", SchemaKind::Builtin, DIRECTIONAL_LIGHT),
         "PointLight" => ("PointLight", SchemaKind::Builtin, POINT_LIGHT),
+        "Points" => ("Points", SchemaKind::Builtin, POINTS),
         "RusdScatter" => ("RusdScatter", SchemaKind::Generator, SCATTER),
         "RusdStreetGrid" => ("RusdStreetGrid", SchemaKind::Generator, STREET_GRID),
         "RusdBlockFill" => ("RusdBlockFill", SchemaKind::Generator, BLOCK_FILL),
@@ -219,6 +244,14 @@ mod tests {
             SchemaKind::Generator
         );
         assert!(lookup("NoSuchSchema").is_none());
+    }
+
+    #[test]
+    fn points_is_a_builtin_with_a_point_cloud() {
+        let s = lookup("Points").expect("the D14 point cloud is a builtin schema");
+        assert_eq!(s.kind, SchemaKind::Builtin);
+        let points = s.props.iter().find(|p| p.name == "points").unwrap();
+        assert_eq!(points.ty, PropType::Vec3Array);
     }
 
     #[test]

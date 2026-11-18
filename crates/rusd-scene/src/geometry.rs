@@ -111,6 +111,163 @@ pub fn mat_transform_vec(m: Mat, v: [f64; 3]) -> [f64; 3] {
     out
 }
 
+/// The attribute name a point cloud is read from (USD: `UsdGeom.Points.points`,
+/// `point3f[]`). D14 reads this on an *input* prim and writes instances onto an
+/// output layer.
+pub const POINTS_ATTR: &str = "points";
+
+/// One prim's authored `points`, in the prim's **local** space: `point3f[]` or
+/// `point3d[]`. `None` when the prim authors no such attribute (a `Mesh` does too,
+/// and its vertices are a point cloud as good as any).
+pub fn local_points(prim: &Prim) -> Option<Vec<[f64; 3]>> {
+    match attr(prim, POINTS_ATTR)? {
+        SdfValue::Vec3fVec(v) => Some(
+            v.iter()
+                .map(|p| [p.x as f64, p.y as f64, p.z as f64])
+                .collect(),
+        ),
+        SdfValue::Vec3dVec(v) => Some(v.iter().map(|p| [p.x, p.y, p.z]).collect()),
+        _ => None,
+    }
+}
+
+/// The point cloud of the prim at `path`, in **world** space: the authored points
+/// under the prim's composed world transform (its own xform ops and every
+/// ancestor's — the same matrix the renderer draws it with).
+///
+/// `None` when the prim does not exist or authors no points. D14's geometry-in
+/// contract: a scatter reads these and writes instances in its own output layer.
+pub fn world_points(stage: &Stage, path: &str) -> Option<Vec<[f64; 3]>> {
+    let spath = sdf::path(path).ok()?;
+    let prim = stage.prim(spath).ok()?;
+    let local = local_points(&prim)?;
+    let xform = world_xform_of(stage, path)?;
+    Some(
+        local
+            .into_iter()
+            .map(|p| mat_transform_point(xform, p))
+            .collect(),
+    )
+}
+
+/// One triangle of a mesh, in **world** space.
+pub type Triangle = [[f64; 3]; 3];
+
+/// The prim's `points` tessellated by its `faceVertexCounts` /
+/// `faceVertexIndices`, in world space — the input geometry a scatter samples to
+/// place instances **on a surface** (D14.1).
+///
+/// `None` when the prim does not exist or authors no readable mesh topology (a
+/// `Cube` has none authored, and its proc shape is not a surface a generator
+/// should invent). Degenerate triangles are dropped: they have no area, so they
+/// can never be hit by an area-weighted sample.
+pub fn world_triangles(stage: &Stage, path: &str) -> Option<Vec<Triangle>> {
+    let spath = sdf::path(path).ok()?;
+    let prim = stage.prim(spath).ok()?;
+    let local = read_mesh(&prim)?;
+    let xform = world_xform_of(stage, path)?;
+    let mut out = Vec::with_capacity(local.indices.len() / 3);
+    let (triangles, _) = local.indices.as_chunks::<3>();
+    for tri in triangles {
+        let mut w = [[0.0f64; 3]; 3];
+        for (k, i) in tri.iter().enumerate() {
+            let p = local.positions.get(*i as usize)?;
+            w[k] = mat_transform_point(xform, [p[0] as f64, p[1] as f64, p[2] as f64]);
+        }
+        if triangle_area(w) > 0.0 {
+            out.push(w);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// A triangle's area (`|ab × ac| / 2`).
+pub fn triangle_area(t: Triangle) -> f64 {
+    let ab = [t[1][0] - t[0][0], t[1][1] - t[0][1], t[1][2] - t[0][2]];
+    let ac = [t[2][0] - t[0][0], t[2][1] - t[0][1], t[2][2] - t[0][2]];
+    let cross = [
+        ab[1] * ac[2] - ab[2] * ac[1],
+        ab[2] * ac[0] - ab[0] * ac[2],
+        ab[0] * ac[1] - ab[1] * ac[0],
+    ];
+    0.5 * (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt()
+}
+
+/// A triangle's centroid — the point a degenerate `[u, v]` lands on.
+pub fn triangle_centroid(t: Triangle) -> [f64; 3] {
+    [
+        (t[0][0] + t[1][0] + t[2][0]) / 3.0,
+        (t[0][1] + t[1][1] + t[2][1]) / 3.0,
+        (t[0][2] + t[1][2] + t[2][2]) / 3.0,
+    ]
+}
+
+/// The point at barycentric `(u, v)` on a triangle: `a + u·(b − a) + v·(c − a)`,
+/// which lies on the triangle (and inside it when `u, v ≥ 0` and `u + v ≤ 1`).
+pub fn triangle_point(t: Triangle, u: f64, v: f64) -> [f64; 3] {
+    let mut p = [0.0; 3];
+    for k in 0..3 {
+        p[k] = t[0][k] + u * (t[1][k] - t[0][k]) + v * (t[2][k] - t[0][k]);
+    }
+    p
+}
+
+/// A world-space point cloud drawn as markers: one small box per point, merged
+/// into a single mesh so a `Points` prim is one `GeoItem` (one prim id in the
+/// pick pass, one draw call).
+///
+/// The markers are what makes a **pipeline prefix** legible (D14 B): stopping the
+/// stack before the scatter shows the input points, which the pipeline is about to
+/// turn into instances — a cloud of nothing renders as an empty picture and says
+/// nothing.
+///
+/// The mesh is in **local** space, like every other gprim's: callers pass the
+/// points already untransformed (`world_points` gives world space; a caller that
+/// wants the prim's own transform to apply instead reverses it or passes local
+/// points).
+pub fn points_mesh(points: &[[f64; 3]], size: f64) -> Mesh {
+    let box_mesh = cube_mesh(size.max(1e-6));
+    let mut positions = Vec::with_capacity(points.len() * box_mesh.positions.len());
+    let mut normals = Vec::with_capacity(points.len() * box_mesh.normals.len());
+    let mut indices = Vec::with_capacity(points.len() * box_mesh.indices.len());
+    let per = box_mesh.positions.len() as u32;
+    for (i, p) in points.iter().enumerate() {
+        for pos in &box_mesh.positions {
+            positions.push([
+                pos[0] + p[0] as f32,
+                pos[1] + p[1] as f32,
+                pos[2] + p[2] as f32,
+            ]);
+        }
+        normals.extend_from_slice(&box_mesh.normals);
+        let base = i as u32 * per;
+        indices.extend(box_mesh.indices.iter().map(|i| i + base));
+    }
+    Mesh {
+        positions,
+        normals,
+        indices,
+    }
+}
+
+/// The side of one point's marker box: a twentieth of the cloud's own diagonal,
+/// clamped so a single-point cloud still gets a visible cube and a huge one does
+/// not swallow its neighbours.
+pub fn marker_size(points: &[[f64; 3]]) -> f64 {
+    let mut min = [f64::MAX; 3];
+    let mut max = [f64::MIN; 3];
+    for p in points {
+        for k in 0..3 {
+            min[k] = min[k].min(p[k]);
+            max[k] = max[k].max(p[k]);
+        }
+    }
+    let diag =
+        ((max[0] - min[0]).powi(2) + (max[1] - min[1]).powi(2) + (max[2] - min[2]).powi(2)).sqrt();
+    let raw = if diag > 0.0 { diag / 20.0 } else { 1.0 };
+    raw.clamp(1e-3, 1e4)
+}
+
 /// A triangulated mesh in local space.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Mesh {
@@ -169,6 +326,14 @@ pub fn extract(stage: &Stage) -> SceneGeometry {
         if !prim.is_active().unwrap_or(true) {
             continue;
         }
+        // `visibility = "invisible"` (D14.1 replacement semantics): a stronger
+        // layer hid this prim without deleting it — the scatter that replaced a point
+        // cloud or a mesh authors exactly this over its input. Composed visibility
+        // is what decides, so a prefix of the pipeline that stops before the scatter
+        // sees the input again.
+        if is_invisible(&prim) {
+            continue;
+        }
         let type_name = prim
             .type_name()
             .ok()
@@ -178,7 +343,7 @@ pub fn extract(stage: &Stage) -> SceneGeometry {
         let world = world_xform(&prim, &mut cache);
         match type_name.as_str() {
             "Camera" => camera = Some(read_camera(&prim)),
-            "Cube" | "Sphere" | "Cylinder" | "Mesh" => {
+            "Cube" | "Sphere" | "Cylinder" | "Mesh" | "Points" => {
                 let color = read_color(&prim);
                 let mesh = match type_name.as_str() {
                     "Cube" => cube_mesh(read_f64(&prim, "size").unwrap_or(2.0)),
@@ -195,6 +360,23 @@ pub fn extract(stage: &Stage) -> SceneGeometry {
                                 Diagnostic::warning(
                                     "W_RENDER_PLACEHOLDER",
                                     "mesh topology missing/invalid; using magenta placeholder",
+                                )
+                                .at_prim(path.clone()),
+                            );
+                            placeholder_mesh()
+                        }
+                    },
+                    // D14: a point cloud draws as markers, in the prim's **local**
+                    // space (the world transform is already applied to the item).
+                    // The marker's size is derived from the cloud's own spread so an
+                    // unscaled scene and a kilometre-wide one both read.
+                    "Points" => match local_points(&prim) {
+                        Some(pts) if !pts.is_empty() => points_mesh(&pts, marker_size(&pts)),
+                        _ => {
+                            diags.push(
+                                Diagnostic::warning(
+                                    "W_RENDER_PLACEHOLDER",
+                                    "Points prim authors no points; using magenta placeholder",
                                 )
                                 .at_prim(path.clone()),
                             );
@@ -228,6 +410,63 @@ pub fn extract(stage: &Stage) -> SceneGeometry {
 }
 
 // --- transforms -----------------------------------------------------------
+
+/// The **world** transform of the prim at `path`: its own `xformOpOrder` and
+/// every ancestor's, composed the way the renderer draws it.
+///
+/// `None` when there is no such prim. This is the reader a generator uses to turn
+/// an input's authored points (local space) into world space (D14: geometry in).
+pub fn world_xform_of(stage: &Stage, path: &str) -> Option<Mat> {
+    let spath = sdf::path(path).ok()?;
+    let prim = stage.prim(spath).ok()?;
+    let mut cache = BTreeMap::new();
+    Some(world_xform(&prim, &mut cache))
+}
+
+/// The inverse of an **affine** column-major matrix, `None` when its linear part
+/// is singular.
+///
+/// Affine is what an xform op stack produces (rotation/scale/translate, or one
+/// `xformOp:transform`): the last row is `0 0 0 1`. A full 4×4 inverse would also
+/// work and would also silently "invert" a projective matrix into something that
+/// is not a transform, so this one refuses what is not affine.
+pub fn mat_inverse_affine(m: Mat) -> Option<Mat> {
+    if (m[3]).abs() > 1e-12
+        || (m[7]).abs() > 1e-12
+        || (m[11]).abs() > 1e-12
+        || (m[15] - 1.0).abs() > 1e-12
+    {
+        return None;
+    }
+    // Upper 3×3, column-major: column j is (m[4j], m[4j+1], m[4j+2]).
+    let a = [[m[0], m[4], m[8]], [m[1], m[5], m[9]], [m[2], m[6], m[10]]];
+    let det = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1])
+        - a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0])
+        + a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    // Cofactor matrix, then transpose: the inverse of the linear part.
+    let mut inv = IDENTITY;
+    inv[0] = (a[1][1] * a[2][2] - a[1][2] * a[2][1]) * inv_det;
+    inv[1] = (a[1][2] * a[2][0] - a[1][0] * a[2][2]) * inv_det;
+    inv[2] = (a[1][0] * a[2][1] - a[1][1] * a[2][0]) * inv_det;
+    inv[4] = (a[0][2] * a[2][1] - a[0][1] * a[2][2]) * inv_det;
+    inv[5] = (a[0][0] * a[2][2] - a[0][2] * a[2][0]) * inv_det;
+    inv[6] = (a[0][1] * a[2][0] - a[0][0] * a[2][1]) * inv_det;
+    inv[8] = (a[0][1] * a[1][2] - a[0][2] * a[1][1]) * inv_det;
+    inv[9] = (a[0][2] * a[1][0] - a[0][0] * a[1][2]) * inv_det;
+    inv[10] = (a[0][0] * a[1][1] - a[0][1] * a[1][0]) * inv_det;
+    // Translation: -A⁻¹ · t (t is the matrix's last column, m[12..15]). Element
+    // (row, col) of a column-major matrix is `m[col * 4 + row]`, so `(A⁻¹ · t)[row]`
+    // reads A⁻¹'s row `row`, i.e. indices `row`, `4 + row`, `8 + row`.
+    let t = [m[12], m[13], m[14]];
+    for row in 0..3 {
+        inv[12 + row] = -(inv[row] * t[0] + inv[4 + row] * t[1] + inv[8 + row] * t[2]);
+    }
+    Some(inv)
+}
 
 fn world_xform(prim: &Prim, cache: &mut BTreeMap<String, Mat>) -> Mat {
     let key = prim.path().as_str().to_owned();
@@ -316,6 +555,14 @@ fn read_matrix(prim: &Prim, name: &str) -> Option<Mat> {
         }
         _ => None,
     }
+}
+
+/// Whether the prim's **composed** `visibility` is `invisible` (`UsdGeomImageable`'s
+/// token, which any prim may carry whether or not it has the schema).
+///
+/// `inherited` — USD's default — and an unauthored value both mean visible.
+pub fn is_invisible(prim: &Prim) -> bool {
+    matches!(attr(prim, "visibility"), Some(SdfValue::Token(t)) if t.as_str() == "invisible")
 }
 
 fn read_color(prim: &Prim) -> [f32; 3] {
@@ -651,6 +898,64 @@ mod tests {
         for i in 0..16 {
             assert!((lhs[i] - rhs[i]).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn points_mesh_is_one_marker_per_point() {
+        let single = cube_mesh(1.0);
+        let pts = [[0.0, 0.0, 0.0], [10.0, 0.0, 0.0], [0.0, 10.0, 0.0]];
+        let m = points_mesh(&pts, 1.0);
+        assert_eq!(m.positions.len(), single.positions.len() * pts.len());
+        assert_eq!(m.indices.len(), single.indices.len() * pts.len());
+        // Each marker is centred on its point: the first vertex of block i is the
+        // cube's first vertex shifted by that point.
+        for (i, p) in pts.iter().enumerate() {
+            let v = m.positions[i * single.positions.len()];
+            let want = [
+                single.positions[0][0] + p[0] as f32,
+                single.positions[0][1] + p[1] as f32,
+                single.positions[0][2] + p[2] as f32,
+            ];
+            assert_eq!(v, want, "block {i} is not at its point");
+        }
+        // Indices are offset per block, so every triangle addresses its own cube.
+        let per = single.positions.len() as u32;
+        assert!(
+            m.indices
+                .iter()
+                .skip(single.indices.len())
+                .all(|i| *i >= per)
+        );
+    }
+
+    #[test]
+    fn marker_size_follows_the_clouds_spread() {
+        // A degenerate cloud still gets a usable marker; a wide one gets a proportional one.
+        let tiny = marker_size(&[[1.0, 2.0, 3.0]]);
+        assert!(tiny > 0.0 && tiny.is_finite(), "{tiny}");
+        let wide = marker_size(&[[0.0, 0.0, 0.0], [20.0, 0.0, 0.0]]);
+        assert!((wide - 1.0).abs() < 1e-9, "20/20 = 1, got {wide}");
+    }
+
+    #[test]
+    fn affine_inverse_undoes_a_transform() {
+        let m = mat_mul(
+            mat_translation([3.0, -2.0, 5.0]),
+            mat_mul(mat_rotation_z(0.9), mat_scale([2.0, 3.0, 0.5])),
+        );
+        let inv = mat_inverse_affine(m).expect("an xform stack is invertible");
+        for p in [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0], [-4.0, 0.5, 7.0]] {
+            let round = mat_transform_point(inv, mat_transform_point(m, p));
+            for k in 0..3 {
+                assert!((round[k] - p[k]).abs() < 1e-9, "{p:?} -> {round:?}");
+            }
+        }
+        // A singular linear part has no inverse, and a projective matrix is refused
+        // rather than "inverted" into something that is not a transform.
+        assert!(mat_inverse_affine(mat_scale([0.0, 1.0, 1.0])).is_none());
+        let mut projective = IDENTITY;
+        projective[3] = 1.0;
+        assert!(mat_inverse_affine(projective).is_none());
     }
 
     #[test]

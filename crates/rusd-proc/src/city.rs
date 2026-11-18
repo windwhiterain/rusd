@@ -264,8 +264,48 @@ impl Generator for RusdBuilding {
     }
 }
 
-/// Scatter prop instances (spheres) across a rectangular domain, reading the
-/// prototype's radius. Demonstrates a real read dependency in the cook graph.
+/// Scatter prop instances across a **parameter domain** and along **input
+/// geometry** (D14 A / D14.1). Demonstrates a real read dependency in the cook
+/// graph.
+///
+/// ## Three modes
+///
+/// - **parametric** (no `input_points`): sample positions from `domain` × `count`.
+///   `RusdScatter`'s original behaviour, kept byte-for-byte so an existing document
+///   (`examples/forest.rusd`, `examples/city.rusd`) cooks to the same scene.
+/// - **point cloud** (`input_points` names a prim whose `points` is a
+///   `point3f[]`): one instance per point, in the cloud's own order, at that point.
+///   Nothing is invented and nothing is dropped.
+/// - **surface** (`input_points` names a `Mesh` with face topology): exactly
+///   `count` instances, sampled **area-weighted** — the triangle comes from a
+///   cumulative-area table and the point inside it from a uniform barycentric pair —
+///   so a dense part of the mesh receives proportionally more instances and every
+///   instance lands **on** the surface.
+///
+/// A mesh wins over its own vertices when both are readable: sampling a `Mesh`'s
+/// `points` alone would put instances on triangle corners in file order, which is
+/// neither "on the surface" nor area-weighted.
+///
+/// ## Replacement semantics
+///
+/// The output layer writes the instances **and** an `over` on the input prim with
+/// `visibility = "invisible"`. The input's own spec is untouched — it keeps its
+/// points and its faces in its own layer — so a pipeline **prefix** that stops
+/// before this node still shows the geometry, while the full stack shows the
+/// instances that replaced it. Visibility rather than `active`: an inactive prim is
+/// suppressed by composition and a weaker layer cannot bring it back, whereas
+/// visibility is an ordinary overridable attribute — exactly "override, do not
+/// delete".
+///
+/// ## Spaces and determinism
+///
+/// Points and triangles are read in **world** space (the input's and every
+/// ancestor's transform), and each instance's `xformOp:translate` is that world
+/// position converted into this node's **local** space
+/// (`inverse(anchor world) · point`). Writing a world value as a local op would
+/// apply the parent's transform twice — the `fix/ground-size` bug class. The
+/// sampling stream is `Rng::seeded(stage.seed, anchor path, seed)`: path-keyed, so
+/// editing another node never reshuffles these instances.
 pub struct RusdScatter;
 
 impl Generator for RusdScatter {
@@ -275,6 +315,9 @@ impl Generator for RusdScatter {
 
     fn eval(&self, ctx: &mut GenContext) -> Result<sdf::Layer, Vec<Diagnostic>> {
         let base = ctx.path.as_str().to_owned();
+        if let Some(input) = ctx.param_path("input_points").map(str::to_owned) {
+            return scatter_from_geometry(ctx, &base, &input);
+        }
         let count = ctx.param_u64("count", 100);
         let max_prims = ctx.param_u64("max_prims", 20000).min(count);
         let (dw, dh) = match ctx.params.get("domain") {
@@ -329,6 +372,292 @@ impl Generator for RusdScatter {
     }
 }
 
+/// A prototype instance: a **same-stack reference** to the prototype prim plus the
+/// instance's own transform.
+///
+/// The reference's asset path is the stage's root layer identifier and its prim
+/// path is the prototype's — what a same-stack reference is in USD. That is the
+/// spelling `Stage::flatten` → `usdc` → `Layer::from_bytes` also survives: the Tier
+/// A snapshot a viewer receives still composes the instance's prototype, so
+/// geometry out is real USD instancing on both ends, not a copy of the prototype's
+/// numbers.
+///
+/// The instance carries **no type name of its own**. A `def` with a local typeName
+/// is the strongest opinion about the prim's type and would win over the arc,
+/// turning every instance into an empty `Xform`; the type must come from the
+/// prototype.
+///
+/// `xformOpOrder` is `[translate, scale]` (USD's order: scale applied first), and
+/// the whole op stack is authored in one pass because an attribute spec can only be
+/// created once per path.
+fn author_reference(
+    d: &mut dyn sdf::AbstractData,
+    prim: &sdf::Path,
+    root_id: &str,
+    prototype: &sdf::Path,
+    local_translate: [f64; 3],
+    scale: f64,
+) -> AuthResult {
+    let op = sdf::ReferenceListOp::explicit([sdf::Reference {
+        asset_path: root_id.to_owned(),
+        prim_path: prototype.clone(),
+        ..Default::default()
+    }]);
+    d.set_field(
+        prim,
+        sdf::FieldKey::References.as_str(),
+        SdfValue::ReferenceListOp(op),
+    );
+    let tp = format!("{}.xformOp:translate", prim.as_str());
+    let mut ta = AttributeSpec::new(d, tp.as_str(), "point3f", Variability::Uniform, false)?;
+    ta.set_default(SdfValue::Vec3f(gf::vec3f(
+        local_translate[0] as f32,
+        local_translate[1] as f32,
+        local_translate[2] as f32,
+    )))?;
+    let mut ops = vec!["xformOp:translate".to_owned()];
+    if (scale - 1.0).abs() > 1e-12 {
+        let s = scale as f32;
+        let sp = format!("{}.xformOp:scale", prim.as_str());
+        let mut sa = AttributeSpec::new(d, sp.as_str(), "float3", Variability::Uniform, false)?;
+        sa.set_default(SdfValue::Vec3f(gf::vec3f(s, s, s)))?;
+        ops.push("xformOp:scale".to_owned());
+    }
+    let op_path = format!("{}.xformOpOrder", prim.as_str());
+    let mut oa = AttributeSpec::new(d, op_path.as_str(), "token[]", Variability::Uniform, false)?;
+    oa.set_default(SdfValue::TokenVec(
+        ops.into_iter().map(Into::into).collect(),
+    ))?;
+    Ok(())
+}
+
+/// The two forms of input geometry a scatter consumes (D14.1).
+enum InputGeometry {
+    /// A surface: sample `count` points on it, area-weighted.
+    Surface(Vec<rusd_scene::geometry::Triangle>),
+    /// A cloud: one instance per point, in the cloud's own order.
+    Cloud(Vec<[f64; 3]>),
+}
+
+/// Everything one geometry-mode scatter needs, read once.
+struct GeometryInput {
+    geometry: InputGeometry,
+    /// `inverse(anchor world)`; `None` only when the anchor has no world transform
+    /// at all (it is not in the stage yet), which reads as identity.
+    inv_anchor: Option<rusd_scene::Mat>,
+    proto_path: sdf::Path,
+    root_id: String,
+}
+
+impl GeometryInput {
+    /// A world point as the instance's authored local `translate`.
+    fn to_local(&self, world: [f64; 3]) -> [f64; 3] {
+        match self.inv_anchor {
+            Some(inv) => rusd_scene::geometry::mat_transform_point(inv, world),
+            None => world,
+        }
+    }
+}
+
+/// Read the geometry an `input_points` names, in its own form (D14.1), recording
+/// every dependency the answer depends on so the cook memo is exact.
+fn read_input_geometry(
+    ctx: &mut GenContext,
+    base: &str,
+    input: &str,
+) -> Result<GeometryInput, Vec<Diagnostic>> {
+    // A `Mesh`'s surface first: its `points` are also a readable cloud, and a
+    // surface is the stronger claim about what the input *is*.
+    let geometry = match ctx.read_triangles(input) {
+        Some(tris) => InputGeometry::Surface(tris),
+        None => match ctx.read_points(input) {
+            Some(pts) if !pts.is_empty() => InputGeometry::Cloud(pts),
+            Some(_) => {
+                return Err(vec![
+                    Diagnostic::error(
+                        "E_INPUT_GEOMETRY",
+                        format!("input_points {input} authors an empty `points` array"),
+                    )
+                    .at_prim(base),
+                ]);
+            }
+            None => {
+                return Err(vec![
+                    Diagnostic::error(
+                        "E_INPUT_GEOMETRY",
+                        format!(
+                            "input_points {input} has neither readable mesh topology nor a `points` cloud"
+                        ),
+                    )
+                    .at_prim(base),
+                ]);
+            }
+        },
+    };
+    let prototype = ctx
+        .param_str("prototype")
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            vec![
+                Diagnostic::error("E_MISSING_PROTOTYPE", "RusdScatter needs `prototype`")
+                    .at_prim(base),
+            ]
+        })?;
+    let proto_path = sdf::path(&prototype).map_err(|e| {
+        vec![
+            Diagnostic::error(
+                "E_INPUT_GEOMETRY",
+                format!("prototype {prototype:?} is not a prim path: {e}"),
+            )
+            .at_prim(base),
+        ]
+    })?;
+    // The anchor's own transform: what a world position is undone by. Read as a
+    // dependency, so moving the anchor (or a parent of it) re-cooks this node.
+    let anchor_world = ctx.read_world_xform(base);
+    let inv_anchor = anchor_world.and_then(rusd_scene::geometry::mat_inverse_affine);
+    if anchor_world.is_some() && inv_anchor.is_none() {
+        return Err(vec![
+            Diagnostic::error(
+                "E_INPUT_GEOMETRY",
+                "the scatter anchor's world transform is not invertible (zero scale)",
+            )
+            .at_prim(base),
+        ]);
+    }
+    Ok(GeometryInput {
+        geometry,
+        inv_anchor,
+        proto_path,
+        root_id: ctx.stage().root_layer().identifier().to_owned(),
+    })
+}
+
+/// The **geometry mode** of [`RusdScatter`] (D14 A / D14.1): the instances come
+/// from input geometry. See the type's own docs for the contract.
+///
+/// Diagnostics:
+/// - `E_INPUT_GEOMETRY` — no readable surface and no `points` cloud, an empty
+///   cloud, a singular anchor transform, or a prototype that is not a prim path.
+///   Never a panic, and never a silently empty layer.
+/// - `W_BUDGET` — a cloud larger than `max_prims` (the first `max_prims`, in the
+///   cloud's order, become instances), or a `count` that exceeds it.
+fn scatter_from_geometry(
+    ctx: &mut GenContext,
+    base: &str,
+    input: &str,
+) -> Result<sdf::Layer, Vec<Diagnostic>> {
+    let read = read_input_geometry(ctx, base, input)?;
+    let limit = ctx.param_u64("max_prims", 20000).max(1) as usize;
+    let count = ctx.param_u64("count", 100) as usize;
+    let scale_dist = ctx.params.get("scale").cloned();
+    let mut rng = Rng::seeded(ctx.stage_seed, base, ctx.seed);
+
+    let mut warns: Vec<Diagnostic> = Vec::new();
+    let placements: Vec<[f64; 3]> = match &read.geometry {
+        InputGeometry::Cloud(points) => {
+            if points.len() > limit {
+                warns.push(
+                    Diagnostic::warning(
+                        "W_BUDGET",
+                        format!(
+                            "max_prims={limit} reached; {} of {} points truncated",
+                            points.len() - limit,
+                            points.len()
+                        ),
+                    )
+                    .at_prim(base),
+                );
+            }
+            points.iter().take(limit).copied().collect()
+        }
+        InputGeometry::Surface(tris) => {
+            let kept = count.min(limit);
+            if count > kept {
+                warns.push(
+                    Diagnostic::warning(
+                        "W_BUDGET",
+                        format!("max_prims={limit} reached; {count} instances truncated to {kept}"),
+                    )
+                    .at_prim(base),
+                );
+            }
+            surface_samples(tris, kept, &mut rng)
+        }
+    };
+
+    let mut layer = sdf::Layer::new_anonymous("rusd_scatter.usda");
+    layer
+        .edit(|l| {
+            let d = l.data_mut();
+            PrimSpec::new(d, base, Specifier::Def, "Xform")?;
+            // The replacement: hide the input geometry where it is, without touching
+            // the layer that authored it.
+            if let Ok(target) = sdf::path(input) {
+                PrimSpec::over(d, target.clone())?;
+                let mut vis = AttributeSpec::new(
+                    d,
+                    format!("{input}.visibility").as_str(),
+                    "token",
+                    Variability::Varying,
+                    false,
+                )?;
+                vis.set_default(SdfValue::Token("invisible".into()))?;
+            }
+            for (k, world) in placements.iter().enumerate() {
+                let p = format!("{base}/i{k:06}");
+                let pp = sdf::path(&p)?;
+                PrimSpec::new(d, p.as_str(), Specifier::Def, "")?;
+                let s = sample_dist(&mut rng, scale_dist.as_ref(), 1.0);
+                author_reference(
+                    d,
+                    &pp,
+                    &read.root_id,
+                    &read.proto_path,
+                    read.to_local(*world),
+                    s,
+                )?;
+            }
+            Ok(())
+        })
+        .map_err(|e| vec![Diagnostic::error("E_GEN", e.to_string()).at_prim(base)])?;
+    for w in warns {
+        ctx.warn(w);
+    }
+    Ok(layer)
+}
+
+/// `count` points on `tris`, sampled by area: pick a triangle in proportion to its
+/// area from a cumulative table, then a point inside it uniformly — the
+/// square-root barycentric pair, which is the uniform distribution over a triangle
+/// (a plain `(u, v)` would pile the instances towards the first corner).
+fn surface_samples(
+    tris: &[rusd_scene::geometry::Triangle],
+    count: usize,
+    rng: &mut Rng,
+) -> Vec<[f64; 3]> {
+    let mut cumulative = Vec::with_capacity(tris.len());
+    let mut total = 0.0_f64;
+    for t in tris {
+        total += rusd_scene::geometry::triangle_area(*t);
+        cumulative.push(total);
+    }
+    if total <= 0.0 {
+        return Vec::new();
+    }
+    (0..count)
+        .map(|_| {
+            let r = rng.next_f64() * total;
+            let idx = cumulative
+                .iter()
+                .position(|c| *c > r)
+                .unwrap_or(tris.len() - 1);
+            let u = rng.next_f64().sqrt();
+            let v = rng.next_f64();
+            rusd_scene::geometry::triangle_point(tris[idx], u * (1.0 - v), u * v)
+        })
+        .collect()
+}
 #[cfg(test)]
 mod tests {
     use crate::cook::nodes_from_doc;
