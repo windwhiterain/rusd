@@ -217,13 +217,18 @@ fn connected(mock: &Mock) -> ProtocolClient {
 /// `rusd_city` is the op the city's cook writes; `rusd_scatter` is the one after it, so
 /// prefixing at `rusd_city` must exclude the scatter's prims — the assertion D14's
 /// server-side 验收 asks for, mirrored on this side as geometry that differs.
+///
+/// The two ops' strengths are the **real** relation (v1.5.2): a cook step inserts its
+/// output at position 0 of the sublayer stack, so `rusd_scatter`, cooking later, is the
+/// **stronger** of the two (2) and `rusd_city` the weaker (3). The panel reverses the op
+/// run so the rows read cook order, which is why the first op row below is `rusd_city`.
 fn city_tree() -> Value {
     json!({
         "layers": [
             {"id": "anon:session", "kind": "session", "strength": 0},
             {"id": "city.rusd.cooked.usda", "kind": "root", "strength": 1},
-            {"id": "rusd_city", "kind": "sublayer", "strength": 2, "op": true},
-            {"id": "rusd_scatter", "kind": "sublayer", "strength": 3, "op": true},
+            {"id": "rusd_scatter", "kind": "sublayer", "strength": 2, "op": true},
+            {"id": "rusd_city", "kind": "sublayer", "strength": 3, "op": true},
             {"id": "prototypes.usda", "kind": "reference", "strength": 4},
         ],
         "arcs": [
@@ -312,7 +317,7 @@ fn an_op_row_click_sends_preview_upto_and_asks_no_detail() {
         .expect("the payload has an op layer");
     assert_eq!(
         op_row.id, "rusd_city",
-        "the first op row is the cook's output"
+        "the first op row is the op that cooked first (v1.5.2: op rows read cook order)"
     );
 
     let action = panel::action_for(op_row);

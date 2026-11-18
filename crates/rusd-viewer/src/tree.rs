@@ -219,9 +219,49 @@ impl CompositionTree {
     /// The layers in strength order, strongest first. The wire already sends them
     /// that way; sorting by `strength` means a panel's root order is the
     /// contract's even if a server ever emits them otherwise.
+    ///
+    /// This is the **stack's** order, not the panel's: the panel draws op rows in
+    /// cook order, which is [`CompositionTree::draw_order`].
     pub fn root_layers(&self) -> Vec<&LayerNode> {
         let mut out: Vec<&LayerNode> = self.layers.iter().collect();
         out.sort_by_key(|l| l.strength);
+        out
+    }
+
+    /// The root rows in the order the panel draws them: the stack in strength order,
+    /// **with each run of cook op rows reversed** (v1.5.2).
+    ///
+    /// # Why the op rows run the other way
+    ///
+    /// A cook step inserts its output layer at position 0 of the root's sublayer
+    /// stack, so **the later an op cooks, the stronger its layer is** — a smaller
+    /// `strength`. Cook order is therefore strength *descending* among op rows: a real
+    /// server reports the mesh → points → instances chain as `RusdInstances` (2) above
+    /// `RusdSamplePoints` (3), and drawn in plain strength order the panel would show
+    /// the pipeline backwards.
+    ///
+    /// Every other layer keeps strength order (session on top, then the root and its
+    /// structural sublayers, then whatever an arc opened), which is what makes the
+    /// stack readable as a stack.
+    ///
+    /// Reversal is per **maximal run**, not one block: a server is not obliged to keep
+    /// its op layers adjacent, and a run that is not contiguous still has to come out
+    /// in cook order while the structural rows between runs stay where they are. A run
+    /// of one is its own reversal, so a stack with no ops, or with one, is unchanged.
+    pub fn draw_order(&self) -> Vec<&LayerNode> {
+        let mut out = self.root_layers();
+        let mut i = 0;
+        while i < out.len() {
+            if !out[i].op {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < out.len() && out[i].op {
+                i += 1;
+            }
+            out[start..i].reverse();
+        }
         out
     }
 
@@ -324,8 +364,9 @@ impl TreeNodeKind {
     }
 }
 
-/// Build the panel's roots: one subtree per layer, **in strength order**, and
-/// under each layer its arcs and its variant sets.
+/// Build the panel's roots: one subtree per layer, in **draw order** (the stack in
+/// strength order, each run of cook op rows in cook order), and under each layer its
+/// arcs and its variant sets.
 ///
 /// The shape, in the order the panel draws it (v1.3, `docs/PROTOCOL.md` 末节 —
 /// **no prim rows**: a stacked city has hundreds, and a prim is inspected by picking
@@ -345,6 +386,11 @@ impl TreeNodeKind {
 /// `preview{upto}` takes is still the row's `id`, and its elided form is the subtitle's
 /// second half.
 ///
+/// The rows' order is **cook order** (v1.5, as v1.5.2 fixes it): the stack in strength
+/// order with each run of op rows reversed ([`CompositionTree::draw_order`]), because a
+/// cook step inserts its output at the top of the sublayer stack. A panel drawn in
+/// plain strength order would read the pipeline backwards.
+///
 /// **The arc's target layer is a row that names it, not a second copy of its
 /// branch.** Every layer is already a root, so nesting the target's subtree under
 /// every arc that reaches it would draw the same prims once per path into the
@@ -354,7 +400,7 @@ impl TreeNodeKind {
 /// `comp_node` about exactly the same node as the root row does; the branch is one
 /// click away in the roots and is not repeated.
 pub fn roots(tree: &CompositionTree) -> Vec<TreeNode> {
-    tree.root_layers()
+    tree.draw_order()
         .into_iter()
         .map(|layer| layer_subtree(tree, layer))
         .collect()
@@ -1531,17 +1577,22 @@ mod tests {
 
     /// A stack with the two ops v1.5 puts in the mesh -> points -> instances chain:
     /// the sample reads a mesh, the instances op reads the points the first wrote.
+    ///
+    /// The strengths are the **real** ones (v1.5.2): a cook step inserts its output at
+    /// position 0 of the root's sublayer stack, so the later op cooks, the *stronger*
+    /// it is — `RusdInstances` at 2 above `RusdSamplePoints` at 3, exactly as a live
+    /// server reports it. Drawn in plain strength order the chain would read backwards.
     fn op_sample() -> Value {
         json!({
             "layers": [
                 {"id": "anon:session", "kind": "session", "strength": 0},
                 {"id": "mesh.usda", "kind": "root", "strength": 1},
-                {"id": "op:sample_points/0", "kind": "sublayer", "strength": 2,
-                 "op": true, "op_name": "RusdSamplePoints",
-                 "input": "/World/Mesh", "output": "op:sample_points/0"},
-                {"id": "op:instances/1", "kind": "sublayer", "strength": 3,
+                {"id": "op:instances/1", "kind": "sublayer", "strength": 2,
                  "op": true, "op_name": "RusdInstances",
                  "input": "/World/Mesh/points", "output": "op:instances/1"},
+                {"id": "op:sample_points/0", "kind": "sublayer", "strength": 3,
+                 "op": true, "op_name": "RusdSamplePoints",
+                 "input": "/World/Mesh", "output": "op:sample_points/0"},
             ],
             "arcs": [],
             "prim_nodes": [],
@@ -1725,8 +1776,12 @@ mod tests {
 
     #[test]
     fn the_rows_are_in_cook_order_and_the_op_metadata_does_not_reorder_them() {
-        // v1.5.1: 行序 = cook 顺序 (strength ascending), which is what the wire's order
-        // already is. The metadata rides along; it does not sort anything.
+        // v1.5.2: 行序 = cook 顺序 = op 行 strength **降序** (a cook step inserts its
+        // output at the top of the sublayer stack, so the later op is the stronger
+        // one). The structural rows keep strength order; only the op run turns.
+        //
+        // The wire order is the fixture's (`instances` before `sample`); the panel's
+        // is the reverse inside the op run, which is the chain's own direction.
         let tree = CompositionTree::parse(&op_sample()).unwrap();
         let rows = roots(&tree);
         let ids: Vec<&str> = rows.iter().map(|r| r.id.as_str()).collect();
@@ -1737,7 +1792,97 @@ mod tests {
                 "mesh.usda",
                 "op:sample_points/0",
                 "op:instances/1"
-            ]
+            ],
+            "the session and root stay on top in strength order; the op rows read
+             mesh -> points -> instances, i.e. strength descending"
+        );
+        // Said in the words the panel uses: the titles top to bottom are the chain.
+        let titles: Vec<String> = rows
+            .iter()
+            .filter(|r| r.op)
+            .map(|r| op_row_title(tree.layer(&r.id).expect("a row is a layer")).to_owned())
+            .collect();
+        assert_eq!(titles, ["RusdSamplePoints", "RusdInstances"]);
+    }
+
+    #[test]
+    fn a_run_of_ops_is_reversed_in_place_and_structural_rows_do_not_move() {
+        // The contract (v1.5.2) says the op rows are reversed **per run**, not as one
+        // block: a server is not obliged to keep the ops adjacent, and a structural
+        // row between two runs must stay where strength puts it.
+        let split = json!({
+            "layers": [
+                {"id": "session", "kind": "session", "strength": 0},
+                {"id": "op:late", "kind": "sublayer", "strength": 1, "op": true},
+                {"id": "shared.usda", "kind": "sublayer", "strength": 2},
+                {"id": "op:mid", "kind": "sublayer", "strength": 3, "op": true},
+                {"id": "op:early", "kind": "sublayer", "strength": 4, "op": true},
+                {"id": "protos.usda", "kind": "reference", "strength": 5},
+            ],
+            "arcs": [], "prim_nodes": [], "variant_sets": [],
+        });
+        let tree = CompositionTree::parse(&split).unwrap();
+        let ids: Vec<String> = roots(&tree).into_iter().map(|r| r.id).collect();
+        assert_eq!(
+            ids,
+            [
+                "session",
+                "op:late",
+                "shared.usda",
+                "op:early",
+                "op:mid",
+                "protos.usda",
+            ],
+            "each run reverses by itself: the one-row run is unchanged and the
+             two-row run turns, with the structural rows untouched"
+        );
+        // And the stack itself is still readable in strength order — the reversal is
+        // the panel's, not a change to what the model says the stack is.
+        assert_eq!(
+            tree.root_layers()
+                .iter()
+                .map(|l| l.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "session",
+                "op:late",
+                "shared.usda",
+                "op:mid",
+                "op:early",
+                "protos.usda"
+            ],
+            "`root_layers` keeps the stack in strength order"
+        );
+    }
+
+    #[test]
+    fn a_stack_with_no_ops_or_one_op_is_not_reordered() {
+        let no_ops = json!({
+            "layers": [
+                {"id": "session", "kind": "session", "strength": 0},
+                {"id": "root.usda", "kind": "root", "strength": 1},
+                {"id": "protos.usda", "kind": "reference", "strength": 2},
+            ],
+            "arcs": [], "prim_nodes": [], "variant_sets": [],
+        });
+        let tree = CompositionTree::parse(&no_ops).unwrap();
+        assert_eq!(
+            roots(&tree).into_iter().map(|r| r.id).collect::<Vec<_>>(),
+            ["session", "root.usda", "protos.usda"]
+        );
+
+        let one_op = json!({
+            "layers": [
+                {"id": "root.usda", "kind": "root", "strength": 0},
+                {"id": "rusd_city", "kind": "sublayer", "strength": 1, "op": true},
+            ],
+            "arcs": [], "prim_nodes": [], "variant_sets": [],
+        });
+        let tree = CompositionTree::parse(&one_op).unwrap();
+        assert_eq!(
+            roots(&tree).into_iter().map(|r| r.id).collect::<Vec<_>>(),
+            ["root.usda", "rusd_city"],
+            "a run of one is its own reversal"
         );
     }
 }
