@@ -17,6 +17,11 @@
 //!   `target_layer:target_prim`; opening it walks into the target layer's branch.
 //! - **a prim hangs under every layer that authors it**, so "who says what" is
 //!   answered by which branch a row is under.
+//! - **an op row is a preview control** (v1.4): a cook generator's output layer is
+//!   drawn with `≤` and clicking it sends `preview{upto: <that layer>}` instead of a
+//!   `comp_node` ask. The 「final」 button beside 「刷新」 sends `preview{upto: null}`.
+//!   Clicking any other row is unchanged: `comp_node{id}`, and the preview stays where
+//!   it was (`docs/PROTOCOL.md` v1.4).
 //! - **a variant set expands** into its variants, the selected one first shown in
 //!   the row (`size = small`).
 //! - **clicking any row** selects it and asks `comp_node{id}` for its detail. A row
@@ -41,6 +46,15 @@ pub enum TreeAction {
     /// A row was clicked: select it, ask its detail, and (when it stands for a
     /// prim) also select that prim and copy its path.
     Select(TreeSelection),
+    /// An **op row** was clicked (v1.4): ask the server for the prefix composed up to
+    /// that cook op. `None` is the 「final」 control — the whole composition.
+    ///
+    /// A third variant rather than a flag on `Select`, because the two clicks do
+    /// different things: `Select` asks `comp_node{id}` for a detail and leaves the
+    /// preview alone (`docs/PROTOCOL.md` v1.4: 点非 op 节点仍走 comp_node 详情，不改
+    /// 预览), while this asks `preview{upto}` and asks no detail. A caller that had to
+    /// tell them apart from one value would have to re-derive the panel's own rule.
+    Preview(Option<String>),
     /// The 「刷新」 button: ask `composition_tree{}` again.
     Refresh,
 }
@@ -55,6 +69,14 @@ pub struct TreePanel {
     /// The detail of the last click (`comp_node{id}`), or why it failed.
     pub detail: Option<NodeDetail>,
     pub detail_error: Option<String>,
+    /// The composition the viewport is currently showing, as the server echoed it in
+    /// `stage_snapshot.upto` (v1.4): `None` is the final composition.
+    ///
+    /// The shell keeps it equal to `ClientModel::preview`; the panel only reads it, to
+    /// highlight the row that is where the user already is. It is **not** what the
+    /// panel sends — a click sends the row's own identifier — so a stale copy cannot
+    /// make a click ask for the wrong prefix, only mis-colour one row for a pass.
+    pub preview: Option<String>,
 }
 
 impl TreePanel {
@@ -102,20 +124,80 @@ impl TreePanel {
     }
 }
 
+/// What a click on `node` asks the shell to do — **the one place that rule lives**.
+///
+/// An **op row** previews the composition up to that layer (v1.4); every other row is a
+/// selection, which asks `comp_node{id}` and leaves the preview alone. `panel::row`
+/// draws from this and the tests assert against it, so the picture and the wire cannot
+/// disagree about which click does which.
+pub fn action_for(node: &TreeNode) -> TreeAction {
+    if node.op {
+        TreeAction::Preview(Some(node.id.clone()))
+    } else {
+        TreeAction::Select(TreeSelection::of(node))
+    }
+}
+
+/// The 「final」 control's action: the whole composition (`preview{upto: null}`).
+///
+/// A function rather than a literal at the button, because it is the *other half* of the
+/// op-row rule above and a test asserting one without the other would let them drift.
+pub fn final_action() -> TreeAction {
+    TreeAction::Preview(None)
+}
+
+/// Whether `node` is the layer row the viewport is currently composed up to
+/// (`docs/PROTOCOL.md` v1.4: the panel marks the prefix in force).
+///
+/// Pure, so the highlight rule is testable without a screen: an op row, a layer row, and
+/// an identifier matching the echoed `upto`. A prim or arc row whose id happened to equal
+/// the string is not a preview row and must not be coloured as one.
+pub fn is_current_preview(node: &TreeNode, preview: Option<&str>) -> bool {
+    node.op && node.kind == TreeNodeKind::Layer && preview == Some(node.id.as_str())
+}
+
 /// Draw the tree panel's whole body: its status line, then either the rows or the
 /// degraded sentence.
 pub fn tree_panel(ui: &mut egui::Ui, panel: &TreePanel) -> TreeAction {
     let mut refresh = false;
+    let mut final_clicked = false;
     ui.horizontal(|ui| {
         ui.label(RichText::new(panel.model.status_zh()).strong());
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if ui.small_button("刷新").clicked() {
                 refresh = true;
             }
+            // The 「final」 control (v1.4: 「final」 行/按钮 → preview{null}). A button as
+            // well as the rows because the final composition is *not* a layer row — an
+            // op row is a prefix, and "the whole thing" has to be reachable after a
+            // preview even when no row stands for it. Green when it is already on
+            // screen, so which of the two states the viewport is in is visible without
+            // clicking anything.
+            let is_final = panel.preview.is_none();
+            let text = if is_final {
+                RichText::new("final ✓")
+            } else {
+                RichText::new("final")
+            };
+            let button = egui::Button::new(text).fill(if is_final {
+                Color32::from_rgb(40, 80, 60)
+            } else {
+                Color32::TRANSPARENT
+            });
+            if ui
+                .add(button)
+                .on_hover_text("显示完整合成（preview{upto: null}）")
+                .clicked()
+            {
+                final_clicked = true;
+            }
         });
     });
     if refresh {
         return TreeAction::Refresh;
+    }
+    if final_clicked {
+        return final_action();
     }
     if panel.model.is_unavailable() {
         ui.add_space(4.0);
@@ -130,45 +212,94 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &TreePanel) -> TreeAction {
         ui.label("（尚无合成树）");
         return TreeAction::None;
     }
+    // **[v1.4] the whole body reads which rows are previews from the rows themselves.**
+    // `row` returns a `TreeAction`, not a `TreeSelection`, so the op-row rule lives in
+    // exactly one place: the `op` flag `crate::tree::roots` set.
     let mut action = TreeAction::None;
     egui::ScrollArea::vertical()
         .id_salt("composition-tree")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for root in &roots {
-                if let Some(sel) = row(ui, root, 0, panel.selection.as_ref()) {
-                    action = TreeAction::Select(sel);
+                if let TreeAction::None = &action
+                    && let Some(a) = row(
+                        ui,
+                        root,
+                        0,
+                        panel.selection.as_ref(),
+                        panel.preview.as_deref(),
+                    )
+                {
+                    action = a;
                 }
             }
         });
     action
 }
 
-/// One row, and its subtree. Returns the selection a click asked for.
+/// One row, and its subtree. Returns what a click asked for, if anything.
 fn row(
     ui: &mut egui::Ui,
     node: &TreeNode,
     depth: usize,
     selected: Option<&TreeSelection>,
-) -> Option<TreeSelection> {
+    preview: Option<&str>,
+) -> Option<TreeAction> {
     let is_selected = selected.is_some_and(|s| s.id == node.id);
+    // An op row that is **the current preview** is marked too: the user needs to see
+    // where they are, and the current prefix is not a selection (it does not follow a
+    // `comp_node` ask).
+    let is_current_preview = is_current_preview(node, preview);
     let text = match node.kind {
+        TreeNodeKind::Layer if node.op => RichText::new(&node.label).strong().underline(),
         TreeNodeKind::Layer => RichText::new(&node.label).strong(),
         TreeNodeKind::Arc => RichText::new(&node.label).italics(),
         TreeNodeKind::Prim | TreeNodeKind::VariantSet => RichText::new(&node.label),
     };
-    let text = if is_selected {
+    let text = if is_current_preview {
+        text.color(Color32::from_rgb(140, 230, 170))
+    } else if is_selected {
         text.color(Color32::from_rgb(120, 200, 255))
     } else {
         text
     };
 
-    let mut clicked: Option<TreeSelection> = None;
-    if node.children.is_empty() {
+    // What a click on this row means: a preview for an op row, a selection otherwise.
+    let click_action = action_for;
+
+    let mut clicked: Option<TreeAction> = None;
+    if node.op {
+        // **An op row is a control, not a twisty.** Its click previews; if it also
+        // collapsed its subtree, one click would mean two things and the user could not
+        // expand without changing what the viewport composes. An op layer's children are
+        // a couple of variant sets at most (v1.3 draws no prim rows), so it is drawn as a
+        // plain row with its subtree always visible.
         ui.horizontal(|ui| {
             indent(ui, depth);
-            if ui.selectable_label(is_selected, text).clicked() {
-                clicked = Some(TreeSelection::of(node));
+            if ui
+                .selectable_label(is_current_preview, text)
+                .on_hover_text(format!(
+                    "预览到此 op 之前：preview{{upto: \"{}\"}}",
+                    node.id
+                ))
+                .clicked()
+            {
+                clicked = Some(TreeAction::Preview(Some(node.id.clone())));
+            }
+        });
+        for child in &node.children {
+            if let Some(a) = row(ui, child, depth + 1, selected, preview) {
+                clicked = Some(a);
+            }
+        }
+    } else if node.children.is_empty() {
+        ui.horizontal(|ui| {
+            indent(ui, depth);
+            if ui
+                .selectable_label(is_selected || is_current_preview, text)
+                .clicked()
+            {
+                clicked = Some(click_action(node));
             }
         });
     } else {
@@ -179,13 +310,13 @@ fn row(
             .default_open(depth == 0)
             .show(ui, |ui| {
                 for child in &node.children {
-                    if let Some(sel) = row(ui, child, depth + 1, selected) {
-                        clicked = Some(sel);
+                    if let Some(a) = row(ui, child, depth + 1, selected, preview) {
+                        clicked = Some(a);
                     }
                 }
             });
         if header.header_response.clicked() {
-            clicked = Some(TreeSelection::of(node));
+            clicked = Some(click_action(node));
         }
     }
     clicked

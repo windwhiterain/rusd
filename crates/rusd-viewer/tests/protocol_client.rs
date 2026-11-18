@@ -701,6 +701,7 @@ fn the_mock_servers_wire_lines_are_the_contracts_shape() {
             version,
             format,
             data,
+            ..
         })) => {
             assert_eq!(version, 7);
             assert_eq!(format, "usdc");

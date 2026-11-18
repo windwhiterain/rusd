@@ -51,6 +51,14 @@ pub struct LayerNode {
     pub kind: String,
     /// Rank in the strength order: 0 is strongest (the session layer).
     pub strength: usize,
+    /// Whether this layer is a **cook generator's output** (v1.4: `composition_tree`
+    /// 的 layers 条目增 `op: true` 标记 cook generator 输出层，kind 仍 sublayer).
+    ///
+    /// An op layer is the one thing in the tree that can be previewed *up to*: the
+    /// prefix is `root + the ops at or before this one + session overrides`. So this
+    /// flag, and only this flag, decides whether a layer row is a preview control or
+    /// a plain structural row.
+    pub op: bool,
 }
 
 /// One composition arc: an edge between two layers at two prims.
@@ -128,6 +136,10 @@ impl CompositionTree {
                     id: string(l, "id", "layers[]")?,
                     kind: string(l, "kind", "layers[]")?,
                     strength: number(l, "strength", "layers[]")? as usize,
+                    // Optional and defaulting to false: a pre-v1.4 server sends no
+                    // flag, and "no op rows" is exactly right for a server whose
+                    // layers cannot answer `preview`.
+                    op: l.get("op").and_then(Value::as_bool).unwrap_or(false),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -246,6 +258,14 @@ pub struct TreeNode {
     /// also selecting the prim in the viewport (`docs/PROTOCOL.md` v1.2: 「点选
     /// prim 节点仍自动拷贝 prim path」).
     pub prim: Option<String>,
+    /// Whether this row is a **preview control**: a cook op layer (v1.4), whose click
+    /// asks the server for the prefix composed up to it instead of asking `comp_node`
+    /// for a detail.
+    ///
+    /// A flag on the row rather than a check against the tree, because the rows are
+    /// what the panel draws: deciding "is this a preview control?" anywhere else makes
+    /// the row and the click two opinions that can disagree.
+    pub op: bool,
     /// Children, in the order a panel draws them.
     pub children: Vec<TreeNode>,
 }
@@ -285,6 +305,10 @@ impl TreeNodeKind {
 ///       ↳ variant name
 /// ```
 ///
+/// A layer row that is a **cook op** (v1.4) is drawn with `op: true` and a `≤` marker,
+/// so the panel can tell a preview control from a plain structural row. Its label still
+/// carries the identifier, because that identifier is what `preview{upto}` takes.
+///
 /// **The arc's target layer is a row that names it, not a second copy of its
 /// branch.** Every layer is already a root, so nesting the target's subtree under
 /// every arc that reaches it would draw the same prims once per path into the
@@ -313,6 +337,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 kind: TreeNodeKind::Layer,
                 label: format!("→ {}", arc.target_layer),
                 prim: None,
+                op: false,
                 children: Vec::new(),
             }]
         } else {
@@ -323,6 +348,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
             kind: TreeNodeKind::Arc,
             label: format!("{} → {}:{}", arc.kind, arc.target_layer, arc.target_prim),
             prim: Some(arc.source_prim.clone()),
+            op: false,
             children: target_row,
         });
     }
@@ -346,6 +372,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                     None => format!("{} (none)", vset.name),
                 },
                 prim: Some(prim.path.clone()),
+                op: false,
                 children: vset
                     .variants
                     .iter()
@@ -358,6 +385,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                         kind: TreeNodeKind::VariantSet,
                         label: v.clone(),
                         prim: Some(prim.path.clone()),
+                        op: false,
                         children: Vec::new(),
                     })
                     .collect(),
@@ -371,14 +399,28 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     TreeNode {
         id: layer.id.clone(),
         kind: TreeNodeKind::Layer,
-        label: format!(
-            "{} [{} · {}/{}]",
-            layer.id,
-            layer.kind,
-            layer.strength,
-            tree.layers.len()
-        ),
+        label: if layer.op {
+            // A preview control (v1.4): the identifier is the `upto` value, so it must
+            // stay in the label verbatim; `≤` is the marker that says clicking it
+            // previews *up to* here rather than inspecting it.
+            format!(
+                "≤ {} [{} · {}/{}]",
+                layer.id,
+                layer.kind,
+                layer.strength,
+                tree.layers.len()
+            )
+        } else {
+            format!(
+                "{} [{} · {}/{}]",
+                layer.id,
+                layer.kind,
+                layer.strength,
+                tree.layers.len()
+            )
+        },
         prim: None,
+        op: layer.op,
         children,
     }
 }

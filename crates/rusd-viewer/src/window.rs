@@ -48,7 +48,7 @@ fn work_area_px(
 ) -> Option<((i32, i32), PhysicalSize<u32>)> {
     use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::Graphics::Gdi::{
-        GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
     };
     let pt = POINT {
         x: origin.0 + (size.width / 2) as i32,
@@ -105,11 +105,8 @@ pub fn startup_window_attrs(event_loop: &ActiveEventLoop) -> Result<WindowAttrib
     // so converting with it keeps the two consistent.
     let scale = monitor.scale_factor().max(0.1);
     let want = LogicalSize::new(OPEN_SIZE.0, OPEN_SIZE.1).to_physical::<u32>(scale);
-    let (origin, area) = work_area_px(
-        (monitor.position().x, monitor.position().y),
-        monitor.size(),
-    )
-    .unwrap_or(((monitor.position().x, monitor.position().y), monitor.size()));
+    let (origin, area) = work_area_px((monitor.position().x, monitor.position().y), monitor.size())
+        .unwrap_or(((monitor.position().x, monitor.position().y), monitor.size()));
     let (size, position) = place_on(origin, area, want);
     Ok(attrs.with_inner_size(size).with_position(position))
 }

@@ -188,6 +188,15 @@ pub struct ClientModel {
     /// from where the prim actually is. Sorted (`BTreeMap`), so nothing depends
     /// on a hash order.
     pub centers: std::collections::BTreeMap<String, [f64; 3]>,
+    /// **Which composition the scene on screen is** (v1.4, D14): the cook-op layer
+    /// `preview{upto}` last asked for, or `None` for the final composition.
+    ///
+    /// It comes from the `stage_snapshot.upto` the server sent, not from what the
+    /// client asked for: a server that answers the request and then composes a
+    /// prefix says which prefix that was, and this is the echo the status bar and
+    /// the overlay print. A client that recorded only its own request would claim a
+    /// prefix while the pixels were still the final scene.
+    pub preview: Option<String>,
 }
 
 /// What an incoming notification means for the view.
@@ -224,6 +233,7 @@ impl ClientModel {
             framed: false,
             offline: false,
             centers: std::collections::BTreeMap::new(),
+            preview: None,
         }
     }
 
@@ -269,14 +279,39 @@ impl ClientModel {
     pub fn apply(&mut self, n: &Notification) -> Effect {
         match n {
             Notification::Snapshot(snap) => {
-                if !self.state.accept(snap.version) {
-                    return Effect::Nothing; // v ≤ the greatest seen: discarded
+                // **A preview frame does not move the version** (`docs/PROTOCOL.md`
+                // v1.4: preview 不推进 scene version), so the discard rule cannot be
+                // the only way in: a prefix frame and the final frame of the same
+                // version are both new *pictures*, and a repeated version is
+                // legitimate wherever the composition on screen changed.
+                //
+                // So a snapshot is stale when it is **older than the floor**, or when it
+                // is at the floor and shows the composition already on screen. Nothing
+                // else is dropped — and nothing at the floor raises it either, which is
+                // the half that matters: a prefix that raised the floor to its own
+                // version would make the next real mutation at that same version look
+                // stale, and the view would freeze for good.
+                //
+                // The floor is an `Option`, not `unwrap_or(0)`: with no floor yet, a
+                // snapshot at **version 0** is the first one, not a duplicate of
+                // nothing (`hello` normally seeds a version, but a server need not).
+                let stale = match self.state.max_version {
+                    None => false,
+                    Some(floor) => {
+                        snap.version < floor || (snap.version == floor && snap.upto == self.preview)
+                    }
+                };
+                if stale {
+                    self.state.discarded += 1;
+                    return Effect::Nothing;
                 }
+                self.state.note_version(snap.version);
                 self.state.accepted += 1;
                 self.version = Some(snap.version);
                 self.last_reason = None;
                 match MadeScene::from_snapshot(snap, self.aspect) {
                     Ok(made) => {
+                        self.preview = snap.upto.clone();
                         self.adopt(&made);
                         Effect::NewScene(Box::new(made))
                     }
@@ -417,10 +452,27 @@ impl ClientModel {
             None => "未选中".to_owned(),
         };
         let mut line = format!("{conn} · {version} · {prims} · {sel}");
+        if let Some(upto) = &self.preview {
+            line.push_str(&format!(" · 预览 ≤ {upto}"));
+        }
         if let Some(r) = &self.last_reason {
             line.push_str(&format!(" · {}", reason_zh(r)));
         }
         line
+    }
+
+    /// The composition on screen, as the status bar and the overlay say it: 「最终」 for
+    /// the final composition and 「预览 ≤ <layer>」 for a prefix (v1.4).
+    ///
+    /// Both states are printed rather than only the prefix: a user who clicked an op row
+    /// needs to see which prefix they are looking at, and a user who clicked 「final」
+    /// needs to see that it took effect. `ClientModel::preview` is the one source (the
+    /// server's echoed `upto`), so this cannot disagree with what is on screen.
+    pub fn preview_label(&self) -> String {
+        match &self.preview {
+            Some(upto) => format!("预览 ≤ {upto}"),
+            None => "最终".to_owned(),
+        }
     }
 
     /// The status bar's one-line summary (ASCII; the logs and the tests read it).
@@ -443,7 +495,12 @@ impl ClientModel {
             Some(r) => format!("({r})"),
             None => String::new(),
         };
-        format!("{conn} · {version} · {prims} · {sel} {reason}")
+        let preview = match &self.preview {
+            Some(upto) => format!("preview<={upto}"),
+            None => String::new(),
+        };
+        format!("{conn} · {version} · {prims} · {sel} {preview} {reason}")
+            .replace("  ", " ")
             .trim_end()
             .to_owned()
     }
@@ -501,6 +558,7 @@ mod tests {
             version,
             format: "usdc".to_owned(),
             data: base64_encode(bytes),
+            upto: None,
         })
     }
 
@@ -568,6 +626,7 @@ mod tests {
             version: 2,
             format: "usdc".to_owned(),
             data: base64_encode(b"not a usdc file at all"),
+            upto: None,
         });
         let effect = m.apply(&bad);
         match &effect {
