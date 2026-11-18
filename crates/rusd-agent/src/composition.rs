@@ -69,6 +69,39 @@ struct LayerEntry {
     id: String,
     kind: &'static str,
     strength: usize,
+    /// Whether this layer is a **cook output layer** (`docs/PROTOCOL.md`
+    /// v1.4): a generator's authored sublayer, which a preview can stop the
+    /// composition at. See [`cook_output_layer`].
+    op: bool,
+}
+
+/// Whether `id` is a cook output layer of this stage: a layer the cook inserted
+/// into the root layer's sublayer stack. A `.rusd` document authors no
+/// `subLayers` (SPEC §4's v0 subset), so every sublayer of the root layer is one
+/// the cook wrote — and none of them is a document layer, an arc target or the
+/// session layer, which are the other kinds the tree knows.
+///
+/// The order is the cook's: the cook inserts each output layer at position 0 of
+/// the root's stack, so the stack lists them newest first and **cook order is the
+/// stack reversed**. [`cook_output_layers`] is the same rule, exported for the
+/// preview slice.
+fn cook_output_layer(id: &str, root_id: &str, root_sublayers: &[String]) -> bool {
+    id != root_id && root_sublayers.iter().any(|s| s == id)
+}
+
+/// The cook output layers of `stage` in **cook order** (oldest first), which is
+/// the order `preview{upto}` counts in (PROTOCOL v1.4). A muted layer is not in
+/// the root's stack, so a superseded output layer of an earlier pass is not
+/// listed.
+pub fn cook_output_layers(stage: &Stage) -> Vec<String> {
+    let root_id = stage.root_layer().identifier().to_owned();
+    let mut ids = stage.sub_layers(&root_id);
+    // `sub_layers` lists the parent first.
+    if ids.first().is_some_and(|id| *id == root_id) {
+        ids.remove(0);
+    }
+    ids.reverse();
+    ids
 }
 
 struct ArcEntry {
@@ -136,6 +169,7 @@ impl CompositionTree {
             })
             .collect();
 
+        let root_sublayers = stage.sub_layers(&root_id);
         let arcs = scan_arcs(stage, &scans);
 
         // A layer outside the root layer stack is there because an arc reached
@@ -167,6 +201,7 @@ impl CompositionTree {
                     id: scan.id.clone(),
                     kind,
                     strength,
+                    op: cook_output_layer(&scan.id, &root_id, &root_sublayers),
                 }
             })
             .collect();
@@ -187,6 +222,7 @@ impl CompositionTree {
                 "id": l.id,
                 "kind": l.kind,
                 "strength": l.strength,
+                "op": l.op,
             })).collect::<Vec<_>>(),
             "arcs": self.arcs.iter().map(|a| json!({
                 "id": a.id,
@@ -266,6 +302,7 @@ impl CompositionTree {
                     "identifier": layer.id,
                     "kind": layer.kind,
                     "strength": layer.strength,
+                    "op": layer.op,
                     "usda_text": borrow.export_to_string().unwrap_or_default(),
                     "spec_count": borrow.data().spec_paths().len(),
                 })
@@ -1381,5 +1418,91 @@ mod tests {
             "an asset nothing answers to stays as authored"
         );
         assert_eq!(file_name("a/b\\c.usda"), "c.usda");
+    }
+
+    /// A stage whose root layer sublayers `layers`, inserted the way the cook
+    /// inserts one: at position 0, so the newest output layer is strongest.
+    fn cooked_stack(layers: &[&str]) -> Stage {
+        let stage = Stage::builder()
+            .in_memory("root.usda")
+            .expect("in-memory stage");
+        let root_id = stage.root_layer().identifier().to_owned();
+        for tag in layers {
+            stage
+                .insert_layer(
+                    &root_id,
+                    0,
+                    sdf::Layer::new_anonymous(tag),
+                    sdf::LayerOffset::IDENTITY,
+                )
+                .expect("insert the cooked layer");
+        }
+        stage
+    }
+
+    #[test]
+    fn cook_output_layers_are_listed_in_cook_order_not_stack_order() {
+        // Cooked `city` first, then `scatter`: the cook inserts each at position
+        // 0 of the root's stack, so the stack reads `root, scatter, city` while
+        // the cook ran `city` then `scatter`. `preview{upto}` counts in cook
+        // order, so that is what this answers.
+        let stage = cooked_stack(&["rusd_city.usda", "rusd_scatter.usda"]);
+        let ops = cook_output_layers(&stage);
+        assert_eq!(ops.len(), 2, "{ops:?}");
+        assert!(ops[0].contains("rusd_city.usda"), "{ops:?}");
+        assert!(ops[1].contains("rusd_scatter.usda"), "{ops:?}");
+
+        let root_id = stage.root_layer().identifier().to_owned();
+        let root_sublayers = stage.sub_layers(&root_id);
+        assert!(
+            !cook_output_layer(&root_id, &root_id, &root_sublayers),
+            "the root layer is the document, not a cook output"
+        );
+        for id in &ops {
+            assert!(
+                cook_output_layer(id, &root_id, &root_sublayers),
+                "each cooked sublayer is an op: {id}"
+            );
+        }
+        // A layer the stage holds but the root does not sublayer — a session
+        // layer, an arc target — is not one either.
+        assert!(!cook_output_layer(
+            "C:/assets/proto.usda",
+            &root_id,
+            &root_sublayers
+        ));
+    }
+
+    #[test]
+    fn the_tree_flags_the_cook_output_layers() {
+        let stage = cooked_stack(&["rusd_city.usda", "rusd_scatter.usda"]);
+        let tree = CompositionTree::build(&stage).to_json();
+        let rows: Vec<(String, bool)> = tree["layers"]
+            .as_array()
+            .expect("layers")
+            .iter()
+            .map(|l| {
+                (
+                    l["id"].as_str().unwrap_or_default().to_owned(),
+                    l["op"].as_bool().unwrap_or(false),
+                )
+            })
+            .collect();
+        let ops: Vec<&String> = rows
+            .iter()
+            .filter(|(_, op)| *op)
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ops.len(), 2, "both cooked layers are ops: {rows:?}");
+        assert!(
+            rows.iter().any(|(id, op)| !op && id.contains("root.usda")),
+            "the root layer is not an op: {rows:?}"
+        );
+        // The flag survives to `comp_node`'s layer detail.
+        let tree = CompositionTree::build(&stage);
+        let detail = tree
+            .node(&stage, ops[0])
+            .expect("the op layer has a detail");
+        assert_eq!(detail["op"].as_bool(), Some(true), "{detail}");
     }
 }

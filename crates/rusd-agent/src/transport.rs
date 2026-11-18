@@ -19,8 +19,8 @@
 //!
 //! ## Beyond the D12 surface
 //!
-//! Three groups of methods live alongside that one, each in its own module and
-//! described by its own section of `docs/PROTOCOL.md`:
+//! Four groups of methods live alongside that one, each described by its own
+//! section of `docs/PROTOCOL.md`:
 //!
 //! - [`crate::capture`] — `capture` / `capture_get` / `capture_list`, the
 //!   visual references a human hands an agent (PROTOCOL v1.1). A capture is
@@ -31,6 +31,11 @@
 //!   stack's `sdf` layer specs, not off the flattened snapshot, which has already
 //!   dropped every arc. The tree is cached for the `version` it describes and
 //!   dropped whenever the stage is rebuilt.
+//! - `preview` here (PROTOCOL v1.4) — how far into the cook **one connection's**
+//!   snapshots go. The state is per connection, not per session: two viewers may
+//!   watch different stages of the same cook at once. A preview is not a mutation
+//!   and does not move `version`; it flattens the same authority stack with the
+//!   later cook output layers muted.
 //!
 //! Which mutations rebuild, and which edit in place:
 //!
@@ -400,7 +405,7 @@ struct Session {
     /// Notification lines produced by the request being handled, held until
     /// that request's response is written: a client that sends `open` reads the
     /// response to `open` first, then the snapshot it caused.
-    pending: Vec<String>,
+    pending: Vec<Pending>,
     /// A channel back into this same sync loop, which the file-watch callback
     /// uses to wake it (that callback runs on `notify`'s own thread).
     wake: mpsc::Sender<Msg>,
@@ -418,6 +423,37 @@ struct Session {
     /// `sdf` layer specs and kept for the version it describes: `comp_node` is
     /// asked for one node at a time, after the tree that named it.
     tree: Option<(u64, CompositionTree)>,
+    /// Per-connection preview state (PROTOCOL v1.4): how far into the cook a
+    /// connection's snapshots stop. The value is a position in the **cook order**
+    /// of the stage's output layers (0 is the first generator cooked); a
+    /// connection absent from the map sees the final, full composition.
+    ///
+    /// The wire names a layer *identifier*, but cook output layers are anonymous
+    /// (`anon:<n>:<tag>`) and a rebuild — `open` / `patch` / `undo` / `redo` /
+    /// `reload` — mints new ones. Keeping the **position** is what lets a preview
+    /// survive an edit to the document: the layer at that position is still the
+    /// same generator's output, and the snapshot names the identifier the stack
+    /// has now. A position the rebuilt stack no longer reaches falls back to the
+    /// final composition, and the snapshot says so by carrying no `upto`.
+    preview: BTreeMap<u64, usize>,
+}
+
+/// What one mutation made available to its subscribers, held until the
+/// request's response is written (PROTOCOL 「消息顺序」).
+///
+/// A snapshot is **not** one line: it depends on the connection it goes to, whose
+/// preview state decides where the composition stops (PROTOCOL v1.4). So the
+/// pending list names what to build and the broadcast builds it once per distinct
+/// preview state.
+enum Pending {
+    /// A notification every subscriber gets verbatim: `diagnostics`,
+    /// `state_changed`.
+    Line(String),
+    /// The scene at `version`. `final_line` is the whole composition, already
+    /// built and so already known to flatten: a connection that asked for a
+    /// preview gets a line built for its own state instead, and one that did
+    /// not gets exactly this line without a second flatten.
+    Snapshot { version: u64, final_line: String },
 }
 
 /// The hot-reload watch on one document path (PROTOCOL `reason:"reload"`).
@@ -448,6 +484,7 @@ impl Session {
             reload_due: None,
             captures,
             tree: None,
+            preview: BTreeMap::new(),
         }
     }
 
@@ -456,6 +493,8 @@ impl Session {
             Msg::Request { conn, req, out } => self.request(conn, &req, &out),
             Msg::Gone { conn } => {
                 self.subs.remove(&conn);
+                // A connection's preview state ends with the connection.
+                self.preview.remove(&conn);
             }
             Msg::FileChanged => self.reload_due = Some(Instant::now() + RELOAD_DEBOUNCE),
         }
@@ -497,10 +536,7 @@ impl Session {
         self.agent.replace_doc(text);
         let pipeline = self.rebuild();
         let _ = self.after_mutation("reload", &pipeline);
-        let pending = std::mem::take(&mut self.pending);
-        if !pending.is_empty() {
-            self.broadcast(&pending);
-        }
+        self.publish();
     }
 
     /// Point the hot-reload watch at `path`, replacing any earlier one.
@@ -558,11 +594,29 @@ impl Session {
             "subscribe" => {
                 let subscribed = self.subscribe(conn, &params, out);
                 if subscribed.is_ok() {
-                    after = self.snapshot_line(self.version).ok();
+                    let upto = self.preview_position(conn);
+                    after = self.snapshot_line(self.version, upto).ok();
                 }
                 subscribed
             }
             "unsubscribe" => self.unsubscribe(conn, &params),
+            "preview" => {
+                let set = self.preview(conn, &params);
+                if set.is_ok() && self.subs.contains_key(&conn) {
+                    // The connection asked to see the composition stop earlier
+                    // (or to see it whole): send it the scene that preview
+                    // describes, after the response. The version does not move —
+                    // nothing about the authority state changed — so this
+                    // snapshot carries the version the connection already had.
+                    //
+                    // Only a subscriber gets one: snapshots are what a
+                    // subscription is for, and a connection that never
+                    // subscribed would not otherwise see a notification at all.
+                    let upto = self.preview_position(conn);
+                    after = self.snapshot_line(self.version, upto).ok();
+                }
+                set
+            }
             "opinion" => self.opinion(&params),
             "composition_tree" => self.composition_tree(&params),
             "comp_node" => self.comp_node(&params),
@@ -584,16 +638,86 @@ impl Session {
         }
         // Effect, then consequence: everything this request caused reaches the
         // clients after the answer to the request itself.
-        let pending = std::mem::take(&mut self.pending);
-        if !pending.is_empty() {
-            self.broadcast(&pending);
-        }
+        self.publish();
         if let Some(line) = after {
             let _ = out.send(line);
         }
     }
 
     // --- viewer methods ---------------------------------------------------
+
+    /// `preview{upto}` (PROTOCOL v1.4): how far into the cook **this**
+    /// connection's snapshots go. `upto` is the identifier of a cook output
+    /// layer, as `composition_tree`'s `layers` lists them (the rows with
+    /// `op: true`), or `null` for the final, whole composition.
+    ///
+    /// The prefix the connection then sees is the root layer plus the cook
+    /// output layers up to and including `upto` in **cook order** — not the
+    /// stack order a `layers` row lists, which is the strength order and puts
+    /// the newest layer first.
+    ///
+    /// The state is stored as the position in cook order for the reason
+    /// [`Session::preview`] gives. An identifier that names no cook output
+    /// layer of the current stage is `-32602`, naming what would have worked:
+    /// asking for a preview of a layer that is not an op is a client bug, not a
+    /// request to see something else.
+    fn preview(&mut self, conn: u64, p: &Value) -> Result<Value, (i64, String)> {
+        let upto = match p.get("upto") {
+            None => {
+                return Err((
+                    INVALID_PARAMS,
+                    "preview: `upto` (a cook output layer identifier, or null) required".into(),
+                ));
+            }
+            Some(Value::Null) => None,
+            Some(Value::String(id)) => Some(id.clone()),
+            Some(other) => {
+                return Err((
+                    INVALID_PARAMS,
+                    format!("preview: `upto` must be a layer identifier or null, not {other}"),
+                ));
+            }
+        };
+        let Some(stage) = self.stage.clone() else {
+            return Err(server_error("no scene open; call open first".into()));
+        };
+        let ops = crate::composition::cook_output_layers(&stage);
+        match upto {
+            None => {
+                self.preview.remove(&conn);
+                Ok(json!({ "upto": Value::Null }))
+            }
+            Some(id) => {
+                let position = ops.iter().position(|layer| *layer == id).ok_or_else(|| {
+                    (
+                        INVALID_PARAMS,
+                        format!(
+                            "preview: {id:?} is not a cook output layer of this stage; \
+                             the op layers are {ops:?} (null previews the final composition)"
+                        ),
+                    )
+                })?;
+                self.preview.insert(conn, position);
+                Ok(json!({ "upto": id, "op_index": position }))
+            }
+        }
+    }
+
+    /// Where `conn`'s preview stops, as a position in cook order; `None` is the
+    /// final composition. A position the current stage no longer reaches (the
+    /// document changed and the cook now has fewer ops) falls back to the final
+    /// composition, draining the stale state as it does.
+    fn preview_position(&mut self, conn: u64) -> Option<usize> {
+        let position = *self.preview.get(&conn)?;
+        let stage = self.stage.as_ref()?;
+        let len = crate::composition::cook_output_layers(stage).len();
+        if position < len {
+            Some(position)
+        } else {
+            self.preview.remove(&conn);
+            None
+        }
+    }
 
     /// `composition_tree{}` (PROTOCOL v1.2): the composition tree of the
     /// authority stack. Built on demand and kept until the stage changes — a
@@ -879,54 +1003,167 @@ impl Session {
         }));
     }
 
-    /// Publish the new authority state: bump the version, flatten to `usdc`,
-    /// and broadcast to every subscriber.
+    /// Publish the new authority state: bump the version, and hand every
+    /// subscriber the scene and the reason. Snapshots are built at broadcast
+    /// time, one per distinct preview state (PROTOCOL v1.4).
     fn after_mutation(&mut self, reason: &str, pipeline: &Pipeline) -> Result<(), (i64, String)> {
         if !pipeline.ok {
-            self.pending.push(diagnostics_line(&pipeline.diags));
+            self.pending
+                .push(Pending::Line(diagnostics_line(&pipeline.diags)));
             return Ok(());
         }
         let version = self.version + 1;
-        let snapshot = self.snapshot_line(version).map_err(server_error)?;
+        // Build the final composition once here, so a flatten failure is this
+        // request's error and no version is published for a scene no snapshot
+        // can carry (PROTOCOL 「合成失败的 mutation」). The line is reused for
+        // every subscriber that did not ask for a preview.
+        let final_line = self.snapshot_line(version, None).map_err(server_error)?;
         self.version = version;
-        self.pending.push(snapshot);
+        self.pending.push(Pending::Snapshot {
+            version,
+            final_line,
+        });
         if !pipeline.diags.is_empty() {
-            self.pending.push(diagnostics_line(&pipeline.diags));
+            self.pending
+                .push(Pending::Line(diagnostics_line(&pipeline.diags)));
         }
-        self.pending.push(to_line(&json!({
+        self.pending.push(Pending::Line(to_line(&json!({
             "method": "state_changed",
             "params": { "version": version, "reason": reason },
-        })));
+        }))));
         Ok(())
     }
 
-    /// The Tier A snapshot: the whole stage flattened into one `usdc` layer,
+    /// The Tier A snapshot: the stage — or, for a preview, the composition that
+    /// stops after the cook op at `upto` — flattened into one `usdc` layer,
     /// base64 on the wire.
-    fn snapshot_line(&self, version: u64) -> Result<String, String> {
+    ///
+    /// A preview is built by muting the cook output layers **after** `upto` in
+    /// cook order, flattening, and unmuting them again. Muting is the stage's own
+    /// composition control (`Stage::mute_layer`), so the prefix is composed by
+    /// the same engine that composes the whole — there is no second pipeline to
+    /// keep in step. The layers come back exactly as they were, so a caller's
+    /// final composition is untouched by a client's preview.
+    fn snapshot_line(&self, version: u64, upto: Option<usize>) -> Result<String, String> {
         let Some(stage) = self.stage.as_ref() else {
             return Err("no scene open; nothing to snapshot".into());
         };
-        let flat = stage
-            .flatten()
-            .map_err(|e| format!("flatten failed: {e}"))?;
+        let ops = crate::composition::cook_output_layers(stage);
+        let muted: Vec<String> = match upto {
+            Some(position) => ops.iter().skip(position + 1).cloned().collect(),
+            None => Vec::new(),
+        };
+        for id in &muted {
+            stage.mute_layer(id.clone());
+        }
+        let flattened = stage.flatten();
+        for id in &muted {
+            stage.unmute_layer(id);
+        }
+        let flat = flattened.map_err(|e| format!("flatten failed: {e}"))?;
         let format = sdf::LayerRegistry::find_by_id("usdc")
             .ok_or("the usdc file format is not registered")?;
         let written = format
             .write_bytes(flat.data())
             .map_err(|e| format!("usdc write failed: {e}"))?;
+        let mut params = json!({
+            "version": version,
+            "format": "usdc",
+            "data": base64_encode(&written.bytes),
+        });
+        // `upto` is absent for the final composition (PROTOCOL v1.4): the
+        // snapshot then means the whole scene, which is what a client that never
+        // asked for a preview always gets.
+        if let Some(position) = upto
+            && let Some(id) = ops.get(position)
+        {
+            params["upto"] = json!(id);
+        }
         Ok(to_line(&json!({
             "method": "stage_snapshot",
-            "params": {
-                "version": version,
-                "format": "usdc",
-                "data": base64_encode(&written.bytes),
-            },
+            "params": params,
         })))
     }
 
-    fn broadcast(&mut self, lines: &[String]) {
-        self.subs
-            .retain(|_, out| lines.iter().all(|line| out.send(line.clone()).is_ok()));
+    /// Broadcast what the request being handled caused, and empty the pending
+    /// list (PROTOCOL 「消息顺序」: response, then snapshot, then diagnostics,
+    /// then `state_changed`).
+    ///
+    /// A snapshot is built once per **distinct preview state** among the
+    /// subscribers, not once per connection: a preview is a flatten of the whole
+    /// stage, and two viewers watching the same prefix must not pay for it twice.
+    fn publish(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        if pending.is_empty() {
+            return;
+        }
+        // Which preview state each subscriber is in, resolved once: this also
+        // drains a state the rebuilt cook no longer reaches.
+        let conns: Vec<u64> = self.subs.keys().copied().collect();
+        let mut states: BTreeMap<u64, Option<usize>> = conns
+            .into_iter()
+            .map(|conn| (conn, self.preview_position(conn)))
+            .collect();
+        // One preview line per state that some subscriber is actually in, built
+        // once however many connections watch it: a preview is a flatten of the
+        // whole stage, which is the one cost worth sharing here.
+        let mut previews: BTreeMap<usize, String> = BTreeMap::new();
+        for item in &pending {
+            let Pending::Snapshot { version, .. } = item else {
+                continue;
+            };
+            // Collected first: a failure below rewrites `states`.
+            let wanted: Vec<usize> = states.values().flatten().copied().collect();
+            for position in wanted {
+                if previews.contains_key(&position) {
+                    continue;
+                }
+                match self.snapshot_line(*version, Some(position)) {
+                    Ok(line) => {
+                        previews.insert(position, line);
+                    }
+                    Err(message) => {
+                        // A prefix that will not flatten: those connections fall
+                        // back to the final composition rather than keep a stale
+                        // scene, and the failure is logged rather than published
+                        // — a client's own `preview` call is where it surfaces.
+                        eprintln!("rusd serve: preview at op {position}: {message}");
+                        for (conn, upto) in states.iter_mut() {
+                            if *upto == Some(position) {
+                                *upto = None;
+                                self.preview.remove(conn);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut gone: Vec<u64> = Vec::new();
+        for (conn, upto) in &states {
+            for item in &pending {
+                let line = match item {
+                    Pending::Line(line) => line.clone(),
+                    Pending::Snapshot { final_line, .. } => match upto {
+                        None => final_line.clone(),
+                        Some(position) => match previews.get(position) {
+                            Some(line) => line.clone(),
+                            None => continue,
+                        },
+                    },
+                };
+                let Some(out) = self.subs.get(conn) else {
+                    break;
+                };
+                if out.send(line).is_err() {
+                    gone.push(*conn);
+                    break;
+                }
+            }
+        }
+        for conn in gone {
+            self.subs.remove(&conn);
+            self.preview.remove(&conn);
+        }
     }
 }
 
