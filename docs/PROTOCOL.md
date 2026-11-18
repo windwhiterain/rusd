@@ -312,3 +312,23 @@ layers（strength 序，session 最强）+ arcs（边/命名行指向目标层�
   未知 upto -32602；preview 不动 version。
 - viewer：op 行点击发 preview（mock server 断言 wire）；final 恢复；overlay 面积界；
   真窗终验归父会话。
+## v1.4.1 增补（用户裁定：scatter 必须基于几何；2026-11-18）
+
+**scatter 的分布必须来自输入几何，不是参数域。** 输入几何两种形态：
+
+- **UsdGeom.Mesh**：按三角形**面积加权**采样（count + seed 参数；累积面积 + 重心坐标），
+  实例位置落在输入 mesh 表面上。
+- **Points / point3f[]**：逐点实例（含世界变换）。
+
+**替换语义**：输出 layer 写原型实例 prim，**并写 visibility override 隐藏输入几何 prim**
+⇒ 合成结果 scatter 之后只见实例；前缀预览 scatter 之前见输入几何。输入几何保留在输入层
+（不删 spec，只 override visibility）。
+
+确定性：路径键控 ChaCha8（与现 generator 同纪律）。参数式域 scatter 仅作无 input 时回退。
+
+### 验收（proc）
+
+- mesh 输入：实例数 == count；每个实例位置到输入 mesh 表面距离 ≈ 0（点在三角形内）；
+- points 输入：逐点世界变换一致；
+- 替换语义：scatter 后输入 prim 的 composed visibility = invisible；前缀之前 = visible；
+- 同 seed 同输入 ⇒ 同输出（确定性回归）。
