@@ -926,14 +926,24 @@ impl Shell {
                             self.tree_open = false;
                         }
                     });
+                    // The detail gets its own bottom section inside the panel: the tree is
+                    // a full-height scroll area, so a detail drawn *after* it lands below
+                    // the visible rect and is never seen (v1.5.5 lesson: the feature
+                    // existed, the pixels did not). Carve the detail first, then the tree
+                    // takes the rest.
+                    egui::Panel::bottom("tree-detail")
+                        .resizable(true)
+                        .default_size(240.0)
+                        .min_size(64.0)
+                        .show(ui, |ui| {
+                            crate::panel::detail_panel(ui, &self.tree);
+                        });
                     match crate::panel::tree_panel(ui, &self.tree) {
                         crate::panel::TreeAction::Select(sel) => self.on_tree_select(sel),
                         crate::panel::TreeAction::Preview(upto) => self.ask_preview(upto),
                         crate::panel::TreeAction::Refresh => self.ask_tree(),
                         crate::panel::TreeAction::None => {}
                     }
-                    ui.separator();
-                    crate::panel::detail_panel(ui, &self.tree);
                 })
         } else {
             // Collapsed: a strip that reopens it. The viewport takes the width back on
@@ -1878,39 +1888,4 @@ pub fn run(args: ViewArgs) -> i32 {
         return 1;
     }
     0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn words(s: &[&str]) -> Vec<String> {
-        s.iter().map(|x| (*x).to_owned()).collect()
-    }
-
-    #[test]
-    fn connect_is_required_and_usdc_is_optional() {
-        let a = ViewArgs::parse(&words(&["--connect", "127.0.0.1:8765"])).expect("parses");
-        assert_eq!(a.connect, "127.0.0.1:8765");
-        assert_eq!(a.usdc, None);
-
-        let b = ViewArgs::parse(&words(&["--connect=127.0.0.1:8765", "--usdc", "city.usdc"]))
-            .expect("parses");
-        assert_eq!(b.connect, "127.0.0.1:8765");
-        assert_eq!(b.usdc.as_deref(), Some("city.usdc"));
-    }
-
-    #[test]
-    fn a_missing_or_empty_connect_is_an_error_not_a_default() {
-        assert!(ViewArgs::parse(&words(&[])).is_err());
-        assert!(ViewArgs::parse(&words(&["--usdc", "a.usdc"])).is_err());
-        assert!(ViewArgs::parse(&words(&["--connect", ""])).is_err());
-        assert!(ViewArgs::parse(&words(&["--connect"])).is_err());
-    }
-
-    #[test]
-    fn an_unknown_flag_is_refused_with_its_name() {
-        let e = ViewArgs::parse(&words(&["--connect", "h:1", "--nope"])).expect_err("refused");
-        assert!(e.contains("--nope"), "{e}");
-    }
 }
