@@ -11,7 +11,7 @@ use openusd::sdf::LayerOffset;
 use openusd::usd::Stage;
 use rusd_core::{Diagnostic, PrimPath, Value};
 
-use crate::generator::{GenContext, Generator, read_attr_value};
+use crate::generator::{GenContext, Generator};
 
 /// One generator node instance: a generator schema anchored at a prim path.
 #[derive(Clone, Debug)]
@@ -187,10 +187,7 @@ fn memo_key(stage: &Stage, node: &CookNode) -> u64 {
     for (prim, attr) in &node.reads {
         prim.hash(&mut h);
         attr.hash(&mut h);
-        match read_attr_value(stage, prim, attr) {
-            Some(v) => format!("{v:?}").hash(&mut h),
-            None => "none".hash(&mut h),
-        }
+        crate::generator::read_value_for_memo(stage, prim, attr).hash(&mut h);
     }
     h.finish()
 }
@@ -211,15 +208,36 @@ pub fn nodes_from_doc(doc: &rusd_core::syntax::ParsedDocument) -> Vec<CookNode> 
             _ => 0,
         };
         let reads = match prim.schema.as_str() {
-            "RusdScatter" => prim
-                .props
-                .get("prototype")
-                .and_then(|v| match v {
+            // D14 geometry-in: a scatter that reads a point cloud depends on that
+            // prim's `points` (hashing their world-space values, see
+            // `read_value_for_memo`) **and on its own anchor's world transform**,
+            // because its instances are written in the anchor's local space.
+            "RusdScatter" => {
+                let mut reads: Vec<(String, String)> = Vec::new();
+                if let Some(p) = prim.props.get("prototype").and_then(|v| match v {
                     Value::String(s) => Some(s.clone()),
                     _ => None,
-                })
-                .map(|p| vec![(p, "radius".to_owned())])
-                .unwrap_or_default(),
+                }) {
+                    reads.push((p, "radius".to_owned()));
+                }
+                if let Some(p) = prim.props.get("input_points").and_then(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                }) {
+                    // The input's geometry in **either** form (D14.1): the surface
+                    // read covers a `Mesh`'s triangles, the points read covers a
+                    // cloud. Both are recorded, because which one a path answers
+                    // with depends on the scene, not on this list — and the memo
+                    // value of each is the geometry itself.
+                    reads.push((p.clone(), crate::generator::SURFACE_READ.to_owned()));
+                    reads.push((p, rusd_scene::geometry::POINTS_ATTR.to_owned()));
+                    reads.push((
+                        prim.path.as_str().to_owned(),
+                        crate::generator::WORLD_XFORM_READ.to_owned(),
+                    ));
+                }
+                reads
+            }
             _ => Vec::new(),
         };
         let stage_seed = match doc.stage.get("seed") {

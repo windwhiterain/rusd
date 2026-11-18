@@ -82,6 +82,24 @@ fn type_ok(val: &Value, ty: PropType) -> bool {
         Vec2 => matches!(val, Value::Vec2(_)) || num_array(val, 2),
         Vec3 => matches!(val, Value::Vec3(_)) || num_array(val, 3),
         Vec4 => matches!(val, Value::Vec4(_)) || num_array(val, 4),
+        // A `point3f[]` is an array of `[x,y,z]` arrays on the surface: `points =
+        // [[0.0,0.0,0.0], [1.0,0.0,0.0]]`. An array of bare numbers is refused: three
+        // numbers are one point (`vec3`), not a cloud, and silently re-shaping a flat
+        // list into points would place a scatter where nobody asked.
+        Vec3Array => match val {
+            Value::Array(items) => {
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|v| matches!(v, Value::Vec3(_)) || num_array(v, 3))
+            }
+            _ => false,
+        },
+        // `int[]` / `int64[]`: an array of non-negative integers (a mesh's face
+        // counts and vertex indices).
+        IntArray => {
+            matches!(val, Value::Array(items) if items.iter().all(|v| matches!(v, Value::Int(i) if *i >= 0)))
+        }
         Color3f => matches!(val, Value::Vec3(_)) || num_array(val, 3),
         Array => matches!(val, Value::Array(_)),
         Dict => matches!(val, Value::Dict(_)),

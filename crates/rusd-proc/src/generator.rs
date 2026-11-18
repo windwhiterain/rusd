@@ -26,6 +26,73 @@ pub fn read_attr_value(stage: &Stage, prim: &str, attr: &str) -> Option<SdfValue
     pr.attribute(attr).get::<SdfValue>().ok().flatten()
 }
 
+/// Read a prim's authored `points` (`point3f[]` / `point3d[]`) in **world** space:
+/// the cloud under the prim's composed world transform, ancestors included.
+///
+/// This is D14's geometry-in reader: a generator that consumes geometry reads
+/// points where they actually are, not where the input layer wrote them.
+/// Returns `None` when the prim does not exist or authors no `points`; otherwise
+/// the cloud, one `[x, y, z]` per point.
+pub fn read_world_points(stage: &Stage, prim: &str) -> Option<Vec<[f64; 3]>> {
+    rusd_scene::geometry::world_points(stage, prim)
+}
+
+/// The declared-read name for **a prim's composed world transform** (D14
+/// geometry-in). It is not an authored attribute; it is what a generator records
+/// when its output depends on where an input prim *is* rather than only on its
+/// authored values, so the cook memo re-runs the node when a parent moves.
+pub const WORLD_XFORM_READ: &str = "world_xform";
+
+/// The declared-read name for **a prim's tessellated world-space triangles**
+/// (D14.1 geometry-in). Like [`WORLD_XFORM_READ`] it is not authored: it is the
+/// dependency a surface scatter really has — the *surface*, after topology and
+/// every ancestor transform.
+pub const SURFACE_READ: &str = "surface";
+
+/// The value a declared read stands for, for the cook memo key (D14):
+///
+/// - `world_xform` is the prim's composed world matrix;
+/// - any other name is that attribute's composed value.
+///
+/// The distinction matters because `points` is authored in the prim's **local**
+/// space: two documents whose point clouds are identical but whose parents moved
+/// author the same `points` and different geometry. Hashing the composed attribute
+/// alone would memo-hit and leave the instances where they used to be, which
+/// breaks incremental ≡ full.
+pub fn read_value_for_memo(stage: &Stage, prim: &str, attr: &str) -> String {
+    if attr == WORLD_XFORM_READ {
+        return match rusd_scene::geometry::world_xform_of(stage, prim) {
+            Some(m) => m.map(|v| format!("{v:.6}")).join(","),
+            None => "none".to_owned(),
+        };
+    }
+    if attr == SURFACE_READ {
+        return match rusd_scene::geometry::world_triangles(stage, prim) {
+            Some(tris) => tris
+                .iter()
+                .flat_map(|t| t.iter())
+                .map(|p| format!("{:.6},{:.6},{:.6}", p[0], p[1], p[2]))
+                .collect::<Vec<_>>()
+                .join(";"),
+            None => "none".to_owned(),
+        };
+    }
+    if attr == rusd_scene::geometry::POINTS_ATTR {
+        return match read_world_points(stage, prim) {
+            Some(pts) => pts
+                .iter()
+                .map(|p| format!("{:.6},{:.6},{:.6}", p[0], p[1], p[2]))
+                .collect::<Vec<_>>()
+                .join(";"),
+            None => "none".to_owned(),
+        };
+    }
+    match read_attr_value(stage, prim, attr) {
+        Some(v) => format!("{v:?}"),
+        None => "none".to_owned(),
+    }
+}
+
 /// The context handed to a generator evaluation: read-only composed inputs
 /// (with read tracking), the node's params, path-keyed seed, and a warning sink.
 pub struct GenContext<'a> {
@@ -72,6 +139,31 @@ impl<'a> GenContext<'a> {
         read_attr_f64(self.stage, prim, attr)
     }
 
+    /// Read a prim's authored point cloud as **geometry in** (D14), in world
+    /// space, recording `(prim, "points")` as the dependency so an edit to those
+    /// points re-cooks this node and nothing else.
+    pub fn read_points(&mut self, prim: &str) -> Option<Vec<[f64; 3]>> {
+        self.reads.push((prim.to_owned(), "points".to_owned()));
+        read_world_points(self.stage, prim)
+    }
+
+    /// A prim's tessellated **world-space triangles** as an input (D14.1): a
+    /// surface a scatter can sample. Recorded as [`SURFACE_READ`], whose memo value
+    /// is the triangles themselves — moving a parent moves every one of them.
+    pub fn read_triangles(&mut self, prim: &str) -> Option<Vec<rusd_scene::geometry::Triangle>> {
+        self.reads.push((prim.to_owned(), SURFACE_READ.to_owned()));
+        rusd_scene::geometry::world_triangles(self.stage, prim)
+    }
+
+    /// A prim's composed world transform as an **input** (D14): recorded as
+    /// [`WORLD_XFORM_READ`], so the memo re-runs the node when the prim or any
+    /// ancestor moves.
+    pub fn read_world_xform(&mut self, prim: &str) -> Option<rusd_scene::Mat> {
+        self.reads
+            .push((prim.to_owned(), WORLD_XFORM_READ.to_owned()));
+        rusd_scene::geometry::world_xform_of(self.stage, prim)
+    }
+
     /// The actual reads performed during this evaluation (for precise memo keys).
     pub fn tracked_reads(&self) -> &[(String, String)] {
         &self.reads
@@ -107,6 +199,11 @@ impl<'a> GenContext<'a> {
             Some(Value::String(s)) => Some(s.as_str()),
             _ => None,
         }
+    }
+
+    /// A `path` parameter, which the surface spells as a string (SPEC §2/§3).
+    pub fn param_path(&self, name: &str) -> Option<&str> {
+        self.param_str(name)
     }
 
     pub fn param_vec2(&self, name: &str, default: [f64; 2]) -> [f64; 2] {

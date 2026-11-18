@@ -1,0 +1,59 @@
+# rusd 0.1 — D14.1 演示：scatter 基于输入 mesh 表面
+# 输入层持有一块 2×2 四边形的起伏地面（UsdGeom.Mesh：points + faceVertexCounts +
+# faceVertexIndices）；RusdScatter 用 input_points 读它，按三角形**面积加权**
+# 采样 count 个位置（累积面积选三角形 + 重心坐标选点），在**自己的输出层**
+# 写原型实例。
+#
+# 替换语义：输出层对输入 mesh 写 `visibility = "invisible"` 的 over ——
+# 合成结果只显示实例；停在 scatter 之前的前缀仍看到原 mesh（它的 spec 未被删除，
+# 只被更强的层覆盖）。
+
+[stage]
+default_prim = "/World"
+meters_per_unit = 1.0
+seed = 20261118
+up_axis = "Z"
+
+[World]
+schema = "Xform"
+
+[World.Camera]
+fov = 50.0
+look_at = [5.0, 5.0, 0.5]
+position = [19.0, -15.0, 12.0]
+schema = "Camera"
+
+# --- 输入：3×3 个顶点组成的起伏地面（4 个四边形） --------------------------
+# 顶点索引 = 行 * 3 + 列。
+[World.Terrain]
+faceVertexCounts = [4, 4, 4, 4]
+faceVertexIndices = [0, 1, 4, 3, 1, 2, 5, 4, 3, 4, 7, 6, 4, 5, 8, 7]
+points = [
+    [0.0, 0.0, 0.0],
+    [5.0, 0.0, 0.5],
+    [10.0, 0.0, 0.0],
+    [0.0, 5.0, 0.5],
+    [5.0, 5.0, 1.5],
+    [10.0, 5.0, 0.4],
+    [0.0, 10.0, 0.0],
+    [5.0, 10.0, 0.3],
+    [10.0, 10.0, 0.0],
+]
+schema = "Mesh"
+
+# --- 输出：表面上 240 个原型实例 -----------------------------------------
+[World.Prototypes]
+schema = "Xform"
+
+[World.Prototypes.Tuft]
+radius = 0.35
+schema = "Sphere"
+
+[World.Tufts]
+count = 240
+input_points = "/World/Terrain"
+max_prims = 5000
+prototype = "/World/Prototypes/Tuft"
+scale = { dist = "uniform", min = 0.7, max = 1.5 }
+schema = "RusdScatter"
+seed = 11

@@ -1,0 +1,54 @@
+# rusd 0.1 — D14 A 演示：几何进，几何出（点 → 实例）
+# 输入层持有一片点（UsdGeom.Points 的 point3f[] `points`）；
+# RusdScatter 用 input_points 读这些点（含世界变换），在**自己的输出层**写原型实例。
+#
+# 两个阶段在同一份文档里：
+#   /World/Dots  —— 点几何（Points），本文件直接作者
+#   /World/Spots —— RusdScatter，读 /World/Dots 的点
+#
+# 替换语义：scatter 的输出层对 /World/Dots 写 `visibility = "invisible"` 的 over，
+# 所以合成结果只见实例；停下来在 scatter 之前的前缀仍见点。点本身仍在输入层：
+# over 不改、不删那个 spec。
+
+[stage]
+default_prim = "/World"
+meters_per_unit = 1.0
+seed = 20261118
+up_axis = "Z"
+
+[World]
+schema = "Xform"
+
+[World.Camera]
+fov = 50.0
+look_at = [4.5, 4.5, 0.0]
+position = [18.0, -16.0, 12.0]
+schema = "Camera"
+
+# --- 输入：点云 -------------------------------------------------------------
+# point3f[]：外层数组的每个元素是一个 [x, y, z] 点。
+[World.Dots]
+points = [
+    [0.0, 0.0, 0.0],
+    [9.0, 0.0, 0.0],
+    [0.0, 9.0, 0.0],
+    [9.0, 9.0, 0.0],
+    [4.5, 4.5, 3.0],
+]
+schema = "Points"
+
+# --- 输出：每点一个原型实例 -----------------------------------------------
+# 原型挂在 /World/Prototypes/Pine（Sphere radius 0.6）。
+[World.Prototypes]
+schema = "Xform"
+
+[World.Prototypes.Pine]
+radius = 0.6
+schema = "Sphere"
+
+[World.Spots]
+input_points = "/World/Dots"
+max_prims = 2000
+prototype = "/World/Prototypes/Pine"
+schema = "RusdScatter"
+seed = 5
