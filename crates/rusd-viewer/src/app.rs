@@ -621,7 +621,8 @@ impl Shell {
         });
     }
 
-    /// Ask `preview{upto}` for an op row's click (v1.4), or `preview{null}` for the
+    /// Ask `preview{upto}` for a **preview control row's** click -- an op row (v1.4)
+    /// or the root layer's row (v1.5.3) -- or `preview{null}` for the
     /// 「final」 control.
     ///
     /// The scene the server answers with arrives as an ordinary `stage_snapshot` whose

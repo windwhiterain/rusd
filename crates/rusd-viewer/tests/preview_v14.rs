@@ -352,10 +352,13 @@ fn a_non_op_row_still_asks_comp_node_and_never_sends_preview() {
     let tree = CompositionTree::parse(&city_tree()).expect("parses");
     let rows = rusd_viewer::tree::roots(&tree);
 
-    // Three non-op kinds: a layer, an arc, and a variant set.
+    // Three non-control kinds: a layer, an arc, and a variant set. The layer has to
+    // be one that is neither an op row nor **the root row**, because v1.5.3 makes
+    // the root a preview control too (`docs/PROTOCOL.md` v1.5.3: root 行成为预览
+    // 控制行); the session layer is such a row in this payload.
     let layer_row = rows
         .iter()
-        .find(|r| r.kind == rusd_viewer::tree::TreeNodeKind::Layer && !r.op)
+        .find(|r| r.kind == rusd_viewer::tree::TreeNodeKind::Layer && !r.op && !r.root)
         .expect("a plain layer root");
     let arc_row = rows
         .iter()
@@ -375,6 +378,7 @@ fn a_non_op_row_still_asks_comp_node_and_never_sends_preview() {
             panic!("{} must select, not preview: {action:?}", node.label);
         };
         assert!(!node.op, "{} is not an op row", node.label);
+        assert!(!node.root, "{} is not the root row", node.label);
         client
             .request("comp_node", rusd_viewer::tree::comp_node_params(&sel.id))
             .expect("sent")

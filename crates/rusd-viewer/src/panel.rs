@@ -22,6 +22,12 @@
 //!   `comp_node` ask. The 「final」 button beside 「刷新」 sends `preview{upto: null}`.
 //!   Clicking any other row is unchanged: `comp_node{id}`, and the preview stays where
 //!   it was (`docs/PROTOCOL.md` v1.4).
+//! - **the root layer's row is a preview control too** (v1.5.3): clicking it sends
+//!   `preview{upto: <root layer id>}`, which composes the root and the session
+//!   overrides with **no cook op at all** -- the input-only picture a pipeline
+//!   starts from. It carries the same `≤` marker and the same click as an op
+//!   row, and it selects nothing: a control row's click is its preview
+//!   (`docs/PROTOCOL.md` v1.5.3: 「root 行成为预览控制行」).
 //! - **an op row says which op it is and what it reads and writes** (v1.5): the title
 //!   is the generator's schema name (`RusdSamplePoints`, `RusdInstances`,
 //!   `RusdScatter`) rather than an anonymous identifier, and a dim subtitle reads
@@ -52,8 +58,9 @@ pub enum TreeAction {
     /// A row was clicked: select it, ask its detail, and (when it stands for a
     /// prim) also select that prim and copy its path.
     Select(TreeSelection),
-    /// An **op row** was clicked (v1.4): ask the server for the prefix composed up to
-    /// that cook op. `None` is the 「final」 control — the whole composition.
+    /// A **preview control row** was clicked: an op row (v1.4) or the root layer's
+    /// row (v1.5.3). Ask the server for the prefix composed up to that layer;
+    /// `None` is the 「final」 control — the whole composition.
     ///
     /// A third variant rather than a flag on `Select`, because the two clicks do
     /// different things: `Select` asks `comp_node{id}` for a detail and leaves the
@@ -167,16 +174,29 @@ impl TreePanel {
 
 /// What a click on `node` asks the shell to do — **the one place that rule lives**.
 ///
-/// An **op row** previews the composition up to that layer (v1.4); every other row is a
-/// selection, which asks `comp_node{id}` and leaves the preview alone. `panel::row`
-/// draws from this and the tests assert against it, so the picture and the wire cannot
-/// disagree about which click does which.
+/// A **preview control row** previews the composition up to that layer: an op row
+/// (v1.4) or the root layer's row (v1.5.3, [`is_preview_control`]). Every other row
+/// is a selection, which asks `comp_node{id}` and leaves the preview alone.
+/// `panel::row` draws from this and the tests assert against it, so the picture and
+/// the wire cannot disagree about which click does which.
 pub fn action_for(node: &TreeNode) -> TreeAction {
-    if node.op {
+    if is_preview_control(node) {
         TreeAction::Preview(Some(node.id.clone()))
     } else {
         TreeAction::Select(TreeSelection::of(node))
     }
+}
+
+/// Whether `node` is a row whose click is a **preview** rather than a selection:
+/// a cook op's layer row (v1.4) or the stack's root layer row (v1.5.3).
+///
+/// One predicate for the click, the highlight and the drawing, because all three are
+/// the same question asked at three places: a row that previews must look like one
+/// (the `≤` marker), be marked when it is the prefix in force, and send `preview`
+/// when clicked. An arc's leaf that *names* a layer is a `Layer` row too and is
+/// deliberately not one of these: it points at a branch and is clicked to inspect it.
+pub fn is_preview_control(node: &TreeNode) -> bool {
+    node.kind == TreeNodeKind::Layer && (node.op || node.root)
 }
 
 /// The 「final」 control's action: the whole composition (`preview{upto: null}`).
@@ -190,11 +210,12 @@ pub fn final_action() -> TreeAction {
 /// Whether `node` is the layer row the viewport is currently composed up to
 /// (`docs/PROTOCOL.md` v1.4: the panel marks the prefix in force).
 ///
-/// Pure, so the highlight rule is testable without a screen: an op row, a layer row, and
-/// an identifier matching the echoed `upto`. A prim or arc row whose id happened to equal
-/// the string is not a preview row and must not be coloured as one.
+/// Pure, so the highlight rule is testable without a screen: a preview control row
+/// ([`is_preview_control`] -- an op row, or the root layer's row since v1.5.3) whose
+/// id is the echoed `upto`. A prim or arc row whose id happened to equal the string
+/// is not a preview row and must not be coloured as one.
 pub fn is_current_preview(node: &TreeNode, preview: Option<&str>) -> bool {
-    node.op && node.kind == TreeNodeKind::Layer && preview == Some(node.id.as_str())
+    is_preview_control(node) && preview == Some(node.id.as_str())
 }
 
 /// Draw the tree panel's whole body: its status line, then either the rows or the
@@ -287,13 +308,18 @@ fn row(
     preview: Option<&str>,
 ) -> Option<TreeAction> {
     let is_selected = selected.is_some_and(|s| s.id == node.id);
-    // An op row that is **the current preview** is marked too: the user needs to see
-    // where they are, and the current prefix is not a selection (it does not follow a
-    // `comp_node` ask).
+    // A preview control row that is **the current preview** is marked too: the user
+    // needs to see where they are, and the current prefix is not a selection (it
+    // does not follow a `comp_node` ask).
     let is_current_preview = is_current_preview(node, preview);
+    // The row's **drawn** title: an op row already carries the `<=` marker in its label
+    // (v1.4), and the root row gains it while it is the prefix in force (v1.5.3).
+    let title = control_row_title(node, is_current_preview);
     let text = match node.kind {
-        TreeNodeKind::Layer if node.op => RichText::new(&node.label).strong().underline(),
-        TreeNodeKind::Layer => RichText::new(&node.label).strong(),
+        TreeNodeKind::Layer if is_preview_control(node) => {
+            RichText::new(title).strong().underline()
+        }
+        TreeNodeKind::Layer => RichText::new(title).strong(),
         TreeNodeKind::Arc => RichText::new(&node.label).italics(),
         TreeNodeKind::Prim | TreeNodeKind::VariantSet => RichText::new(&node.label),
     };
@@ -305,24 +331,22 @@ fn row(
         text
     };
 
-    // What a click on this row means: a preview for an op row, a selection otherwise.
+    // What a click on this row means: a preview for a control row (an op layer's or
+    // the root layer's), a selection otherwise.
     let click_action = action_for;
 
     let mut clicked: Option<TreeAction> = None;
-    if node.op {
-        // **An op row is a control, not a twisty.** Its click previews; if it also
+    if is_preview_control(node) {
+        // **A control row is a control, not a twisty.** Its click previews; if it also
         // collapsed its subtree, one click would mean two things and the user could not
-        // expand without changing what the viewport composes. An op layer's children are
-        // a couple of variant sets at most (v1.3 draws no prim rows), so it is drawn as a
-        // plain row with its subtree always visible.
+        // expand without changing what the viewport composes. A control layer's children
+        // are a couple of arcs and variant sets at most (v1.3 draws no prim rows), so it
+        // is drawn as a plain row with its subtree always visible.
         ui.horizontal(|ui| {
             indent(ui, depth);
             if ui
                 .selectable_label(is_current_preview, text)
-                .on_hover_text(format!(
-                    "预览到此 op 之前：preview{{upto: \"{}\"}}",
-                    node.id
-                ))
+                .on_hover_text(preview_hover_text(node))
                 .clicked()
             {
                 clicked = Some(TreeAction::Preview(Some(node.id.clone())));
@@ -366,6 +390,44 @@ fn row(
         }
     }
     clicked
+}
+
+/// The title a control row **draws**: its label, with the `≤` marker on it when that
+/// row is the prefix in force.
+///
+/// Op rows carry the marker in the label itself (`crate::tree::roots` builds
+/// `≤ <generator> [...]`, v1.4), because for them it says "clicking previews up to
+/// here". The root row is a control from v1.5.3 only, and the contract spells its
+/// marker as part of *being the current preview* — 「`preview == root id` 时高亮 +
+/// `≤` 标记」 — so it is added here, at the one place that knows both the row and the
+/// state, rather than baked into a label the model cannot re-derive when the preview
+/// moves.
+///
+/// Pure, so the marker is testable without a screen: `(row, is_current_preview)` in,
+/// the drawn text out.
+pub fn control_row_title(node: &TreeNode, is_current_preview: bool) -> String {
+    if is_current_preview && !node.op {
+        format!("≤ {}", node.label)
+    } else {
+        node.label.clone()
+    }
+}
+
+/// What a control row says when the pointer rests on it: which click it is.
+///
+/// Two sentences rather than one, because the two prefixes are not the same thing: an
+/// op row's `upto` includes that op, and the root row's includes **no** op at all
+/// (v1.5.3). Both name the identifier the wire takes, so a user reading the tooltip
+/// can quote it.
+fn preview_hover_text(node: &TreeNode) -> String {
+    if node.op {
+        format!("预览到此 op 之前：preview{{upto: \"{}\"}}", node.id)
+    } else {
+        format!(
+            "预览到根层（不含任何 op）：preview{{upto: \"{}\"}}",
+            node.id
+        )
+    }
 }
 
 fn indent(ui: &mut egui::Ui, depth: usize) {
