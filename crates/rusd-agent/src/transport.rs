@@ -94,7 +94,7 @@ use openusd::gf;
 use openusd::sdf::{self, AttributeSpec, Variability};
 use openusd::usd::Stage;
 use rusd_core::{Diagnostic, Severity};
-use rusd_proc::{CookEngine, ExpandOutput};
+use rusd_proc::{CookEngine, CookOp, ExpandOutput};
 use serde_json::{Value, json};
 
 use crate::Agent;
@@ -397,6 +397,15 @@ struct Session {
     stage: Option<Stage>,
     session_id: Option<String>,
     cook: CookEngine,
+    /// The ops of the latest cook pass (PROTOCOL v1.5.1), in cook order, each
+    /// naming its generator, its `input_points` and the output layer it wrote
+    /// now. Replaced **wholesale** after every cook (a rebuild mints new output
+    /// layers, so the old identifiers name nothing) and never accumulated; it is
+    /// what `composition_tree` joins against to label an op layer.
+    ///
+    /// A preview does not touch it: a prefix changes which layers a
+    /// connection's snapshot stops at, not what the cook produced.
+    cook_ops: Vec<CookOp>,
     ops: Vec<Opinion>,
     undo: Vec<Face>,
     redo: Vec<Face>,
@@ -474,6 +483,7 @@ impl Session {
             stage: None,
             session_id: None,
             cook: rusd_proc::default_registry(),
+            cook_ops: Vec::new(),
             ops: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -727,7 +737,7 @@ impl Session {
         let Some(stage) = self.stage.clone() else {
             return Err(server_error("no scene open; call open first".into()));
         };
-        let tree = CompositionTree::build(&stage);
+        let tree = CompositionTree::build_with_ops(&stage, &self.cook_ops);
         let value = tree.to_json();
         self.tree = Some((self.version, tree));
         Ok(value)
@@ -744,7 +754,7 @@ impl Session {
             return Err(server_error("no scene open; call open first".into()));
         };
         if self.tree.as_ref().map(|(v, _)| *v) != Some(self.version) {
-            let tree = CompositionTree::build(&stage);
+            let tree = CompositionTree::build_with_ops(&stage, &self.cook_ops);
             self.tree = Some((self.version, tree));
         }
         let (_, tree) = self.tree.as_ref().expect("the tree was just built");
@@ -920,8 +930,10 @@ impl Session {
         self.tree = None;
         // A different root layer means the memoized cook layers are not in this
         // stage: a memo hit would skip the insert and leave a hole, so the
-        // content-hash cache starts over with the stage.
+        // content-hash cache starts over with the stage. Its op list goes with it
+        // — those `layer_id`s name layers this rebuild will not reuse.
         self.cook = rusd_proc::default_registry();
+        self.cook_ops.clear();
 
         let Some(text) = self.agent.doc_text().map(str::to_owned) else {
             return Pipeline {
@@ -954,6 +966,11 @@ impl Session {
         let result = self.cook.cook(&stage, &root_id, &nodes);
         let stats = result.stats;
         let diags = result.diags;
+        // The ops of *this* pass, wholesale (PROTOCOL v1.5.1): a rebuild mints
+        // new output layers, so the previous list's `layer_id`s are gone. A cook
+        // that failed to produce a layer for a node simply has no op for it, and
+        // the tree falls back to `null` for that layer.
+        self.cook_ops = result.ops;
         let prim_count = rusd_scene::prim_count(&stage);
         self.live(stage.clone(), stats, &diags, prim_count, nodes.len());
         self.stage = Some(stage);
@@ -981,6 +998,9 @@ impl Session {
         let result = self.cook.cook(&stage, &root_id, &nodes);
         let stats = result.stats;
         let diags = result.diags;
+        // Wholesale, as in `rebuild`: memo hits keep their output layer, so this
+        // pass still lists them — a reused node is an op of the cook (v1.5.1).
+        self.cook_ops = result.ops;
         let prim_count = rusd_scene::prim_count(&stage);
         self.live(stage, stats, &diags, prim_count, nodes.len());
         Pipeline { diags, ok: true }
