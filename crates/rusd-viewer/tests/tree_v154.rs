@@ -466,6 +466,45 @@ fn two_layers_referencing_one_target_draw_two_independently_openable_rows() {
 }
 
 #[test]
+fn an_instance_rows_selection_is_what_the_status_bar_reads() {
+    // The shell's `on_tree_select` moves the tree row's `prim` into `model.selection`
+    // (through `panel::copy_payload`, which is `clipboard_for`) and copies the path. The
+    // status bar then says 「选中 <path>」. Both halves are pure, so the chain can be
+    // followed here without a window: what an instance row's click produces is exactly
+    // what the header then prints.
+    let rows = rows_of(&tufts_tree(240));
+    let group = row_by_id(&rows, "prim:/Prototypes/Tuft").expect("the group row");
+    let instances: Vec<&TreeNode> = group
+        .children
+        .iter()
+        .filter(|c| c.kind == TreeNodeKind::Prim)
+        .collect();
+    let created = &instances[123];
+    let path = panel::copy_payload(&TreeSelection::of(created))
+        .expect("an instance row stands for a prim, so it copies one");
+    assert_eq!(path, "/World/Tufts/i000123");
+
+    let mut model = rusd_viewer::session::ClientModel::new();
+    model.selection = Some(path);
+    assert!(
+        model.status_line_zh().contains("选中 /World/Tufts/i000123"),
+        "the header says which prim is selected: {}",
+        model.status_line_zh()
+    );
+}
+
+#[test]
+fn the_group_rows_selection_copies_nothing_so_the_header_is_unchanged() {
+    // The complement: an edge class selects no prim, so the status bar keeps saying
+    // 「未选中」 -- a click on it must not claim a selection it did not make.
+    let rows = rows_of(&tufts_tree(240));
+    let group = row_by_id(&rows, "prim:/Prototypes/Tuft").expect("the group row");
+    assert_eq!(panel::copy_payload(&TreeSelection::of(&group)), None);
+    let model = rusd_viewer::session::ClientModel::new();
+    assert!(model.status_line_zh().contains("未选中"));
+}
+
+#[test]
 fn the_panel_paints_a_single_edge_exactly_as_before() {
     // The pre-v1.5.4 picture for a stack with no cluster: the edge's own label, with
     // no count on it.
