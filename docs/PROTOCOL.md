@@ -491,3 +491,17 @@ session overrides；root 档 = 只有 root 与 overrides、不含任何 op。
 - viewer：root 行点击发 preview{upto: root id}（mock 断言）+ 高亮断言 + 非 op 非 root 行
   仍选择。
 - 真窗：点 root 行 ⇒ 只见输入 mesh（起伏地面）；sample / instances / final 照旧。
+
+## v1.5.4 增补（用户裁定：合成树 reference 条目去重；2026-11-18）
+
+**同一层里同源同目标的弧只画一行**：wire 的 `arcs` 仍**逐条上报**（无损，其它 client 可自取）；
+聚合是 **client 展示层**的事。
+
+- 聚合键 = `(kind, source_layer, target_layer, target_prim)`；`source_prim` **不参与**（它正是
+  实例之间唯一不同的部分）。组内条数 N ≥ 2 时行标签后缀 `×N`；N = 1 不加后缀。
+- 聚合只改**绘制**：层行/结构行/prim 行不受影响；`composition_tree` 的 `arcs` 计数与 wire 不变
+  （面板头「242 arc」仍是事实计数）。
+- 点击语义不变：该行仍选择**目标 prim**（`comp_node{目标}`），与今天点任一条 reference 行的
+  结果一致。payload / inherit 等弧同理按此键聚合。
+- 验收（viewer）：mock 树 240 条同键 reference 弧 ⇒ 渲染 1 行带 `×240`；不同键不合并；
+  单击仍发 comp_node 目标的 wire 断言；既有 312 测试不破坏。
