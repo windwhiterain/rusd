@@ -26,11 +26,13 @@
 //!   visual references a human hands an agent (PROTOCOL v1.1). A capture is
 //!   **not** a scene mutation: it does not advance `version` and broadcasts
 //!   nothing.
-//! - [`crate::composition`] — `composition_tree` / `comp_node`, the composition
-//!   tree the viewer's panel draws (PROTOCOL v1.2). It is read off the authority
-//!   stack's `sdf` layer specs, not off the flattened snapshot, which has already
-//!   dropped every arc. The tree is cached for the `version` it describes and
-//!   dropped whenever the stage is rebuilt.
+//! - [`crate::composition`] — `composition_tree` / `comp_node` / `layer`, the
+//!   composition tree the viewer's panel draws (PROTOCOL v1.2, with `layer` from
+//!   v1.5.5). It is read off the authority stack's `sdf` layer specs, not off the
+//!   flattened snapshot, which has already dropped every arc. `layer{id}` answers
+//!   what one opened layer authors, so a clicked layer row shows its own specs
+//!   rather than the composition's verdict on them. The tree is cached for the
+//!   `version` it describes and dropped whenever the stage is rebuilt.
 //! - `preview` here (PROTOCOL v1.4, extended by v1.5.3) — how far into the cook
 //!   **one connection's** snapshots go. The state is per connection, not per
 //!   session: two viewers may watch different stages of the same cook at once. A
@@ -647,6 +649,7 @@ impl Session {
             }
             "opinion" => self.opinion(&params),
             "composition_tree" => self.composition_tree(&params),
+            "layer" => self.layer(&params),
             "comp_node" => self.comp_node(&params),
             "capture" => self.captures.capture(&params),
             "capture_get" => self.captures.get(&params),
@@ -809,6 +812,41 @@ impl Session {
             (
                 INVALID_PARAMS,
                 format!("comp_node: no node has the id {id:?}"),
+            )
+        })
+    }
+
+    /// `layer{id}` (PROTOCOL v1.5.5): what one opened layer authors. The id is
+    /// the identifier `composition_tree`'s `layers` rows carry, so a client that
+    /// clicked a layer row (or an op row, or the root row) needs no lookup.
+    ///
+    /// A pure read: no `version` moves and nothing is published, because the
+    /// answer describes the layer the stage already holds rather than changing
+    /// it. The tree is brought up to the current version first, for the same
+    /// reason `comp_node` does: an id a client is still holding must not address
+    /// the layer stack of a scene that no longer exists.
+    ///
+    /// An unknown id is `-32602` and the message lists the layers that *are*
+    /// open, which is what a client needs to correct itself.
+    fn layer(&mut self, p: &Value) -> Result<Value, (i64, String)> {
+        let Some(id) = p.get("id").and_then(Value::as_str) else {
+            return Err((INVALID_PARAMS, "layer: `id` (string) required".into()));
+        };
+        let Some(stage) = self.stage.clone() else {
+            return Err(server_error("no scene open; call open first".into()));
+        };
+        if self.tree.as_ref().map(|(v, _)| *v) != Some(self.version) {
+            let tree = CompositionTree::build_with_ops(&stage, &self.cook_ops);
+            self.tree = Some((self.version, tree));
+        }
+        let (_, tree) = self.tree.as_ref().expect("the tree was just built");
+        tree.layer_content(&stage, id).ok_or_else(|| {
+            (
+                INVALID_PARAMS,
+                format!(
+                    "layer: no opened layer has the id {id:?}; the layers are {}",
+                    tree.layer_ids().join(", ")
+                ),
             )
         })
     }

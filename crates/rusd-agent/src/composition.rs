@@ -32,6 +32,16 @@
 //! stable for one stage but not across a mutation, and a client refetches the
 //! tree when its version moves, which is exactly when an id could have moved.
 //!
+//! ## What a layer itself says (`layer{id}`)
+//!
+//! The tree is a view of the *composition*; a clicked layer row also has to show
+//! what that layer wrote. That is [`CompositionTree::layer_content`] (PROTOCOL
+//! v1.5.5): one row per prim-like spec the layer authors, in the layer's own
+//! order, each naming its specifier or scaffolding kind, its `typeName`, the
+//! properties it authors and the references it carries. It is the layer's fact
+//! content, read off one `sdf` layer — no composition, no aggregation. An id no
+//! opened layer has is refused, and the refusal lists the layers there are.
+//!
 //! ## An arc target the stage never opened
 //!
 //! A reference names an asset path, and the layer it resolves to is a
@@ -245,6 +255,54 @@ impl CompositionTree {
         }
     }
 
+    /// The ids of the opened layers, strongest first: what `layer{id}` accepts,
+    /// and exactly what its refusal lists. Same rows, same order, as
+    /// [`CompositionTree::to_json`]'s `layers`.
+    pub fn layer_ids(&self) -> Vec<String> {
+        self.layers.iter().map(|l| l.id.clone()).collect()
+    }
+
+    /// The content of one opened layer (`layer{id}`, PROTOCOL v1.5.5): every spec
+    /// the layer authors, in the layer's own spec order, so a clicked layer row
+    /// can show what *that layer* says rather than what the composition makes of
+    /// it. `None` when no opened layer has that id.
+    ///
+    /// A row is one **prim-like** spec: its `path`, its `spec_type`, the
+    /// `type_name` it declares when it declares one, the `properties` it authors,
+    /// and the `references` it carries. `spec_type` is a prim spec's **specifier**
+    /// (`def` / `over` / `class`), because that is the word a layer writes, and
+    /// `pseudo_root` / `variant_set` / `variant` for the scaffolding specs, which
+    /// have no specifier. A property spec is folded into its owning prim's row (it
+    /// is named there in `properties`) rather than listed on its own, so a layer of
+    /// two hundred instances is two hundred rows and not thousands. The list is
+    /// the layer's fact content and is **not** aggregated for display.
+    ///
+    /// Pure read: nothing about the stage moves, and the answer is a function of
+    /// the layer alone, so the same layer answers the same bytes.
+    pub fn layer_content(&self, stage: &Stage, id: &str) -> Option<Value> {
+        let layer = self.layers.iter().find(|l| l.id == id)?;
+        // A reference names an asset path, and the layer it resolves to is a
+        // different string. Resolving it here by the same rule `scan_arcs` uses
+        // (identifier, then resolved path, then file name) is what makes a
+        // reference row and the arc it makes name one layer.
+        let scans: Vec<LayerScan> = self
+            .layers
+            .iter()
+            .map(|l| LayerScan {
+                id: l.id.clone(),
+                resolved: stage
+                    .layer(&l.id)
+                    .and_then(|guard| guard.resolved_path().map(str::to_owned)),
+                specs: Vec::new(),
+            })
+            .collect();
+        Some(json!({
+            "id": layer.id,
+            "kind": layer.kind,
+            "specs": layer_spec_rows(stage, &layer.id, &scans),
+        }))
+    }
+
     /// The wire shape of `composition_tree{}`.
     pub fn to_json(&self) -> Value {
         json!({
@@ -385,6 +443,117 @@ fn layer_specs(stage: &Stage, layer: &str) -> Vec<(sdf::Path, SpecType)> {
             .into_iter()
             .filter_map(|path| data.spec_type(&path).map(|ty| (path, ty)))
             .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// The rows of `layer{id}` (PROTOCOL v1.5.5): one row per spec the layer
+/// authors, in the layer's own spec order (`spec_paths` is sorted, so the same
+/// layer answers the same list, byte for byte).
+///
+/// A row is a **prim-like** spec: the pseudo-root, a prim spec, a variant set or
+/// a variant. A property spec is an opinion *on* its owning prim — the prim's row
+/// lists it by name in `properties` — so it is not a row of its own: that is what
+/// keeps a layer of two hundred instances and their transforms a list of two
+/// hundred lines rather than thousands.
+///
+/// A row's `spec_type` is a prim spec's **specifier** (`def` / `over` /
+/// `class`), because that is the word a layer writes, and `pseudo_root` /
+/// `variant_set` / `variant` for the scaffolding specs, which have no specifier.
+/// `type_name` is the type a prim or variant spec declares, `null` when it
+/// declares none.
+///
+/// `references` names the layer a reference points at by the same rule the arcs
+/// use ([`resolve_target`]): the opened layer the asset resolves to when there is
+/// one, the asset path as authored when there is not.
+fn layer_spec_rows(stage: &Stage, layer: &str, scans: &[LayerScan]) -> Vec<Value> {
+    with_layer(stage, layer, |borrow| {
+        let data = borrow.data();
+        // Read every field owned while the one borrow is held: a `Ref` of the
+        // layer cannot be taken twice, and a row outlives the guard.
+        let specs: Vec<(sdf::Path, SpecType, Option<SdfValue>, Option<SdfValue>)> = data
+            .spec_paths()
+            .into_iter()
+            .filter_map(|path| {
+                let ty = data.spec_type(&path)?;
+                let field = |key: &str| {
+                    data.try_field(&path, key)
+                        .ok()
+                        .flatten()
+                        .map(|v| v.into_owned())
+                };
+                Some((
+                    path.clone(),
+                    ty,
+                    field(FieldKey::Specifier.as_str()),
+                    field(FieldKey::TypeName.as_str()),
+                ))
+            })
+            .filter(|(_, ty, _, _)| {
+                matches!(
+                    ty,
+                    SpecType::PseudoRoot
+                        | SpecType::Prim
+                        | SpecType::VariantSet
+                        | SpecType::Variant
+                )
+            })
+            .collect();
+        let properties: Vec<Vec<String>> = specs
+            .iter()
+            .map(|(path, _, _, _)| property_names(data, path))
+            .collect();
+        let references: Vec<Vec<(String, String)>> = specs
+            .iter()
+            .map(|(path, ty, _, _)| match ty {
+                SpecType::Prim | SpecType::Variant => data
+                    .try_field(path, FieldKey::References.as_str())
+                    .ok()
+                    .flatten()
+                    .map(|v| v.into_owned())
+                    .map(|v| {
+                        reference_list(&v)
+                            .into_iter()
+                            .map(|(asset, prim)| {
+                                (resolve_target(scans, &asset), prim.as_str().to_owned())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            })
+            .collect();
+        let mut rows: Vec<Value> = Vec::with_capacity(specs.len());
+        for (index, (path, ty, specifier, type_name)) in specs.into_iter().enumerate() {
+            let spec_type = match ty {
+                SpecType::PseudoRoot => "pseudo_root",
+                SpecType::VariantSet => "variant_set",
+                SpecType::Variant => "variant",
+                _ => match specifier {
+                    Some(SdfValue::Specifier(sdf::Specifier::Def)) => "def",
+                    Some(SdfValue::Specifier(sdf::Specifier::Over)) => "over",
+                    Some(SdfValue::Specifier(sdf::Specifier::Class)) => "class",
+                    _ => "prim",
+                },
+            };
+            let type_name = match type_name {
+                Some(SdfValue::Token(token)) if ty != SpecType::PseudoRoot => {
+                    Value::String(token.as_str().to_owned())
+                }
+                _ => Value::Null,
+            };
+            rows.push(json!({
+                "path": path.as_str(),
+                "spec_type": spec_type,
+                "type_name": type_name,
+                "properties": properties[index],
+                "references": references[index].iter().map(|(layer, prim)| json!({
+                    "layer": layer,
+                    "prim": prim,
+                })).collect::<Vec<_>>(),
+            }));
+        }
+        rows
     })
     .unwrap_or_default()
 }
