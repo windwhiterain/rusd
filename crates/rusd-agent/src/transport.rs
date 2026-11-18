@@ -1102,8 +1102,7 @@ impl Session {
     }
 
     /// The Tier A snapshot: the stage — or, for a preview, the composition that
-    /// stops after the cook op at `upto` — flattened into one `usdc` layer,
-    /// base64 on the wire.
+    /// stops at `upto` — flattened into one `usdc` layer, base64 on the wire.
     ///
     /// A preview is built by muting the cook output layers **after** `upto` in
     /// cook order, flattening, and unmuting them again. Muting is the stage's own
