@@ -159,17 +159,23 @@ fn connected(mock: &Mock) -> ProtocolClient {
 ///
 /// The input of the instances op is the **points prim the sample op wrote**, which is
 /// the paragraph the pipeline is: three states, three layers, one order.
+///
+/// The strengths are the **real** ones (v1.5.2): a cook step inserts its output at
+/// position 0 of the root's sublayer stack, so the later an op cooks the *stronger*
+/// its layer is. `RusdInstances` (2) therefore sits above `RusdSamplePoints` (3) in the
+/// stack, exactly as a live server reports it, and only the panel's own ordering puts
+/// the chain back in the order it ran.
 fn pipeline_tree() -> Value {
     json!({
         "layers": [
             {"id": "anon:session", "kind": "session", "strength": 0},
             {"id": "mesh.usda", "kind": "root", "strength": 1},
-            {"id": "op:sample_points/0", "kind": "sublayer", "strength": 2, "op": true,
-             "op_name": "RusdSamplePoints",
-             "input": "/World/Mesh", "output": "op:sample_points/0"},
-            {"id": "op:instances/1", "kind": "sublayer", "strength": 3, "op": true,
+            {"id": "op:instances/1", "kind": "sublayer", "strength": 2, "op": true,
              "op_name": "RusdInstances",
              "input": "/World/Mesh/points", "output": "op:instances/1"},
+            {"id": "op:sample_points/0", "kind": "sublayer", "strength": 3, "op": true,
+             "op_name": "RusdSamplePoints",
+             "input": "/World/Mesh", "output": "op:sample_points/0"},
         ],
         "arcs": [
             {"id": "arc:0", "kind": "subLayer", "source_layer": "mesh.usda",
@@ -265,7 +271,22 @@ fn the_label_keeps_cook_order_and_touches_no_other_row() {
     assert_eq!(
         op_ids,
         ["op:sample_points/0", "op:instances/1"],
-        "rows are in the layer stack's order, which is the cook order"
+        "the op rows are drawn in cook order (v1.5.2): the stack has instances
+         stronger, so the panel reverses the op run and the chain reads forwards"
+    );
+    // The wire order really is the other way round, which is what makes the assertion
+    // above a claim about the panel and not about the fixture.
+    let parsed = CompositionTree::parse(&pipeline_tree()).expect("parses");
+    let wire: Vec<&str> = parsed.layers.iter().map(|l| l.id.as_str()).collect();
+    assert_eq!(
+        wire,
+        [
+            "anon:session",
+            "mesh.usda",
+            "op:instances/1",
+            "op:sample_points/0"
+        ],
+        "the stack really does report the later op as the stronger layer"
     );
 
     // A structural row is unchanged: identifier, kind, rank, and no subtitle. Only op
@@ -446,6 +467,16 @@ fn a_non_op_row_has_no_subtitle_and_still_asks_comp_node() {
 /// The production widget (`panel::tree_panel`), no GPU and no window: the point is
 /// that a title built in the model but never drawn would not appear here.
 fn painted_texts(tree: Value) -> Vec<String> {
+    painted(tree).into_iter().map(|(_, text)| text).collect()
+}
+
+/// Draw the tree panel headlessly and return every text it painted **with its y**, in
+/// paint order.
+///
+/// The y is what makes a *position* assertion possible: "the sample op is drawn above
+/// the instances op" is a claim about where on the panel each row landed, which a set
+/// of strings cannot answer.
+fn painted(tree: Value) -> Vec<(f32, String)> {
     let ctx = egui::Context::default();
     let raw = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
@@ -470,7 +501,7 @@ fn painted_texts(tree: Value) -> Vec<String> {
     let mut texts = Vec::new();
     for clipped in &out.shapes {
         if let egui::epaint::Shape::Text(t) = &clipped.shape {
-            texts.push(t.galley.text().to_owned());
+            texts.push((t.pos.y, t.galley.text().to_owned()));
         }
     }
     texts
@@ -515,5 +546,117 @@ fn the_panel_paints_the_old_picture_for_a_pre_v15_answer() {
     assert!(
         !texts.iter().any(|t| t.contains("Rusd")),
         "no generator name is invented from a missing field: {texts:?}"
+    );
+}
+// --- 6. the real shape: op rows read top to bottom in cook order -------------
+
+/// The shape a live server reports, as the parent session measured it: strength order
+/// `session(0), root(1), RusdInstances(2), RusdSamplePoints(3)`.
+///
+/// The ids are the anonymous ones a real cook emits (`anon:` prefixed), so nothing here
+/// depends on a name a hand-written fixture invented.
+fn real_server_tree() -> Value {
+    json!({
+        "layers": [
+            {"id": "anon:session", "kind": "session", "strength": 0},
+            {"id": "mesh.usda", "kind": "root", "strength": 1},
+            {"id": "anon:rusd_instances/1", "kind": "sublayer", "strength": 2, "op": true,
+             "op_name": "RusdInstances",
+             "input": "/World/Mesh/points", "output": "anon:rusd_instances/1"},
+            {"id": "anon:rusd_sample_points/0", "kind": "sublayer", "strength": 3, "op": true,
+             "op_name": "RusdSamplePoints",
+             "input": "/World/Mesh", "output": "anon:rusd_sample_points/0"},
+        ],
+        "arcs": [
+            {"id": "arc:0", "kind": "subLayer", "source_layer": "mesh.usda",
+             "source_prim": "/", "target_layer": "mesh.usda", "target_prim": "/"},
+        ],
+        "prim_nodes": [
+            {"id": "prim:/World/Mesh", "path": "/World/Mesh", "authored_in": ["mesh.usda"]},
+        ],
+        "variant_sets": [],
+    })
+}
+
+/// The y a painted row sits at, found by the text it carries.
+///
+/// A title and its subtitle are one row, so the smallest y of the matching texts is the
+/// row's: the needle names a row's own text, and nothing else carries it.
+fn row_y(painted: &[(f32, String)], needle: &str) -> f32 {
+    let hits: Vec<f32> = painted
+        .iter()
+        .filter(|(_, t)| t.contains(needle))
+        .map(|(y, _)| *y)
+        .collect();
+    assert!(!hits.is_empty(), "no painted text contains {needle:?}");
+    hits.into_iter().fold(f32::INFINITY, f32::min)
+}
+
+#[test]
+fn the_panel_draws_the_pipeline_forwards_from_a_real_servers_strength_order() {
+    // The bug this pins, found in integration: a cook step inserts its output at
+    // position 0 of the sublayer stack, so the server's strength order puts the *later*
+    // op on top. A panel drawing strength order shows instances over sample, and the
+    // pipeline reads backwards.
+    let painted = painted(real_server_tree());
+
+    let sample = row_y(&painted, "RusdSamplePoints");
+    let instances = row_y(&painted, "RusdInstances");
+    let session = row_y(&painted, "anon:session");
+    let root = row_y(&painted, "mesh.usda");
+
+    assert!(
+        sample < instances,
+        "the sample op must be drawn above the instances op (y {sample} vs {instances}): \
+         the panel shows the chain in cook order, not in strength order"
+    );
+    // And the structural rows are untouched: session strongest on top, then the root.
+    assert!(
+        session < root,
+        "the session layer stays the top row (y {session} vs {root})"
+    );
+    assert!(
+        root < sample,
+        "both cook ops stay below the root layer (y {root} vs {sample})"
+    );
+
+    // The same claim at the model level, so a failure also says which row it was.
+    let rows = rows_of(&real_server_tree());
+    let titles: Vec<&str> = rows
+        .iter()
+        .filter(|(_, n)| n.op)
+        .map(|(_, n)| n.label.as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        [
+            "≤ RusdSamplePoints [sublayer · 3/4]",
+            "≤ RusdInstances [sublayer · 2/4]"
+        ],
+        "top to bottom, the op rows are the cook chain"
+    );
+}
+
+#[test]
+fn the_real_shapes_subtitles_follow_their_titles() {
+    // The subtitle is what a reader follows, so it has to be the chain too: the top op
+    // reads the mesh, the one under it the points the top one wrote.
+    //
+    // The output half is the *summary*, and a real anonymous id is over the 20-character
+    // budget (`anon:rusd_sample_points/0` is 25), so the needles here are the elided
+    // forms — which is also the elision working on the identifier a live cook produces
+    // rather than on a short hand-written one.
+    let painted = painted(real_server_tree());
+    let sample_title = row_y(&painted, "RusdSamplePoints");
+    let sample_sub = row_y(&painted, "/World/Mesh → anon:rusd_sample_poi…");
+    let instances_sub = row_y(&painted, "/World/Mesh/points → anon:rusd_instances/…");
+    assert!(
+        sample_title < sample_sub,
+        "the subtitle sits with its own title (y {sample_title} vs {sample_sub})"
+    );
+    assert!(
+        sample_sub < instances_sub,
+        "so the pair reads mesh -> points -> instances top to bottom \
+         (y {sample_sub} vs {instances_sub})"
     );
 }
