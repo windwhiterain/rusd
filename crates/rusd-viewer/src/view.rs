@@ -44,13 +44,181 @@ pub fn camera_for_scene(model: &mut ClientModel, made: &MadeScene, aspect: f64) 
         return None;
     }
     model.set_aspect(aspect);
-    Some(Orbit::from_camera(&scene::fit_camera(
-        &BBox {
-            min: made.bounds.0,
-            max: made.bounds.1,
-        },
+    Some(orbit_for_bounds(
+        (made.bounds.0, made.bounds.1),
         model.aspect,
-    )))
+    ))
+}
+
+/// The orbit that frames `bounds` in a frame of `aspect`, with no state read or
+/// written: the fit itself, which every entry point below shares.
+pub fn orbit_for_bounds(bounds: ([f64; 3], [f64; 3]), aspect: f64) -> Orbit {
+    Orbit::from_camera(&scene::fit_camera(
+        &BBox {
+            min: bounds.0,
+            max: bounds.1,
+        },
+        aspect,
+    ))
+}
+
+/// Frame `bounds` now, and record that the view holds a real fit of it.
+///
+/// The used half of [`ClientModel::rearm_first_fit`]: after a new *document* has
+/// arrived, the fit is taken and the aspect recorded in one place, so a caller
+/// cannot fit without saying it did (and then keep re-fitting on every later
+/// scene).
+pub fn fit_to_bounds(model: &mut ClientModel, bounds: ([f64; 3], [f64; 3]), aspect: f64) -> Orbit {
+    model.set_aspect(aspect);
+    model.mark_framed();
+    orbit_for_bounds(bounds, model.aspect)
+}
+
+/// Which `state_changed` reasons mean the **layer stack** may have changed shape,
+/// so the composition tree must be re-read (`docs/PROTOCOL.md` v1.2's kind, v1.4's
+/// `op` flag: a patch or an opinion can add or drop a cook op's output layer).
+///
+/// Every reason the contract names is listed rather than "anything but reload": a
+/// server that grows a reason this build does not know would then have the tree
+/// silently stop following it, and the cost of asking once too often is one
+/// structural read (the panel replaces itself, the user sees no flicker). `preview`
+/// is **not** a reason — it is not a mutation and advances no version — so it is
+/// not here and asks for nothing.
+pub fn asks_tree(reason: &str) -> bool {
+    matches!(
+        reason,
+        "open" | "patch" | "opinion" | "undo" | "redo" | "reload"
+    )
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub struct StateChangePlan {
+    /// The camera the view must draw the scene with now, or `None` to keep the
+    /// user's orbit (`docs/REMOTE.md` §6).
+    pub refit: Option<Orbit>,
+    /// `composition_tree{}` was sent, so the panel will soon replace its rows.
+    pub asked_tree: bool,
+}
+
+/// The tag a `composition_tree` request is answered under (`app::Shell::on_reply`).
+pub const TREE_TAG: &str = "composition_tree";
+
+/// Ask `composition_tree{}` on `net` and say so on `tree`.
+///
+/// The one copy of "ask the tree": the shell reaches it through here for every
+/// reason (`「刷新」`, the first scene, and each `state_changed`), so a test can watch
+/// the wire without a window.
+///
+/// Rows already on screen **stay** until the answer replaces them: a
+/// `state_changed` follows every mutation, and blanking the panel to a loading row on
+/// each one would flicker the very thing the user is reading. A first ask (nothing on
+/// screen yet) does say it is loading.
+pub fn ask_tree(net: &crate::net::NetWorker, tree: &mut crate::panel::TreePanel) {
+    if !matches!(tree.model, crate::tree::TreeModel::Ready(_)) {
+        tree.model = crate::tree::TreeModel::Loading;
+    }
+    tree.note_asked(true);
+    net.send(crate::net::NetCommand::Call {
+        tag: TREE_TAG.to_owned(),
+        method: "composition_tree".to_owned(),
+        params: crate::tree::tree_params(),
+    });
+}
+
+/// Ask the tree **unless a request is already in flight**; if one is, record that
+/// another read is owed ([`TreePanel::take_reread`]).
+///
+/// This is what a `state_changed` goes through, and the coalescing is the point: a gizmo
+/// drag emits an opinion up to 30 times a second, each one a `state_changed{reason:
+/// "opinion"}`, and a `composition_tree` is a structural read of the whole authority
+/// stack. Asking per notification would put 30 of those in flight during one drag.
+/// Coalescing keeps both halves of the requirement — the tree follows the server, and it
+/// follows it once per round trip instead of once per message.
+fn ask_tree_coalesced(net: &crate::net::NetWorker, tree: &mut crate::panel::TreePanel) {
+    if tree.asking {
+        tree.reread_pending = true;
+        return;
+    }
+    ask_tree(net, tree);
+}
+
+/// The scene's bounds as the **screen** has them: the world box of the last scene
+/// adopted, which is the box a fit drawn now must frame.
+///
+/// Reading it from the model rather than taking it as an argument is what keeps a
+/// caller from fitting a box that is not the one being shown (and it removes the
+/// `&mut model` / `model.bbox` aliasing every caller would otherwise hit). `None`
+/// when no scene has arrived: there is nothing to frame.
+fn on_screen(model: &ClientModel) -> Option<([f64; 3], [f64; 3])> {
+    model.bbox
+}
+
+/// Carry out a `state_changed`: raise the tree request and fit the camera where the
+/// reason calls for it.
+///
+/// This is the whole reaction to the notification, with the pieces it needs handed in
+/// (`model`, `tree`, `net`) and nothing from the window or the GPU — which is what
+/// lets the integration test drive the same code over a socket and see both the
+/// request it sends and the camera it returns. `Shell::on_state_changed` only takes
+/// the answer and does the rendering.
+///
+/// The two rules are [`asks_tree`] and [`camera_for_state_change`]; a `preview` is not
+/// a `state_changed` at all (it advances no version), so it arrives here never and
+/// moves neither.
+pub fn apply_state_change(
+    model: &mut ClientModel,
+    tree: &mut crate::panel::TreePanel,
+    net: &crate::net::NetWorker,
+    version: u64,
+    reason: &str,
+    aspect: f64,
+) -> StateChangePlan {
+    let refit = camera_for_state_change(model, version, reason, aspect);
+    let asks = asks_tree(reason);
+    if asks {
+        ask_tree_coalesced(net, tree);
+    }
+    StateChangePlan {
+        refit,
+        asked_tree: asks,
+    }
+}
+
+/// The camera a `state_changed` makes the view fit, or `None` to keep the user's.
+///
+/// Only **`open`** refits, and only `open` is a new *document*: its scene is the
+/// first frame of a new thing, and the previous document's fit means nothing for
+/// it (a city framed at 23 units, then a single-mesh scatter document: the second
+/// lands in a corner of the first's frame). A patch, an opinion, an undo, a redo
+/// and a reload re-compose the *same* document, so the user's orbit wins — the
+/// rule `camera_for_scene` already states (`docs/REMOTE.md` §6: 相机归 client).
+///
+/// # Why it compares versions
+///
+/// The contract fixes the order `响应 → stage_snapshot → diagnostics →
+/// state_changed`, so the new document's snapshot has **already been adopted** by
+/// the time this reason arrives — through `camera_for_scene`, which says "not the
+/// first scene, keep the orbit". The fit therefore has to be taken here, from the
+/// bounds now on screen, and `version == model.version` is the test that the scene
+/// this reason speaks for is the one being shown. When they differ (a server that
+/// sent the reason first, or a client that dropped the snapshot as stale) nothing
+/// is fitted: the latch is re-armed instead and the next scene to arrive fits as a
+/// first one would.
+pub fn camera_for_state_change(
+    model: &mut ClientModel,
+    version: u64,
+    reason: &str,
+    aspect: f64,
+) -> Option<Orbit> {
+    if reason != "open" {
+        return None;
+    }
+    let bounds = on_screen(model)?;
+    if model.version == Some(version) {
+        return Some(fit_to_bounds(model, bounds, aspect));
+    }
+    model.rearm_first_fit();
+    None
 }
 
 /// Whether `orbit` holds every corner of `bounds` inside a `(w, h)` frame, and the

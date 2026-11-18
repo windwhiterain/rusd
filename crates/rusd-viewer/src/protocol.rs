@@ -478,6 +478,32 @@ impl ClientState {
         true
     }
 
+    /// Whether a **`state_changed`** at `version` is one to act on: false only when it is
+    /// older than everything seen.
+    ///
+    /// Not [`ClientState::accept`], and the difference is the whole point: the server
+    /// sends `stage_snapshot{version:n}` and then `state_changed{version:n}` — **the same
+    /// version**, that is what makes the reason describe the scene just pushed
+    /// (`docs/PROTOCOL.md` 「消息顺序」). A strict `>` rule therefore dropped *every*
+    /// `state_changed` on a real server: the snapshot had already raised the counter to
+    /// `n`, so the reason that followed it read as a duplicate. It went unnoticed because
+    /// every test of a reason fed it a version no snapshot had carried — this defect was
+    /// found by the mock that sends both, in `tests/state_change_v142.rs`.
+    ///
+    /// An equal version is safe to take here where it is not safe for a snapshot: a
+    /// `state_changed` carries no scene, so acting on it cannot roll the view back, and
+    /// it does not move the counter either (`note_version` is a `max`). An **older** one
+    /// still is a duplicate — a reason for a scene the view has passed says nothing about
+    /// this one.
+    pub fn accept_state_change(&mut self, version: u64) -> bool {
+        if self.max_version.is_some_and(|m| version < m) {
+            self.discarded += 1;
+            return false;
+        }
+        self.note_version(version);
+        true
+    }
+
     /// Whether the viewer knows it is live: `hello` answered with our protocol
     /// and `subscribe` was granted.
     pub fn is_live(&self) -> bool {
@@ -605,6 +631,38 @@ mod tests {
             }
             other => panic!("expected a response, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_state_changed_at_the_snapshots_own_version_is_taken_and_an_older_one_is_not() {
+        // The server pushes `stage_snapshot{version:n}` **and then**
+        // `state_changed{version:n}`: the same version is what makes the reason describe
+        // the scene just pushed. A strict `>` discard rule therefore dropped every
+        // `state_changed` on a real server — the snapshot had already raised the counter,
+        // so the reason read as a duplicate, which is exactly why the composition tree
+        // stopped following the server and the camera never refitted on an `open`.
+        let mut s = ClientState::default();
+        assert!(
+            s.accept_state_change(7),
+            "with nothing seen yet, a reason is newer than nothing"
+        );
+        assert_eq!(s.max_version, Some(7), "and it seeds the counter");
+        assert!(
+            s.accept_state_change(7),
+            "the reason for the snapshot at v7 must be taken, not dropped as a duplicate"
+        );
+        assert_eq!(s.discarded, 0);
+
+        // An **older** reason is still a duplicate: it speaks for a scene the view has
+        // passed, and acting on it would act on the wrong one.
+        assert!(!s.accept_state_change(6));
+        assert_eq!(s.discarded, 1);
+        assert_eq!(s.max_version, Some(7), "a stale reason moves nothing");
+
+        // And a snapshot at the same version is still refused by `accept`: two different
+        // scenes must not claim one version (the preview rule is the exception, and it
+        // lives in `ClientModel::apply`).
+        assert!(!s.accept(7));
     }
 
     #[test]

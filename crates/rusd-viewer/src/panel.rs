@@ -77,6 +77,19 @@ pub struct TreePanel {
     /// panel sends — a click sends the row's own identifier — so a stale copy cannot
     /// make a click ask for the wrong prefix, only mis-colour one row for a pass.
     pub preview: Option<String>,
+    /// Whether a `composition_tree` request is **outstanding**.
+    ///
+    /// A `state_changed` now asks for the tree (a patch or an opinion can add or drop a
+    /// cook op layer), and a gizmo drag sends an opinion up to 30 times a second
+    /// (`docs/PROTOCOL.md`: ≤ 30 Hz). Asking per reason would therefore put ~30
+    /// structural reads of the authority stack in flight during one drag, each one a
+    /// whole stack walk on the server and a fresh row model here. So a reason that
+    /// arrives while an answer is outstanding only records that another read is owed:
+    /// the tree still follows the server, and it follows it once per round trip instead
+    /// of once per notification.
+    pub asking: bool,
+    /// A re-read was asked for while one was outstanding (`TreePanel::take_reread`).
+    pub reread_pending: bool,
 }
 
 impl TreePanel {
@@ -85,7 +98,12 @@ impl TreePanel {
     }
 
     /// Take a `composition_tree` answer.
+    ///
+    /// Clears [`TreePanel::asking`]: the round trip is over, so the next reason may ask
+    /// again. A re-read that was asked for meanwhile is **not** sent from here (the
+    /// panel holds no socket); the shell takes it with [`TreePanel::take_reread`].
     pub fn apply_tree(&mut self, reply: Result<serde_json::Value, (i64, String)>) {
+        self.asking = false;
         // A degraded or failed answer also drops the detail: it describes rows of a
         // tree that no longer exists.
         if self.model.apply(reply).is_err() {
@@ -93,6 +111,23 @@ impl TreePanel {
             self.detail_error = None;
             self.selection = None;
         }
+    }
+
+    /// Take the re-read that was owed while a request was outstanding: `true` means
+    /// the caller must ask again now.
+    ///
+    /// Called after [`TreePanel::apply_tree`], once the answer has cleared `asking`. A
+    /// pending re-read is **coalesced**, not queued: however many reasons arrived during
+    /// the round trip, one more read answers all of them (each reason moved the same
+    /// layer stack on).
+    pub fn take_reread(&mut self) -> bool {
+        std::mem::take(&mut self.reread_pending)
+    }
+
+    /// Say a `composition_tree` request went out, or that one could not be sent (the
+    /// panel is then not left believing one is outstanding).
+    pub fn note_asked(&mut self, outstanding: bool) {
+        self.asking = outstanding;
     }
 
     /// Take a `comp_node{id}` answer.

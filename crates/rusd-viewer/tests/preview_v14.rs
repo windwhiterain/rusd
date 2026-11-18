@@ -253,6 +253,7 @@ fn effect_name(e: &rusd_viewer::session::Effect) -> &'static str {
     match e {
         Effect::NewScene(_) => "NewScene",
         Effect::Status => "Status",
+        Effect::StateChanged { .. } => "StateChanged",
         Effect::Nothing => "Nothing",
         Effect::Failed(_) => "Failed",
     }
