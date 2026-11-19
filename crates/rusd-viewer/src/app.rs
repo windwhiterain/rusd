@@ -422,7 +422,7 @@ impl Shell {
                     // status bar must now say. Without this the view kept
                     // claiming "connecting" while snapshots were arriving.
                     self.model.mark_live();
-                    self.status = self.model.status_line_zh();
+                    self.status = self.model.status_line_zh(|id| self.layer_name(id));
                     self.ask_tree();
                     self.request_repaint();
                 }
@@ -461,7 +461,7 @@ impl Shell {
                 self.on_state_changed(version, &reason);
             }
             Effect::Status => {
-                self.status = self.model.status_line_zh();
+                self.status = self.model.status_line_zh(|id| self.layer_name(id));
                 self.request_repaint();
             }
             Effect::Nothing => {}
@@ -512,7 +512,7 @@ impl Shell {
             // The rows are on screen until the answer replaces them (`view::ask_tree`).
             self.tree_asked = true;
         }
-        self.status = self.model.status_line_zh();
+        self.status = self.model.status_line_zh(|id| self.layer_name(id));
         self.request_repaint();
     }
 
@@ -541,7 +541,7 @@ impl Shell {
         // The composition on screen, echoed to the panel so its op row can be marked
         // and its 「final」 button reads the state the viewport is actually in (v1.4).
         self.tree.preview = self.model.preview.clone();
-        self.status = self.model.status_line_zh();
+        self.status = self.model.status_line_zh(|id| self.layer_name(id));
         self.preview = None;
         self.gizmo = None;
         // The first scene of a session is when `composition_tree{}` becomes
@@ -745,9 +745,13 @@ impl Shell {
     /// A click in the tree: select the row, ask its detail, and — when the row
     /// stands for a prim — select that prim in the viewport and copy its path.
     ///
-    /// **The preview is not touched** (`docs/PROTOCOL.md` v1.4: 点非 op 节点仍走
-    /// `comp_node` 详情，不改预览). Only `TreeAction::Preview` asks `preview`, so
-    /// inspecting a layer cannot silently change which composition is on screen.
+    /// **A layer row's click is also a preview when that layer is a preview control**
+    /// (`TreeAction::Preview`), and `preview` is asked *beside* the detail rather than
+    /// instead of it: the user's ruling is that clicking an arc's target-layer leaf must
+    /// equal clicking the layer itself, and what a layer row means is now one thing --
+    /// select it, show its detail, and (for a root or op layer) compose up to it. A row
+    /// that is not a control leaves the composition alone (`docs/PROTOCOL.md` v1.4: 点非
+    /// op 节点仍走 comp_node 详情，不改预览).
     fn on_tree_select(&mut self, sel: crate::tree::TreeSelection) {
         self.ask_node(&sel.id);
         if let Some(path) = crate::panel::copy_payload(&sel) {
@@ -757,8 +761,33 @@ impl Shell {
             self.gizmo = None;
             self.ask_render();
         }
+        // **A layer click reaches that layer's row** (v1.5.8): the row may be scrolled
+        // far out of sight, and an arc's target-layer leaf is a click on the layer, so
+        // the panel brings the layer's own first-level row into view on the next pass.
+        if sel.kind == crate::tree::TreeNodeKind::Layer {
+            self.tree.scroll_to(&sel.id);
+        }
         self.tree.selection = Some(sel);
         self.request_repaint();
+    }
+
+    /// A **layer row** was clicked: the one click a layer has, whatever drew it.
+    ///
+    /// The detail first -- a layer row always shows that layer's `comp_node` -- then the
+    /// jump to the layer's own row, then the preview when the layer is a control
+    /// (`preview: true`, which `action_for` sets for exactly the root and cook op
+    /// layers). Asking both is the user's ruling made executable: 点 reference 的层叶子
+    /// == 点这个 layer 本体, so neither half may be skipped for either row.
+    ///
+    /// The preview goes through [`Shell::ask_preview`] like the 「final」 button does, so
+    /// a refused `upto` (`-32602`) is reported the same way rather than leaving the bar
+    /// claiming a prefix the viewport never showed.
+    fn on_tree_layer(&mut self, selection: crate::tree::TreeSelection, preview: bool) {
+        let id = selection.id.clone();
+        self.on_tree_select(selection);
+        if preview {
+            self.ask_preview(Some(id));
+        }
     }
 
     /// Take the capture the user just framed: the frame's own beauty image, a mask
@@ -914,7 +943,7 @@ impl Shell {
                 // box right here), and it is the one a user reads. The detailed
                 // ASCII line follows for diagnostics and for a viewer whose
                 // font did not load.
-                ui.label(self.model.status_line_zh());
+                ui.label(self.model.status_line_zh(|id| self.layer_name(id)));
                 ui.separator();
                 ui.label(&self.status);
                 ui.separator();
@@ -972,8 +1001,11 @@ impl Shell {
                         .show(ui, |ui| {
                             crate::panel::detail_panel(ui, &self.tree);
                         });
-                    match crate::panel::tree_panel(ui, &self.tree) {
+                    match crate::panel::tree_panel(ui, &mut self.tree) {
                         crate::panel::TreeAction::Select(sel) => self.on_tree_select(sel),
+                        crate::panel::TreeAction::Layer { selection, preview } => {
+                            self.on_tree_layer(selection, preview)
+                        }
                         crate::panel::TreeAction::Preview(upto) => self.ask_preview(upto),
                         crate::panel::TreeAction::Refresh => self.ask_tree(),
                         crate::panel::TreeAction::None => {}
@@ -1169,6 +1201,20 @@ impl Shell {
     /// frame must be framed for.
     fn viewport_aspect(&self) -> f64 {
         self.viewport.aspect()
+    }
+
+    /// What a **layer identifier is called** on screen: the tree's one
+    /// [`display name`](crate::tree::layer_display_name) when a tree is loaded, and the
+    /// identifier less its `anon:N:` prefix when none is yet (before the first
+    /// `composition_tree` answer there is no layer list to ask, and the prefix carries no
+    /// identity anyway). Every place the shell prints a layer uses this -- the status
+    /// bar's preview badge, the overlay's `composition` line -- so a badge cannot name a
+    /// layer differently from the row the user clicked.
+    fn layer_name(&self, id: &str) -> String {
+        match self.tree.model.tree() {
+            Some(tree) => tree.display_name(id),
+            None => crate::tree::strip_anon_prefix(id),
+        }
     }
 
     /// Pointer input over the viewport: orbit, pan, zoom, pick, and the gizmo.
@@ -1496,7 +1542,13 @@ impl Shell {
         // The composition the viewport is showing (v1.4's preview), first line: it is
         // the one fact a prefix preview changes, and a screenshot of a prefix must say
         // so without being compared against another screenshot.
-        lines.insert(0, format!("composition {}", self.model.preview_label()));
+        lines.insert(
+            0,
+            format!(
+                "composition {}",
+                self.model.preview_label(|id| self.layer_name(id))
+            ),
+        );
         // The two groups that name a DPI defect as a number rather than a story:
         // what the platform said against what the contract expects, and whether the
         // panels and the viewport partition the window. A screenshot of a settled

@@ -467,7 +467,14 @@ impl ClientModel {
     /// the line is visibly one script; every character here is CJK except the
     /// middots and `v8`, which is what makes it a real test of the font (a tofu
     /// box would be unmistakable next to the ASCII-only line below).
-    pub fn status_line_zh(&self) -> String {
+    ///
+    /// `name` is how a **layer** is called: the preview badge names the layer the viewport
+    /// is composed up to, and the shell supplies the tree's one display name
+    /// ([`crate::tree::CompositionTree::display_name`]), so the badge reads the same name
+    /// as the row the user clicked to get there (the user's ruling: one layer, one name,
+    /// everywhere). An `anon:N:` identifier is what the wire echoes, never what a reader
+    /// is shown.
+    pub fn status_line_zh(&self, name: impl Fn(&str) -> String) -> String {
         let conn = if self.offline {
             "离线"
         } else if self.state.is_live() {
@@ -488,7 +495,7 @@ impl ClientModel {
         };
         let mut line = format!("{conn} · {version} · {prims} · {sel}");
         if let Some(upto) = &self.preview {
-            line.push_str(&format!(" · 预览 ≤ {upto}"));
+            line.push_str(&format!(" · 预览 ≤ {}", name(upto)));
         }
         if let Some(r) = &self.last_reason {
             line.push_str(&format!(" · {}", reason_zh(r)));
@@ -502,10 +509,13 @@ impl ClientModel {
     /// Both states are printed rather than only the prefix: a user who clicked an op row
     /// needs to see which prefix they are looking at, and a user who clicked 「final」
     /// needs to see that it took effect. `ClientModel::preview` is the one source (the
-    /// server's echoed `upto`), so this cannot disagree with what is on screen.
-    pub fn preview_label(&self) -> String {
+    /// server's echoed `upto`), so this cannot disagree with what is on screen. `name` is
+    /// that layer's display name, supplied by the caller for the same reason
+    /// [`ClientModel::status_line_zh`] takes one: the overlay must name the layer the way
+    /// the tree does.
+    pub fn preview_label(&self, name: impl Fn(&str) -> String) -> String {
         match &self.preview {
-            Some(upto) => format!("预览 ≤ {upto}"),
+            Some(upto) => format!("预览 ≤ {}", name(upto)),
             None => "最终".to_owned(),
         }
     }
