@@ -117,28 +117,36 @@ pub const DEFAULT_LISTEN: &str = "127.0.0.1:8765";
 /// quiet period after the last event is what marks the save complete.
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// The preview state that stops **before** the first cook op: the stage composes
-/// only the document's own layer plus the session overrides, with every cook
-/// output layer muted (PROTOCOL v1.5.3).
+/// What one connection's snapshots show, as the composition it names
+/// (PROTOCOL v1.4, extended by v1.5.3 / v1.6.0 / v1.7.1 / v1.8).
 ///
-/// A preview stops **before every layer stronger than the one it names**, which
-/// is what "compose up to this layer" means: the session overrides are kept (a
-/// preview is a view of the work, not a scrubbing of it), and the layer named and
-/// everything weaker compose.
+/// Two families live here, because two requests name them and they are not the
+/// same question:
 ///
-/// Op layers and the root are special cases of that rule, not a second rule
-/// (v1.6.0): a stop at an op layer mutes every op **after** it in cook order, and
-/// the root stop mutes every op — so both agree with the strength-order reading
-/// exactly, which is why this file can answer both spellings one way.
+/// - a **stop** ([`Preview::Root`] / [`Preview::Op`] / [`Preview::Layer`]) asks
+///   "how far into the cook should this scene go", and v1.8 answers it by what
+///   each layer *is* rather than by strength alone: the session, the root, the
+///   cook output layers up to the stop, and the **material layers those ops
+///   consumed**. A material layer composes only while its consumer op is inside
+///   the stop, which is why the root stop shows neither an op's output nor an
+///   unconsumed asset (an empty scene, for a document that authors no geometry
+///   of its own).
+/// - a **solo** ([`Preview::Solo`]) asks "show me this one layer", and answers
+///   with that layer plus the session overrides — no stop arithmetic at all.
+///
+/// The stop family's three spellings are one rule, not three (v1.6.0): the op
+/// position, the root, and an ordinary layer identifier are all read against the
+/// same set of layers to compose, so the file can answer them one way.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Preview {
-    /// Stop before every cook op (no stronger layer composes).
+    /// Stop before every cook op (no op output, and no material an op would have
+    /// consumed).
     Root,
     /// Stop after the cook output layer at this position in cook order.
     Op(usize),
     /// Stop after the layer with this identifier.
     Layer(String),
-    /// Compose **only** this layer (the session overrides stay).
+    /// This layer and the session overrides, and nothing else (v1.7.1).
     Solo(String),
 }
 
@@ -487,6 +495,15 @@ struct Session {
     /// what a lay `row`'s `description` says when the layer is not an op: metadata
     /// from the document about a layer the cook never wrote.
     annotations: Vec<rusd_core::Annotation>,
+    /// Each generator node's **declared reads**, by node id, from the nodes the
+    /// last pass cooked (PROTOCOL v1.8).
+    ///
+    /// [`CookOp`] reports the op's generator and its output layer but not its
+    /// `reads`, and those are what a preview needs: an op consumes the material
+    /// layers its reads land in, which is how a stop knows which assets to keep.
+    /// Kept per pass beside [`cook_ops`](Self::cook_ops) and refreshed with it, so a
+    /// rebuilt cook cannot leave a stale dependency behind.
+    reads_by_node: BTreeMap<String, Vec<(String, String)>>,
 }
 
 /// What one mutation made available to its subscribers, held until the
@@ -526,6 +543,7 @@ impl Session {
             session_id: None,
             cook: rusd_proc::default_registry(),
             cook_ops: Vec::new(),
+            reads_by_node: BTreeMap::new(),
             ops: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -700,57 +718,78 @@ impl Session {
 
     // --- viewer methods ---------------------------------------------------
 
-    /// `preview{upto}` (PROTOCOL v1.4, extended by v1.5.3 and v1.6.0): where
-    /// **this** connection's snapshots stop. `upto` is one of
+    /// `preview{upto}` / `preview{solo}` (PROTOCOL v1.4, extended by v1.5.3,
+    /// v1.6.0, v1.7.1 and v1.8): what **this** connection's snapshots show.
+    ///
+    /// `upto` names a **stop**, and is one of
     ///
     /// - the identifier of **any opened layer**, as `composition_tree`'s `layers`
     ///   lists them — a cook output layer, a layer a reference opened
-    ///   (`prototypes.usda`), the root layer, or the session layer. The snapshot
-    ///   then composes that layer and everything **weaker** than it, and nothing
-    ///   stronger; the session overrides are always kept. Clicking a layer row in a
-    ///   client is a request to see that layer, which is why every row is a stop;
+    ///   (`cluster.usda`), the root layer, or the session layer. The snapshot then
+    ///   composes the session, the root, the cook output layers up to that stop in
+    ///   cook order, and the material layers those ops consumed (v1.8). Clicking a
+    ///   layer row in a client is a request to see that layer, which is why every
+    ///   row is a stop;
     /// - `null`, the final, whole composition.
     ///
     /// Op layers and the root are ordinary cases of that rule (v1.6.0): stopping
-    /// at an op mutes the ops after it in cook order, and stopping at the root mutes
-    /// every op — which is exactly the strength order read that way. The reply is
-    /// the same for both spellings, so a client that predates v1.6.0 keeps reading
-    /// `op_index` / `root` where it asked for one of those.
+    /// at an op leaves out the ops after it in cook order, and stopping at the root
+    /// leaves out every op — which is exactly the strength order read that way. The
+    /// reply is the same for both spellings, so a client that predates v1.6.0 keeps
+    /// reading `op_index` / `root` where it asked for one of those.
     ///
-    /// An identifier the stage does not hold is `-32602`, naming what would have
-    /// worked: asking to stop at a layer that is not here is a client bug, not a
-    /// request to see something else.
+    /// `solo` names **one layer to look at on its own** (v1.7.1): that layer and
+    /// the session overrides, and nothing else — no stop arithmetic, so it is a
+    /// different question from `upto` rather than another value of it. The two are
+    /// mutually exclusive: a request with both, or with neither, is `-32602`.
+    ///
+    /// An identifier the stage does not hold is `-32602` for either, naming what
+    /// would have worked: asking to see a layer that is not here is a client bug,
+    /// not a request to see something else.
     fn preview(&mut self, conn: u64, p: &Value) -> Result<Value, (i64, String)> {
-        // A solo stop names one layer and mutes everything else (the session
-        // layer excepted): the render of a single layer node (v1.8).
-        if let Some(solo) = p.get("solo") {
-            let Some(solo) = solo.as_str() else {
+        let upto = p.get("upto");
+        let solo = p.get("solo");
+        if upto.is_some() && solo.is_some() {
+            return Err((
+                INVALID_PARAMS,
+                "preview: `upto` and `solo` are two questions, not one — send exactly one \
+                 (`upto` = how far into the cook, `solo` = this layer on its own)"
+                    .into(),
+            ));
+        }
+        if upto.is_none() && solo.is_none() {
+            return Err((
+                INVALID_PARAMS,
+                "preview: `upto` (an opened layer identifier, or null for the whole \
+                 composition) or `solo` (one opened layer identifier) required"
+                    .into(),
+            ));
+        }
+        let solo_wanted = match solo {
+            None => None,
+            Some(Value::String(id)) => Some(id.clone()),
+            Some(other) => {
                 return Err((
                     INVALID_PARAMS,
-                    "preview: `solo` must be a layer identifier".into(),
+                    format!("preview: `solo` must be a layer identifier, not {other}"),
                 ));
-            };
+            }
+        };
+        if let Some(id) = &solo_wanted {
             let Some(stage) = self.stage.clone() else {
                 return Err(server_error("no scene open; call open first".into()));
             };
+            let root_id = stage.root_layer().identifier().to_owned();
+            let ops = crate::composition::cook_output_layers(&stage);
             let ordered = self.strength_order();
-            if !ordered.iter().any(|open| open == solo) {
-                let root_id = stage.root_layer().identifier().to_owned();
-                let ops = crate::composition::cook_output_layers(&stage);
-                return Err(self.unknown_preview(solo, &ops, &root_id, &ordered));
+            if !ordered.contains(id) {
+                return Err(self.unknown_preview(id, &ops, &root_id, &ordered));
             }
-            self.preview.insert(conn, Preview::Solo(solo.to_owned()));
-            return Ok(json!({ "solo": solo }));
+            self.preview.insert(conn, Preview::Solo(id.clone()));
+            return Ok(json!({ "solo": id }));
         }
-        let upto = match p.get("upto") {
-            None => {
-                return Err((
-                    INVALID_PARAMS,
-                    "preview: `upto` (an opened layer identifier, or null for the whole \
-                     composition) required"
-                        .into(),
-                ));
-            }
+        let upto = match upto {
+            None => unreachable!("exactly one of `upto` / `solo` is present"),
             Some(Value::Null) => None,
             Some(Value::String(id)) => Some(id.clone()),
             Some(other) => {
@@ -842,10 +881,23 @@ impl Session {
     /// The root stop is never stale: it is not a position in the current cook at
     /// all, but the statement that no op should be composed, which holds for a stage
     /// with no ops just as well as for one with three.
+    ///
+    /// A solo is a **named layer**, so it goes stale on the same terms as a named
+    /// stop: an identifier the rebuilt stage no longer holds leaves nothing to look
+    /// at, and the connection falls back to the final composition rather than keep
+    /// a picture of a layer that is gone.
     fn preview_position(&mut self, conn: u64) -> Option<Preview> {
         let state = self.preview.get(&conn)?.clone();
         match &state {
             Preview::Root => Some(state),
+            Preview::Solo(id) => {
+                if self.strength_order().iter().any(|open| open == id) {
+                    Some(state)
+                } else {
+                    self.preview.remove(&conn);
+                    None
+                }
+            }
             Preview::Op(position) => {
                 let stage = self.stage.as_ref()?;
                 let len = crate::composition::cook_output_layers(stage).len();
@@ -856,7 +908,7 @@ impl Session {
                     None
                 }
             }
-            Preview::Layer(id) | Preview::Solo(id) => {
+            Preview::Layer(id) => {
                 if self.strength_order().iter().any(|open| open == id) {
                     Some(state)
                 } else {
@@ -1151,6 +1203,7 @@ impl Session {
         // that failed to produce a layer for a node simply has no op for it, and
         // the tree falls back to `null` for that layer.
         self.cook_ops = result.ops;
+        self.reads_by_node = nodes_reads(&nodes);
         let prim_count = rusd_scene::prim_count(&stage);
         self.live(stage.clone(), stats, &diags, prim_count, nodes.len());
         self.stage = Some(stage);
@@ -1190,6 +1243,7 @@ impl Session {
         // Wholesale, as in `rebuild`: memo hits keep their output layer, so this
         // pass still lists them — a reused node is an op of the cook (v1.5.1).
         self.cook_ops = result.ops;
+        self.reads_by_node = nodes_reads(&nodes);
         let prim_count = rusd_scene::prim_count(&stage);
         self.live(stage, stats, &diags, prim_count, nodes.len());
         Pipeline { diags, ok: true }
@@ -1243,85 +1297,191 @@ impl Session {
         Ok(())
     }
 
-    /// The Tier A snapshot: the stage — or, for a preview, the composition that
-    /// stops at `upto` — flattened into one `usdc` layer, base64 on the wire.
+    /// The layers a preview leaves **out**, so that what composes is exactly what
+    /// PROTOCOL v1.8 says the stop or solo means. Muting is the stage's own
+    /// composition control (`Stage::mute_layer`), so what is left composes through
+    /// the same engine that composes the whole — there is no second pipeline to
+    /// keep in step — and [`snapshot_line`](Self::snapshot_line) unmutes them again,
+    /// so a caller's final composition is untouched by a client's preview.
     ///
-    /// A preview is built by muting every layer **stronger** than the stop, in
-    /// strength order (v1.6.0), flattening, and unmuting them again: session layers
-    /// are never muted, so a preview always keeps the work done so far, and the stop
-    /// and everything weaker compose. Muting is the stage's own composition control
-    /// (`Stage::mute_layer`), so the prefix is composed by the same engine that
-    /// composes the whole — there is no second pipeline to keep in step. The layers
-    /// come back exactly as they were, so a caller's final composition is untouched
-    /// by a client's preview.
+    /// **The rule the stop family answers** (v1.8, which replaced v1.5.3's "mute
+    /// everything stronger"): what composes is the session layer, the root layer,
+    /// the cook output layers up to the stop in cook order, and the **material
+    /// layers those ops consumed**. A material layer is a layer an arc reached
+    /// rather than a cook wrote (`cluster.usda`, `prototypes.usda`, `terrain.usda`);
+    /// it composes only while an op inside the stop reads a prim that lives in it.
+    /// That is what the old rule got wrong: with two independent stages in one
+    /// document, "everything weaker" pulled the *other* stage's construction input
+    /// into the frame, which no reading of the picture asks for.
     ///
-    /// The three stops are the one rule read against three spellings: the root stop
-    /// mutes every cook output layer (what composes then is the document's own scene
-    /// plus the session overrides — the first prefix PROTOCOL v1.5.3 requires to be
-    /// reachable), an op stop mutes the ops after it in cook order, and a named
-    /// layer mutes everything the strength order puts above it (so a reference's
-    /// target, `prototypes.usda`, leaves exactly the document and the session).
+    /// So the kept set is built up rather than filtered down:
+    ///
+    /// 1. the **op layers** to keep — none for the root stop, the first `n+1` for an
+    ///    op stop, the op layers in strength order up to a named layer for a layer
+    ///    stop;
+    /// 2. the **material layers** those ops consume — for every kept op, its
+    ///    declared reads (`CookNode.reads`), each resolved to the layers whose spec
+    ///    it lands in (`Prim::prim_stack`), which is what follows an arc into an
+    ///    asset
+    ///    (and, for a nested one, into the asset that asset references);
+    /// 3. the session and the root, which are never muted.
+    ///
+    /// Everything else is muted. The root stop therefore keeps nothing beyond the
+    /// session and the root — PROTOCOL v1.8's "an empty scene" for a document that
+    /// authors no geometry of its own — because no op is kept, so nothing is
+    /// consumed.
+    ///
+    /// A **solo** does not use this rule at all: it composes a stage of its own
+    /// (see [`solo_flatten`](Self::solo_flatten)), because "this layer and the
+    /// session" cannot be expressed by muting — the root layer, where the document's
+    /// own prims live, is the one layer openusd will not mute.
+    ///
+    /// Replacement semantics survive the rule rather than compete with it: an input
+    /// an upstream op hid is hidden by that op's own `visibility` override, which is
+    /// composed exactly when the op that authored it is kept.
+    fn muted_for(&self, preview: &Option<Preview>) -> Vec<String> {
+        let Some(stage) = self.stage.as_ref() else {
+            return Vec::new();
+        };
+        let order = self.strength_order();
+        let session_id = stage.session_layer().map(|l| l.identifier().to_owned());
+        // Session and root are the two layers a preview never mutes: the root cannot
+        // be (a stack with no root composes nothing) and the session must not be (a
+        // preview is a view of the work, overrides included).
+        let immutable = |id: &String| Some(id) == session_id.as_ref() || *id == self.root_id(stage);
+        match preview {
+            None => Vec::new(),
+            Some(Preview::Solo(_)) => Vec::new(),
+            Some(stop) => {
+                let ops = crate::composition::cook_output_layers(stage);
+                let kept_ops = self.ops_inside(stop, &ops, &order);
+                let mut keep: Vec<String> = kept_ops.clone();
+                for op in &kept_ops {
+                    keep.extend(self.consumed_layers(stage, op));
+                }
+                order
+                    .iter()
+                    .filter(|open| {
+                        !immutable(open) && !kept_ops.contains(open) && !keep.contains(open)
+                    })
+                    .cloned()
+                    .collect()
+            }
+        }
+    }
+
+    /// The cook output layers a stop keeps, by the strength order they occupy —
+    /// which is how v1.8 reads all three spellings of a stop as one rule again: the
+    /// root stop keeps none, an op stop keeps the ops up to its cook position, and a
+    /// named layer keeps every op stronger than it (a stop *below* the ops is a stop
+    /// before them all).
+    fn ops_inside(&self, stop: &Preview, ops: &[String], order: &[String]) -> Vec<String> {
+        match stop {
+            Preview::Root => Vec::new(),
+            Preview::Op(position) => ops.iter().take(position + 1).cloned().collect(),
+            Preview::Layer(id) => order
+                .iter()
+                .take_while(|open| *open != id)
+                .filter(|open| ops.contains(open))
+                .cloned()
+                .collect(),
+            Preview::Solo(_) => Vec::new(),
+        }
+    }
+
+    /// The material layers the op on `layer` consumes: for every prim its node
+    /// declared as a read, the layers that prim's spec lands in.
+    ///
+    /// `Prim::prim_stack` is what makes this follow an arc rather than walk a layer:
+    /// a read of `/World/Terrain` lands in `terrain.usda`'s own `/World/Terrain`,
+    /// and a read under an instance of a nested asset lands in that asset's
+    /// differently-spelled path (`/World/Boxes/i000009` inside `cluster.usda`), which
+    /// no scan of the stage's namespace could have found.
+    ///
+    /// A **cook output layer is never material**, and that exclusion is what makes a
+    /// stop a stop. Two of an op's reads land in op layers: its anchor
+    /// (`/World/Boxes`, whose spec the node itself authored) and its input
+    /// (`/World/SurfaceSamples/points`, an earlier op's output). Neither is an asset
+    /// the op consumed — and a contributor that happened to be a *later* op would
+    /// otherwise be kept for a reason that has nothing to do with the stop, which
+    /// silently un-muted the rest of the cook and made every stop past the first
+    /// look like the final composition.
+    ///
+    /// The session and root are excluded for the same reason they are never muted.
+    fn consumed_layers(&self, stage: &Stage, layer: &str) -> Vec<String> {
+        let session_id = stage.session_layer().map(|l| l.identifier().to_owned());
+        let root_id = self.root_id(stage);
+        let ops = crate::composition::cook_output_layers(stage);
+        let Some(node) = self.cook_ops.iter().find(|op| op.layer_id == layer) else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for (prim, _attr) in self
+            .reads_by_node
+            .get(&node.id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+        {
+            let Ok(path) = sdf::path(prim) else {
+                continue;
+            };
+            let Ok(prim) = stage.prim(&path) else {
+                continue;
+            };
+            let Ok(sites) = prim.prim_stack() else {
+                continue;
+            };
+            for site in sites {
+                if site.layer == layer
+                    || site.layer == root_id
+                    || Some(&site.layer) == session_id.as_ref()
+                    || ops.contains(&site.layer)
+                {
+                    continue;
+                }
+                if !out.contains(&site.layer) {
+                    out.push(site.layer);
+                }
+            }
+        }
+        // The reads of one node can name the same prim twice (a scatter declares a
+        // surface, a volume and a points read of one path), and two ops can consume
+        // the same asset; the answer is a set, and the caller only asks membership.
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// The root layer's identifier, which a preview never mutes.
+    fn root_id(&self, stage: &Stage) -> String {
+        stage.root_layer().identifier().to_owned()
+    }
+
+    /// The Tier A snapshot: the stage — or, for a preview, exactly the composition
+    /// that preview names — flattened into one `usdc` layer, base64 on the wire.
+    ///
+    /// What a preview keeps is [`muted_for`](Self::muted_for)'s answer, and this
+    /// method is the half that applies it: mute, flatten, unmute. The layers come
+    /// back exactly as they were, so a caller's final composition is untouched by a
+    /// client's preview.
     ///
     /// The **root layer cannot be muted** — openusd refuses it for the reason C++
-    /// does, that a stack with no root composes nothing — so a stop at a layer the
-    /// strength order puts *below* the root keeps the root's own scene and drops
-    /// only what stands between them. For a reference's target that is exactly what
-    /// the picture should be: the target contributes nothing without the arc that
-    /// reaches it, and that arc is authored in an op layer, which the stop mutes.
+    /// does, that a stack with no root composes nothing — which is why it is part of
+    /// the immutable set rather than something the rule could drop.
     fn snapshot_line(&self, version: u64, upto: Option<Preview>) -> Result<String, String> {
-        // A **solo** stop is not a prefix of this stage: an asset layer enters
-        // composition only through the arcs that reference it, so muting the
-        // referencing layers would leave the asset with no arcs at all (0 prims,
-        // measured). Solo therefore builds a stage **of that one layer** -- the
-        // node renders its own thing (v1.8).
-        if let Some(Preview::Solo(id)) = &upto {
-            let solo = Stage::open(id).map_err(|e| format!("solo stage {id}: {e}"))?;
-            let flat = solo.flatten().map_err(|e| format!("flatten failed: {e}"))?;
-            let format = sdf::LayerRegistry::find_by_id("usdc")
-                .ok_or("the usdc file format is not registered")?;
-            let written = format
-                .write_bytes(flat.data())
-                .map_err(|e| format!("usdc write failed: {e}"))?;
-            let params = json!({
-                "version": version,
-                "format": "usdc",
-                "data": base64_encode(&written.bytes),
-                "upto": id,
-            });
-            return Ok(to_line(&json!({
-                "method": "stage_snapshot",
-                "params": params,
-            })));
-        }
         let Some(stage) = self.stage.as_ref() else {
             return Err("no scene open; nothing to snapshot".into());
         };
-        let root_id = stage.root_layer().identifier().to_owned();
-        let ops = crate::composition::cook_output_layers(stage);
-        let order = self.strength_order();
-        let session_id = stage.session_layer().map(|l| l.identifier().to_owned());
-        let muted: Vec<String> = match &upto {
-            // Nothing has cooked yet at the root stop, so every op layer goes.
-            Some(Preview::Root) => ops.clone(),
-            // The ops after this one in cook order, by the same rule.
-            Some(Preview::Op(position)) => ops.iter().skip(position + 1).cloned().collect(),
-            // Everything stronger than the named layer — session layers excepted, so
-            // an override stays visible.
-            Some(Preview::Layer(id)) => order
-                .iter()
-                .take_while(|open| *open != id)
-                .filter(|open| Some(*open) != session_id.as_ref())
-                .cloned()
-                .collect(),
-            // Solo: everything but the named layer goes; the session layer's
-            // overrides stay, so a solo stop renders exactly that one layer.
-            Some(Preview::Solo(id)) => order
-                .iter()
-                .filter(|open| *open != id && Some(*open) != session_id.as_ref())
-                .cloned()
-                .collect(),
-            None => Vec::new(),
-        };
+        // A solo is not a subtraction from the stage: it is "this layer alone",
+        // which the stage cannot show by muting, because openusd refuses to mute
+        // the root layer (a stack with no root composes nothing) and the document's
+        // own prims live there. So a solo composes a stage of its own whose root is
+        // that layer, and the document's root layer is simply not in it.
+        if let Some(Preview::Solo(id)) = &upto {
+            let flat = self.solo_flatten(stage, id)?;
+            return self.write_snapshot(version, &flat, &upto);
+        }
+        let muted = self.muted_for(&upto);
         for id in &muted {
             stage.mute_layer(id.clone());
         }
@@ -1330,6 +1490,66 @@ impl Session {
             stage.unmute_layer(id);
         }
         let flat = flattened.map_err(|e| format!("flatten failed: {e}"))?;
+        self.write_snapshot(version, &flat, &upto)
+    }
+
+    /// One layer composed on its own (PROTOCOL v1.7.1): the session's overrides
+    /// plus the named layer, and nothing else — the document's root layer is not in
+    /// this picture, so a solo of an asset shows the asset rather than the asset
+    /// drawn over a document that names it.
+    ///
+    /// The layer is re-anchored under a fresh anonymous root rather than slotted
+    /// into the live stage's stack: the stage's root is un-mutable, so muting can
+    /// express "everything except these two" but never "these two and no root".
+    /// Its arcs are resolved the same way, because the target paths a `reference`
+    /// authored are absolute asset paths — `cluster.usda` still reaches
+    /// `prototypes.usda` from here, which is exactly what a solo of `cluster.usda`
+    /// should show.
+    fn solo_flatten(&self, stage: &Stage, id: &str) -> Result<sdf::Layer, String> {
+        let borrowed = stage
+            .layer(id)
+            .ok_or_else(|| format!("solo: no layer {id:?} is open"))?;
+        // Re-read through the bytes the layer already answered with, so the new
+        // stage holds an owned layer: the live stage keeps its own under a borrow
+        // this cannot move.
+        let text = borrowed
+            .export_to_string()
+            .map_err(|e| format!("solo: cannot re-read {id:?}: {e}"))?;
+        drop(borrowed);
+        let owned = sdf::Layer::from_bytes("solo_layer.usda", text.into_bytes())
+            .map_err(|e| format!("solo: cannot re-parse {id:?}: {e}"))?;
+        let mut builder = Stage::builder();
+        if let Some(session) = stage.session_layer().map(|l| l.identifier().to_owned()) {
+            builder = builder.session_layer(session);
+        }
+        let solo = builder
+            .in_memory("solo_root.usda")
+            .map_err(|e| format!("solo: cannot open a stage: {e}"))?;
+        let solo_root = solo.root_layer().identifier().to_owned();
+        solo.insert_layer(&solo_root, 0, owned, sdf::LayerOffset::IDENTITY)
+            .map_err(|e| format!("solo: cannot place {id:?}: {e:?}"))?;
+        solo.flatten()
+            .map_err(|e| format!("solo flatten failed: {e}"))
+    }
+
+    /// The wire half of a snapshot: the flattened layer as `usdc`, base64, with the
+    /// field that names what the preview was.
+    fn write_snapshot(
+        &self,
+        version: u64,
+        flat: &sdf::Layer,
+        upto: &Option<Preview>,
+    ) -> Result<String, String> {
+        let ops = self
+            .stage
+            .as_ref()
+            .map(crate::composition::cook_output_layers)
+            .unwrap_or_default();
+        let root_id = self
+            .stage
+            .as_ref()
+            .map(|s| self.root_id(s))
+            .unwrap_or_default();
         let format = sdf::LayerRegistry::find_by_id("usdc")
             .ok_or("the usdc file format is not registered")?;
         let written = format
@@ -1342,17 +1562,19 @@ impl Session {
         });
         // `upto` is absent for the final composition (PROTOCOL v1.4): the
         // snapshot then means the whole scene, which is what a client that never
-        // asked for a preview always gets. A preview names the layer it stops at —
+        // asked for a preview always gets. A preview names the layer it stopped at —
         // the identifier the client asked for, which is the root's for the root stop
-        // (v1.5.3) and an op layer's for an op stop.
-        match &upto {
+        // (v1.5.3) and an op layer's for an op stop — and a solo names its own layer
+        // under `solo` instead (v1.7.1), because the two fields mean different things.
+        match upto {
             Some(Preview::Root) => params["upto"] = json!(root_id),
             Some(Preview::Op(position)) => {
                 if let Some(id) = ops.get(*position) {
                     params["upto"] = json!(id);
                 }
             }
-            Some(Preview::Layer(id) | Preview::Solo(id)) => params["upto"] = json!(id),
+            Some(Preview::Layer(id)) => params["upto"] = json!(id),
+            Some(Preview::Solo(id)) => params["solo"] = json!(id),
             None => {}
         }
         Ok(to_line(&json!({
@@ -1369,7 +1591,8 @@ impl Session {
     /// subscribers, not once per connection: a preview is a flatten of the whole
     /// stage, and two viewers watching the same prefix must not pay for it twice.
     /// [`Preview::Root`] is an ordinary key here — several viewers on the root
-    /// stop share one flatten like any other prefix.
+    /// stop share one flatten like any other prefix — and so is a
+    /// [`Preview::Solo`], which two viewers can equally ask for.
     fn publish(&mut self) {
         let pending = std::mem::take(&mut self.pending);
         if pending.is_empty() {
@@ -1733,6 +1956,16 @@ fn err_reply(id: Value, code: i64, message: String) -> Value {
 
 fn server_error(message: String) -> (i64, String) {
     (SERVER_ERROR, message)
+}
+
+/// Every node's declared reads by node id, which is what a preview asks a node's
+/// op for (PROTOCOL v1.8). Taken from the same `nodes` list the cook ran, so the
+/// dependency a snapshot keeps cannot disagree with the one the cook memoized on.
+fn nodes_reads(nodes: &[rusd_proc::CookNode]) -> BTreeMap<String, Vec<(String, String)>> {
+    nodes
+        .iter()
+        .map(|node| (node.id.clone(), node.reads.clone()))
+        .collect()
 }
 
 fn diagnostics_line(diags: &[Diagnostic]) -> String {
