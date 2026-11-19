@@ -138,6 +138,8 @@ enum Preview {
     Op(usize),
     /// Stop after the layer with this identifier.
     Layer(String),
+    /// Compose **only** this layer (the session overrides stay).
+    Solo(String),
 }
 
 /// JSON-RPC codes used here (PROTOCOL §传输).
@@ -719,6 +721,27 @@ impl Session {
     /// worked: asking to stop at a layer that is not here is a client bug, not a
     /// request to see something else.
     fn preview(&mut self, conn: u64, p: &Value) -> Result<Value, (i64, String)> {
+        // A solo stop names one layer and mutes everything else (the session
+        // layer excepted): the render of a single layer node (v1.8).
+        if let Some(solo) = p.get("solo") {
+            let Some(solo) = solo.as_str() else {
+                return Err((
+                    INVALID_PARAMS,
+                    "preview: `solo` must be a layer identifier".into(),
+                ));
+            };
+            let Some(stage) = self.stage.clone() else {
+                return Err(server_error("no scene open; call open first".into()));
+            };
+            let ordered = self.strength_order();
+            if !ordered.iter().any(|open| open == solo) {
+                let root_id = stage.root_layer().identifier().to_owned();
+                let ops = crate::composition::cook_output_layers(&stage);
+                return Err(self.unknown_preview(solo, &ops, &root_id, &ordered));
+            }
+            self.preview.insert(conn, Preview::Solo(solo.to_owned()));
+            return Ok(json!({ "solo": solo }));
+        }
         let upto = match p.get("upto") {
             None => {
                 return Err((
@@ -833,7 +856,7 @@ impl Session {
                     None
                 }
             }
-            Preview::Layer(id) => {
+            Preview::Layer(id) | Preview::Solo(id) => {
                 if self.strength_order().iter().any(|open| open == id) {
                     Some(state)
                 } else {
@@ -1266,6 +1289,13 @@ impl Session {
                 .filter(|open| Some(*open) != session_id.as_ref())
                 .cloned()
                 .collect(),
+            // Solo: everything but the named layer goes; the session layer's
+            // overrides stay, so a solo stop renders exactly that one layer.
+            Some(Preview::Solo(id)) => order
+                .iter()
+                .filter(|open| *open != id && Some(*open) != session_id.as_ref())
+                .cloned()
+                .collect(),
             None => Vec::new(),
         };
         for id in &muted {
@@ -1298,7 +1328,7 @@ impl Session {
                     params["upto"] = json!(id);
                 }
             }
-            Some(Preview::Layer(id)) => params["upto"] = json!(id),
+            Some(Preview::Layer(id) | Preview::Solo(id)) => params["upto"] = json!(id),
             None => {}
         }
         Ok(to_line(&json!({

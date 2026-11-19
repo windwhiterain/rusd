@@ -784,9 +784,18 @@ impl Shell {
     /// claiming a prefix the viewport never showed.
     fn on_tree_layer(&mut self, selection: crate::tree::TreeSelection, preview: bool) {
         let id = selection.id.clone();
+        let layer_row = selection.kind == crate::tree::TreeNodeKind::Layer;
         self.on_tree_select(selection);
         if preview {
             self.ask_preview(Some(id));
+        } else if layer_row {
+            // A plain layer row renders THAT layer alone (preview{solo}), so every
+            // layer node renders its own thing (v1.8).
+            self.net.send(NetCommand::Call {
+                tag: "preview-solo".to_owned(),
+                method: "preview".to_owned(),
+                params: serde_json::json!({ "solo": id }),
+            });
         }
     }
 
