@@ -1,0 +1,435 @@
+#usda 1.0
+
+over "World"
+{
+    def Xform "Boxes"
+    {
+        def "i000000" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.8868734836578369, -2.1689884662628174, -1.9564331769943237)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000001" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.053251266479492, -2.5527186393737793, -2.193887948989868)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000002" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (0.32537904381752014, -2.5752925872802734, -0.4901198744773865)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000003" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.03440583124756813, -1.1437653303146362, -1.5896508693695068)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000004" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.9701969027519226, -2.8895316123962402, 0.5718981027603149)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000005" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-2.7583932876586914, 2.9555604457855225, -1.1800132989883423)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000006" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (1.407212734222412, -0.70256507396698, 1.1094952821731567)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000007" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.2782839834690094, 1.5648328065872192, -2.6724910736083984)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000008" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-1.4813177585601807, -1.2263104915618896, 1.1454756259918213)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000009" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (0.41930073499679565, -0.6490865349769592, 2.9191205501556396)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000010" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.585411310195923, 0.934035062789917, -1.5217986106872559)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000011" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.37085863947868347, 0.5419912934303284, -2.6329987049102783)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000012" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (1.8194137811660767, -1.5112868547439575, 1.2221102714538574)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000013" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-2.3994929790496826, -0.9970179200172424, -1.0830157995224)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000014" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (1.4317817687988281, 0.36955663561820984, -0.507965624332428)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000015" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-1.907017469406128, 2.580749750137329, 1.0227586030960083)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000016" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-2.6274778842926025, -2.312842607498169, -1.784872055053711)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000017" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-2.191859483718872, -2.4331393241882324, -2.355886697769165)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000018" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.4765133559703827, -0.6329076886177063, 2.3790781497955322)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000019" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-1.663001537322998, 2.5356407165527344, -2.0078744888305664)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000020" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.6144964694976807, -0.642997682094574, -0.48638179898262024)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000021" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (0.01024715881794691, -2.2051126956939697, 2.8706703186035156)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000022" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-1.4325156211853027, -1.265354037284851, -0.3522530794143677)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000023" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-1.8255412578582764, 0.7816951274871826, -2.3856749534606934)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000024" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (1.9887117147445679, 2.688525915145874, -2.9900083541870117)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000025" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (0.7473521828651428, 2.5040206909179688, -1.3314272165298462)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000026" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.156440019607544, 1.083857774734497, -1.0677144527435303)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000027" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-2.973095417022705, 1.0562348365783691, -0.2182566374540329)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000028" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.4914236068725586, 0.7465799450874329, 0.5959693193435669)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000029" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-1.662908673286438, -1.226520299911499, -1.9600365161895752)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000030" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.0864102840423584, 0.6262286305427551, -2.5768179893493652)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000031" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (1.4394780397415161, -0.788868248462677, 2.3661391735076904)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000032" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.9721378087997437, 0.08533817529678345, 0.4251258671283722)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000033" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (0.0635131448507309, -1.8664026260375977, 0.34162235260009766)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000034" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (1.4876976013183594, 1.313930630683899, -2.0710644721984863)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000035" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.1404783725738525, -2.5505361557006836, -2.1560423374176025)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000036" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (0.8751392364501953, -0.978325605392456, 1.0675898790359497)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000037" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-1.0648525953292847, 2.856428861618042, -0.9659125208854675)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000038" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-2.7469072341918945, -2.0529189109802246, -2.661792278289795)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000039" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.078970193862915, -1.0386123657226563, -2.4156105518341064)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000040" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (0.2443050742149353, 2.8303887844085693, -2.8631656169891357)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000041" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.9790537357330322, 1.7626489400863647, -1.7891733646392822)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000042" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.2150404453277588, -2.546816825866699, -0.028828373178839684)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000043" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-2.4180164337158203, 0.67734295129776, -0.9071199893951416)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000044" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.2780802249908447, 0.19135062396526337, -2.3549230098724365)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000045" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.11522449553012848, -1.8412293195724487, 1.1054240465164185)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000046" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (0.8897318243980408, 0.2758413553237915, 0.8075715899467468)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000047" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (1.9099634885787964, -1.7406128644943237, -1.3828073740005493)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000048" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.107546329498291, 1.032332181930542, 1.2359204292297363)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000049" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.35714784264564514, 2.599458932876587, -0.9497982859611511)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000050" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.2285120487213135, -2.5678110122680664, -2.7710514068603516)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000051" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-1.2032026052474976, -0.5172984600067139, 2.6446659564971924)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000052" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.248514413833618, -1.3879873752593994, -0.12393002212047577)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000053" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (0.43015727400779724, 2.3921725749969482, -1.5787792205810547)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000054" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (2.47039794921875, 1.4209582805633545, -2.5810132026672363)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000055" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.021416082978248596, 0.08846794068813324, 1.7867203950881958)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000056" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-1.2949292659759521, -0.8018109202384949, 2.1781954765319824)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000057" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (0.4302121698856354, -0.43178582191467285, -1.9036364555358887)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000058" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (1.7761824131011963, 0.4297269582748413, -2.2436366081237793)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def "i000059" (
+            references = @prototypes.usda@</World/Prototypes/Box>
+        )
+        {
+            uniform point3f xformOp:translate = (-0.7964945435523987, -2.0209670066833496, 2.9635629653930664)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+    over "Samples"
+    {
+        over "points"
+        {
+            token visibility = "invisible"
+        }
+    }
+}
