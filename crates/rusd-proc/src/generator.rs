@@ -101,54 +101,16 @@ impl PrototypeError {
 /// unresolved arc, and an agent is better served by a diagnostic that names the
 /// path it looked for.
 pub fn parse_prototype(raw: &str, doc_dir: Option<&str>) -> Result<PrototypeRef, PrototypeError> {
-    let plus = raw.rfind(':').filter(|i| {
-        let rest = &raw[i + 1..];
-        rest.starts_with('/') && sdf::path(rest).is_ok() && !raw[..*i].is_empty()
-    });
-    let Some(split) = plus else {
-        let path = sdf::path(raw).map_err(|e| PrototypeError::path(raw, e))?;
-        return Ok(PrototypeRef { asset: None, path });
-    };
-    let authored = &raw[..split];
-    let prim = &raw[split + 1..];
-    let path = sdf::path(prim).map_err(|e| PrototypeError::path(raw, e))?;
-    let resolved = resolve_asset(authored, doc_dir)?;
+    let parsed = rusd_scene::reference::parse(raw, doc_dir).map_err(|e| match e {
+        rusd_scene::reference::AssetRefError::Path { why, .. } => PrototypeError::path(raw, why),
+        rusd_scene::reference::AssetRefError::Asset { authored, why } => {
+            PrototypeError::asset(&authored, why)
+        }
+    })?;
     Ok(PrototypeRef {
-        asset: Some(resolved),
-        path,
+        asset: parsed.asset,
+        path: parsed.path,
     })
-}
-
-/// An asset path as the reference authors it: absolute, `/`-spelled, so a layer
-/// identifier means the same thing from any layer that reads it (the cook layer
-/// that authors the reference is anonymous and anchors nothing).
-fn resolve_asset(authored: &str, doc_dir: Option<&str>) -> Result<String, PrototypeError> {
-    let as_path = std::path::Path::new(authored);
-    let full = if as_path.is_absolute() {
-        as_path.to_path_buf()
-    } else {
-        let Some(dir) = doc_dir else {
-            return Err(PrototypeError::asset(
-                authored,
-                "the document was opened from its text, so it has no directory to \
-                 resolve a relative layer against; open it by `path`, or spell the \
-                 prototype's layer as an absolute path",
-            ));
-        };
-        std::path::Path::new(dir).join(as_path)
-    };
-    let full = std::path::absolute(&full)
-        .map_err(|e| PrototypeError::asset(authored, format!("cannot resolve: {e}")))?;
-    if !full.is_file() {
-        return Err(PrototypeError::asset(
-            authored,
-            format!("no such layer: {}", full.display()),
-        ));
-    }
-    // A USD asset path is `/`-spelled on every host: the resolver reads `\` as a
-    // separator too, but the identifier it mints is the spelling the reference
-    // authored, and one spelling keeps the tree and the arc agreeing.
-    Ok(full.to_string_lossy().replace('\\', "/"))
 }
 
 /// The declared-read name for **a prim's box volume** (v1.5.8): the `WorldBox` a
