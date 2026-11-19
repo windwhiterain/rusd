@@ -65,17 +65,15 @@ seed = 11
 # 只吃点云（没有 points ⇒ E_INPUT_GEOMETRY）。没有 count 参数：点云里有几个点就
 # 几个实例，max_prims 只做预算截断（保原序 + W_BUDGET）。
 # 输出 /World/Tufts/i000000…；同一层对 /World/TuftSamples/points 写 visibility=invisible。
-[World.Prototypes]
-schema = "Xform"
-
-[World.Prototypes.Tuft]
-radius = 0.35
-schema = "Sphere"
-
+# 原型在**另一个层**里（v1.5.8）：素材被实例化就该是 reference，而不是 sublayer。
+# `asset:prim` 形式的 prototype 让每个实例的 reference 跨资产边界指向
+# examples/prototypes.usda 的 /World/Prototypes/Tuft；那一层由 reference 弧打开，
+# 不在本文件的 root 层栈里，所以在 composition_tree 里是独立的层（op = false）。
+# 相对资产路径按**本文档所在目录**解析（open{content} 无目录 ⇒ E_PROTOTYPE_ASSET）。
 [World.Tufts]
 input_points = "/World/TuftSamples/points"
 max_prims = 5000
-prototype = "/World/Prototypes/Tuft"
+prototype = "prototypes.usda:/World/Prototypes/Tuft"
 scale = { dist = "uniform", min = 0.7, max = 1.5 }
 schema = "RusdInstances"
 seed = 11
