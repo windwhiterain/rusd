@@ -1,14 +1,14 @@
-# rusd 0.1 — 第二阶段（独立 stage）：把 assets 当外部资产，在 quad 表面实例化一簇 box
+# rusd 0.1 — v1.9：**一个合成图**里的两段实例化
 #
-# 这一份**只认识资产**，不认识第一阶段的内部层：
+#   第一段：volume 采样 → box      /World.Volume(Cube 素材) → Samples(点) → Boxes(一簇 box)
+#   第二段：mesh 采样 → 簇          /World.Terrain(Mesh 素材) → SurfaceSamples(点) → Clusters(40 簇)
 #
-#   /World/Terrain   —— prim 级 reference 打开 terrain.usda（10×10 起伏地面素材）
-#   /World/SurfaceSamples —— RusdSamplePoints：表面面积加权采 40 个点
-#   /World/Clusters  —— RusdInstances：每个表面样本实例化**一簇 box**，
-#                       原型 = cluster.usda:/World/Boxes（第一阶段的产物导出成资产）；
-#                       cluster.usda 内部再引用 prototypes.usda 的 box 原型——资产套资产。
-#
-# 第一阶段见 box_cluster.rusd，产物用 `comp_node` 的层原文导出（见 cluster.usda 文件头）。
+# 四个 op 层 + 三个素材层，全部在**同一棵合成图**里可见：
+#   RusdSamplePoints /World/Samples        （第一段的采样）
+#   RusdInstances    /World/Boxes          （第一段：box 实例，原型来自 prototypes.usda）
+#   RusdSamplePoints /World/SurfaceSamples （第二段的采样）
+#   RusdInstances    /World/Clusters       （第二段：簇实例，原型是同栈 /World/Boxes）
+# 素材层（各自独立的 reference 层）：volume.usda / terrain.usda / prototypes.usda。
 
 [stage]
 default_prim = "/World"
@@ -25,11 +25,29 @@ look_at = [5.0, 5.0, 0.0]
 position = [22.0, -18.0, 16.0]
 schema = "Camera"
 
-# --- 实例化目标面：地形素材（prim 级 reference）-------------------------------
+# --- 第一段：volume 采样 → box -----------------------------------------------
+[World.Volume]
+references = "volume.usda:/World/Volume"
+
+[World.Samples]
+count = 60
+description = "在 Volume 盒内均匀采 60 个点（第一阶段）"
+input_points = "/World/Volume"
+schema = "RusdSamplePoints"
+seed = 11
+
+[World.Boxes]
+description = "每个点放一个 box，得到一簇 box（原型来自素材层）"
+input_points = "/World/Samples/points"
+max_prims = 5000
+prototype = "prototypes.usda:/World/Prototypes/Box"
+schema = "RusdInstances"
+seed = 11
+
+# --- 第二段：mesh（quad）采样 → 簇 -------------------------------------------
 [World.Terrain]
 references = "terrain.usda:/World/Terrain"
 
-# --- 表面采样 → 实例化一簇 box（原型是第一阶段导出的资产）---------------------
 [World.SurfaceSamples]
 count = 40
 description = "在 Terrain 表面面积加权采 40 个点（第二阶段）"
@@ -38,26 +56,26 @@ schema = "RusdSamplePoints"
 seed = 7
 
 [World.Clusters]
-description = "把第一阶段的一簇 box（cluster.usda 资产）实例化到 quad 表面"
+description = "把第一阶段的一簇 box 实例化到 quad 表面"
 input_points = "/World/SurfaceSamples/points"
 max_prims = 5000
-prototype = "cluster.usda:/World/Boxes"
+prototype = "/World/Boxes"
 schema = "RusdInstances"
 seed = 7
 
-# --- 层的说明（注记节点：无 schema + layer 键）--------------------------------
+# --- 三个素材层的说明（注记节点：无 schema + layer 键）-----------------------
+[doc.prototypes]
+description = "box 原型库（被第一段的实例跨资产引用）"
+layer = "prototypes.usda"
+
 [doc.terrain]
 description = "10×10 起伏地面素材（由 prim 级 reference 弧打开）"
 layer = "terrain.usda"
 
-[doc.cluster]
-description = "第一阶段的产物：一簇 box（由 cluster.usda 资产提供）"
-layer = "cluster.usda"
-
-[doc.prototypes]
-description = "box 原型库（被 cluster.usda 内部引用，跨两层资产）"
-layer = "prototypes.usda"
+[doc.volume]
+description = "第一阶段的采样域：一个 Cube 素材（由 prim 级 reference 弧打开）"
+layer = "volume.usda"
 
 [doc.root]
-description = "box_scatter.rusd：第二阶段（quad 表面实例化）的作者层"
+description = "box_scatter.rusd：两段实例化的作者层（volume→box，quad→簇）"
 layer = "root"
