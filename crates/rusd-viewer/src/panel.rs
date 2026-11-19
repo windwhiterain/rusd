@@ -58,15 +58,26 @@ pub enum TreeAction {
     /// A row was clicked: select it, ask its detail, and (when it stands for a
     /// prim) also select that prim and copy its path.
     Select(TreeSelection),
+    /// A **layer row** was clicked -- the layer's own first-level row, or an arc's
+    /// target-layer leaf, which is the same layer and therefore the same click.
+    ///
+    /// One variant carrying both halves, because the two are not alternatives: a layer
+    /// row selects that layer (so its `comp_node{id}` detail is shown and the tree jumps
+    /// to the layer's own row) **and**, when it is a preview control, asks the server for
+    /// the prefix composed up to it. `preview` says which: `true` for a root or cook op
+    /// layer, which is the only thing `preview{upto}` accepts today, and `false` for
+    /// every other layer, which is detail only.
+    ///
+    /// Two variants would let a row send a detail *instead of* a preview or the other way
+    /// round, which is exactly the disagreement the user's ruling removes: 点 reference
+    /// 的层叶子 == 点这个 layer 本体.
+    Layer {
+        selection: TreeSelection,
+        preview: bool,
+    },
     /// A **preview control row** was clicked: an op row (v1.4) or the root layer's
     /// row (v1.5.3). Ask the server for the prefix composed up to that layer;
     /// `None` is the 「final」 control — the whole composition.
-    ///
-    /// A third variant rather than a flag on `Select`, because the two clicks do
-    /// different things: `Select` asks `comp_node{id}` for a detail and leaves the
-    /// preview alone (`docs/PROTOCOL.md` v1.4: 点非 op 节点仍走 comp_node 详情，不改
-    /// 预览), while this asks `preview{upto}` and asks no detail. A caller that had to
-    /// tell them apart from one value would have to re-derive the panel's own rule.
     Preview(Option<String>),
     /// The 「刷新」 button: ask `composition_tree{}` again.
     Refresh,
@@ -90,6 +101,15 @@ pub struct TreePanel {
     /// panel sends — a click sends the row's own identifier — so a stale copy cannot
     /// make a click ask for the wrong prefix, only mis-colour one row for a pass.
     pub preview: Option<String>,
+    /// The layer row to bring into view on the next pass: a click on an arc's target-layer
+    /// leaf asks the tree to jump to that layer's own first-level row, which is a row a
+    /// reader may have scrolled far from (`TreePanel::scroll_target`).
+    ///
+    /// **Taken, not merely read**, at the start of the pass that draws ([`tree_panel`]),
+    /// and set again by a click during that pass: so a click schedules exactly one scroll
+    /// for the following frame, and a target the tree no longer holds just falls away
+    /// instead of pinning the view somewhere forever.
+    pub scroll_target: Option<String>,
     /// Whether a `composition_tree` request is **outstanding**.
     ///
     /// A `state_changed` now asks for the tree (a patch or an opinion can add or drop a
@@ -143,6 +163,18 @@ impl TreePanel {
         self.asking = outstanding;
     }
 
+    /// Ask the tree to bring a **layer's own row** into view on the next pass.
+    ///
+    /// This is what makes a click on an arc's target-layer leaf land somewhere: the leaf
+    /// selects that layer and asks its detail, and the layer's first-level row may be
+    /// scrolled far away, so a `Select` of a `Layer` row also sets this (the shell does
+    /// it, once, in `on_tree_select`). Nothing here checks that the tree holds the id:
+    /// [`tree_panel`] takes the target at the top of a pass and a row that never matches
+    /// simply leaves it spent.
+    pub fn scroll_to(&mut self, id: impl Into<String>) {
+        self.scroll_target = Some(id.into());
+    }
+
     /// Take a `comp_node{id}` answer.
     pub fn apply_node(&mut self, reply: Result<serde_json::Value, (i64, String)>) {
         match reply {
@@ -174,16 +206,18 @@ impl TreePanel {
 
 /// What a click on `node` asks the shell to do — **the one place that rule lives**.
 ///
-/// A **preview control row** previews the composition up to that layer: an op row
-/// (v1.4) or the root layer's row (v1.5.3, [`is_preview_control`]). Every other row
-/// is a selection, which asks `comp_node{id}` and leaves the preview alone.
-/// `panel::row` draws from this and the tests assert against it, so the picture and
-/// the wire cannot disagree about which click does which.
+/// A **layer row** is one kind of click whatever drew it: the layer's own root row, and
+/// an arc's leaf that names it, are the same layer at the same id, so they are the same
+/// [`TreeAction::Layer`] — select it, ask its detail, jump the tree to its own row, and
+/// preview up to it when it is a preview control. Every other row is a plain selection.
 pub fn action_for(node: &TreeNode) -> TreeAction {
-    if is_preview_control(node) {
-        TreeAction::Preview(Some(node.id.clone()))
-    } else {
-        TreeAction::Select(TreeSelection::of(node))
+    let selection = TreeSelection::of(node);
+    match node.kind {
+        TreeNodeKind::Layer => TreeAction::Layer {
+            selection,
+            preview: is_preview_control(node),
+        },
+        _ => TreeAction::Select(selection),
     }
 }
 
@@ -220,7 +254,13 @@ pub fn is_current_preview(node: &TreeNode, preview: Option<&str>) -> bool {
 
 /// Draw the tree panel's whole body: its status line, then either the rows or the
 /// degraded sentence.
-pub fn tree_panel(ui: &mut egui::Ui, panel: &TreePanel) -> TreeAction {
+///
+/// The panel is `&mut` for one reason: [`TreePanel::scroll_target`] is **taken** here, at
+/// the top of the pass that draws the rows, so the row it names can bring itself into
+/// view. A click made during this pass sets it again for the next frame (the shell does
+/// that, from the action `row` returns), which is why one click asks for exactly one
+/// scroll and a target the rebuilt tree no longer holds simply falls away.
+pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
     let mut refresh = false;
     let mut final_clicked = false;
     ui.horizontal(|ui| {
@@ -274,9 +314,14 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &TreePanel) -> TreeAction {
         ui.label("（尚无合成树）");
         return TreeAction::None;
     }
+    // The row to bring into view, taken so it is spent by this pass. Handed down as
+    // `&mut` and cleared by the row that uses it: the tree holds a layer twice (its own
+    // first-level row and every arc leaf that names it), and clearing is what keeps the
+    // second match from scrolling somewhere else afterwards.
+    let mut scroll_to = panel.scroll_target.take();
     // **[v1.4] the whole body reads which rows are previews from the rows themselves.**
-    // `row` returns a `TreeAction`, not a `TreeSelection`, so the op-row rule lives in
-    // exactly one place: the `op` flag `crate::tree::roots` set.
+    // `row` returns a `TreeAction`, not a `TreeSelection`, so the click rule lives in
+    // exactly one place: [`action_for`], over the flags `crate::tree::roots` set.
     let mut action = TreeAction::None;
     egui::ScrollArea::vertical()
         .id_salt("composition-tree")
@@ -291,6 +336,7 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &TreePanel) -> TreeAction {
                         root_index,
                         panel.selection.as_ref(),
                         panel.preview.as_deref(),
+                        &mut scroll_to,
                     )
                 {
                     action = a;
@@ -309,6 +355,12 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &TreePanel) -> TreeAction {
 /// collapsed/expanded state between them: opening one would open the other, and a
 /// click on one would be read as a click on the other. `(id, root, depth)` is unique
 /// per row of a drawn tree, because a row's depth and its root each have one path.
+///
+/// `scroll_to` is the id the panel is bringing into view (v1.5.8). **Only the
+/// first-level row of that layer scrolls**: a layer is drawn once as its own root row
+/// and again as a leaf under every arc that reaches it, so `depth == 0` is what says
+/// which of them a reader means by "that layer's row". The row that scrolls clears the
+/// target, so the leaf's later match in the same pass has nothing left to do.
 fn row(
     ui: &mut egui::Ui,
     node: &TreeNode,
@@ -316,11 +368,12 @@ fn row(
     root: usize,
     selected: Option<&TreeSelection>,
     preview: Option<&str>,
+    scroll_to: &mut Option<String>,
 ) -> Option<TreeAction> {
     let is_selected = selected.is_some_and(|s| s.id == node.id);
-    // A preview control row that is **the current preview** is marked too: the user
-    // needs to see where they are, and the current prefix is not a selection (it
-    // does not follow a `comp_node` ask).
+    // A row that is **the current preview** is marked too: the user needs to see where
+    // they are, and the current prefix is not a selection (it does not follow a
+    // `comp_node` ask).
     let is_current_preview = is_current_preview(node, preview);
     // The row's **drawn** title: an op row already carries the `<=` marker in its label
     // (v1.4), and the root row gains it while it is the prefix in force (v1.5.3).
@@ -341,9 +394,19 @@ fn row(
         text
     };
 
-    // What a click on this row means: a preview for a control row (an op layer's or
-    // the root layer's), a selection otherwise.
+    // What a click on this row means -- **one rule, for every row** ([`action_for`]).
+    //
+    // This is what makes an arc's target-layer leaf and the layer's own row the same
+    // click (the user's ruling: 点 reference 的层叶子 == 点这个 layer 本体). The leaf is a
+    // `Layer` row carrying the target's id *and its `op`/`root` flags*
+    // (`crate::tree::layer_subtree`), so the one rule answers for both: the same
+    // `comp_node{layer id}` detail, the same `preview{upto}` for a control, and the same
+    // `scroll_target` (set by the shell from the selection). Nothing here asks which of
+    // the two rows it is drawing.
     let click_action = action_for;
+
+    // Whether this row is the one the panel was asked to bring into view.
+    let wants_scroll = depth == 0 && scroll_to.as_deref() == Some(node.id.as_str());
 
     let mut clicked: Option<TreeAction> = None;
     if is_preview_control(node) {
@@ -354,12 +417,16 @@ fn row(
         // is drawn as a plain row with its subtree always visible.
         ui.horizontal(|ui| {
             indent(ui, depth);
-            if ui
+            let response = ui
                 .selectable_label(is_current_preview, text)
-                .on_hover_text(preview_hover_text(node))
-                .clicked()
-            {
-                clicked = Some(TreeAction::Preview(Some(node.id.clone())));
+                .on_hover_text(row_hover_text(node, true));
+            if wants_scroll {
+                response.scroll_to_me(Some(Align::Center));
+                *scroll_to = None;
+            }
+            if response.clicked() {
+                // The same rule as every other row: a control layer row is a layer row.
+                clicked = Some(click_action(node));
             }
             // v1.5: the row's second half — `{input} → {output summary}` — is drawn
             // **beside** the title and is not itself a control: one row, one click,
@@ -368,17 +435,21 @@ fn row(
             subtitle(ui, node);
         });
         for child in &node.children {
-            if let Some(a) = row(ui, child, depth + 1, root, selected, preview) {
+            if let Some(a) = row(ui, child, depth + 1, root, selected, preview, scroll_to) {
                 clicked = Some(a);
             }
         }
     } else if node.children.is_empty() {
         ui.horizontal(|ui| {
             indent(ui, depth);
-            if ui
+            let response = ui
                 .selectable_label(is_selected || is_current_preview, text)
-                .clicked()
-            {
+                .on_hover_text(row_hover_text(node, false));
+            if wants_scroll {
+                response.scroll_to_me(Some(Align::Center));
+                *scroll_to = None;
+            }
+            if response.clicked() {
                 clicked = Some(click_action(node));
             }
         });
@@ -425,17 +496,21 @@ fn row(
                 open = !open;
                 ui.data_mut(|d| d.insert_temp(id.with("open"), open));
             }
-            if ui
+            let response = ui
                 .selectable_label(is_selected || is_current_preview, text)
-                .clicked()
-            {
+                .on_hover_text(row_hover_text(node, false));
+            if wants_scroll {
+                response.scroll_to_me(Some(Align::Center));
+                *scroll_to = None;
+            }
+            if response.clicked() {
                 clicked = Some(click_action(node));
             }
             subtitle(ui, node);
         });
         if open {
             for child in &node.children {
-                if let Some(a) = row(ui, child, depth + 1, root, selected, preview) {
+                if let Some(a) = row(ui, child, depth + 1, root, selected, preview, scroll_to) {
                     clicked = Some(a);
                 }
             }
@@ -455,8 +530,8 @@ fn row(
 /// state, rather than baked into a label the model cannot re-derive when the preview
 /// moves.
 ///
-/// Pure, so the marker is testable without a screen: `(row, is_current_preview)` in,
-/// the drawn text out.
+/// A row titled by its **description** (the user's ruling for every described layer) is a
+/// control row like any other: the marker is still about the click, not about the text.
 pub fn control_row_title(node: &TreeNode, is_current_preview: bool) -> String {
     if is_current_preview && !node.op {
         format!("≤ {}", node.label)
@@ -465,23 +540,31 @@ pub fn control_row_title(node: &TreeNode, is_current_preview: bool) -> String {
     }
 }
 
-/// What a control row says when the pointer rests on it: which click it is.
+/// What a row says when the pointer rests on it: what its click means (for a control
+/// row), then the **wire identifier** of the layer the row stands for.
 ///
-/// Two sentences rather than one, because the two prefixes are not the same thing: an
-/// op row's `upto` includes that op, and the root row's includes **no** op at all
-/// (v1.5.3). Both name the identifier the wire takes, so a user reading the tooltip
-/// can quote it.
-fn preview_hover_text(node: &TreeNode) -> String {
-    if node.op {
-        format!("预览到此 op 之前：preview{{upto: \"{}\"}}", node.id)
-    } else {
-        format!(
-            "预览到根层（不含任何 op）：preview{{upto: \"{}\"}}",
-            node.id
-        )
+/// The identifier is here and nowhere else on the row, because a row is titled by a
+/// display name now: `anon:60:rusd_instances.usda` is what a request takes and what a log
+/// line shows, so a user who needs to quote it hovers rather than reading it off every
+/// row. A row whose label already *is* a wire spelling (a prim path, an arc id, a
+/// variant set) carries no `hover` and gets an empty tooltip.
+fn row_hover_text(node: &TreeNode, control: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if control {
+        parts.push(if node.op {
+            format!("预览到此 op 之前：preview{{upto: \"{}\"}}", node.id)
+        } else {
+            format!(
+                "预览到根层（不含任何 op）：preview{{upto: \"{}\"}}",
+                node.id
+            )
+        });
     }
+    if let Some(hover) = &node.hover {
+        parts.push(hover.clone());
+    }
+    parts.join("\n")
 }
-
 fn indent(ui: &mut egui::Ui, depth: usize) {
     if depth > 0 {
         ui.add_space(8.0 * depth as f32);
@@ -533,7 +616,9 @@ pub fn detail_panel(ui: &mut egui::Ui, panel: &TreePanel) {
                 prim_detail(ui, p, panel.model.tree());
                 return;
             }
-            for line in detail.lines() {
+            // The tree is passed so every line that names a layer names it the way the
+            // tree's own rows do: one layer, one name, everywhere.
+            for line in detail.lines(panel.model.tree()) {
                 ui.label(RichText::new(line).monospace());
             }
         });
@@ -683,4 +768,3 @@ impl TreePanel {
 pub fn copy_payload(sel: &TreeSelection) -> Option<String> {
     clipboard_for(sel)
 }
-

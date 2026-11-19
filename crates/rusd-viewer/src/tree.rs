@@ -79,6 +79,19 @@ pub struct LayerNode {
     /// `None` when the join is missing; the reader falls back to the layer's own id,
     /// which is the contract's fallback (`output` = 条目 id).
     pub output: Option<String>,
+    /// The layer's **authored description**: the `description` every layer entry now
+    /// carries, from the annotation node its author wrote it on (`docs/PROTOCOL.md`).
+    ///
+    /// Not an op-only field: the root layer, the session layer, a document's sublayers
+    /// and a material layer all send one when they have been described. A layer shown
+    /// by its description is the user's ruling (「有 description 的节点，行和详情都把
+    /// Description 放最前」), so the row's title and the detail's first line are this
+    /// sentence, and the name derived from the identifier stands beside it.
+    ///
+    /// `None` when the answer carried none -- a server from before the field, or a
+    /// layer nobody described -- and then the row and the header are exactly what they
+    /// were before it existed.
+    pub description: Option<String>,
 }
 
 /// One composition arc: an edge between two layers at two prims.
@@ -180,10 +193,14 @@ impl<'a> ArcGroup<'a> {
 
     /// The row's label: where the edge points, and `xN` when it stands for more than
     /// one arc (v1.5.4: a group of N >= 2 gets the suffix, N = 1 does not).
-    pub fn label(&self) -> String {
+    ///
+    /// `target` is the target layer's [`layer_display_name`], not its id: the label is
+    /// read by a user, and the id (`anon:60:...`) is the wire's spelling of the same
+    /// layer. The row's tooltip is where the identifier stays.
+    pub fn label(&self, target: &str) -> String {
         let edge = format!(
             "{} \u{2192} {}:{}",
-            self.key.kind, self.key.target_layer, self.key.target_prim
+            self.key.kind, target, self.key.target_prim
         );
         match self.count() {
             1 => edge,
@@ -270,6 +287,9 @@ impl CompositionTree {
                     op_name: optional_string(l, "op_name"),
                     input: optional_string(l, "input"),
                     output: optional_string(l, "output"),
+                    // Every layer may carry one, and its absence is absence: nothing
+                    // is invented for a layer nobody described.
+                    description: optional_string(l, "description"),
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
@@ -411,6 +431,12 @@ impl CompositionTree {
     pub fn layer(&self, id: &str) -> Option<&LayerNode> {
         self.layers.iter().find(|l| l.id == id)
     }
+
+    /// **The one name this tree shows `id` by** -- [`layer_display_name`] over its own
+    /// layer list, so a caller holding a tree does not have to pass the list itself.
+    pub fn display_name(&self, id: &str) -> String {
+        layer_display_name(&self.layers, id)
+    }
 }
 
 /// One node of the tree, as the panel draws it: what a click selects and what
@@ -424,11 +450,20 @@ pub struct TreeNode {
     /// What the row says beside its icon.
     pub label: String,
     /// A second, dimmer piece of text on the row (v1.5: an op row's
-    /// `{input} -> {output summary}`), or `None` for every row that has none.
+    /// `{input} -> {output summary}`, or the display name a row titled by its
+    /// description no longer shows), or `None` for every row that has none.
     ///
     /// Carried on the row, like `op`, so the panel draws the subtitle from the row it
     /// already draws rather than re-deriving which rows are ops.
     pub secondary: Option<String>,
+    /// The line the row's **hover tooltip** adds under the sentence about its click.
+    ///
+    /// This is where a **wire identifier** lives now that a row is titled by a display
+    /// name: `anon:60:rusd_instances.usda` is what a request takes and what a log line
+    /// shows, and a user who needs to quote it can hover rather than read it off every
+    /// row. A row whose label already is a wire spelling (a prim path, an arc id, a
+    /// variant set's name) carries none.
+    pub hover: Option<String>,
     /// The prim path this node stands for, when it stands for one: a prim node's
     /// own, an arc's *target* prim, a variant set's prim. Selecting such a row is
     /// also selecting the prim in the viewport (`docs/PROTOCOL.md` v1.2: 「点选
@@ -506,10 +541,11 @@ impl TreeNodeKind {
 ///
 /// A layer row that is a **cook op** (v1.4) is drawn with `op: true` and a `≤` marker,
 /// so the panel can tell a preview control from a plain structural row. From v1.5 its
-/// title is the generator's schema name ([`op_row_title`]) and its subtitle reads
+/// title is the generator's schema name ([`display_name_of`]) and its subtitle reads
 /// `{input} → {output summary}` ([`op_row_subtitle`]); the identifier that
 /// `preview{upto}` takes is still the row's `id`, and its elided form is the subtitle's
-/// second half.
+/// second half. A row whose layer has an authored description is titled by that instead
+/// ([`layer_row_label`]), which is the user's ruling for every layer the wire describes.
 ///
 /// The stack's **root layer** row is the *other* preview control (v1.5.3,
 /// “每一档前缀都要看得到”): its click previews `root + overrides`
@@ -544,15 +580,41 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     for group in arc_groups(tree, &layer.id) {
         // A leaf naming the target layer (see `roots`): the edge is visible, and
         // the branch it points at is not copied.
-        let mut kids: Vec<TreeNode> = if group.representative().crosses_layers() {
+        let kids: Vec<TreeNode> = if group.representative().crosses_layers() {
+            // **The target layer's leaf is the layer's own row** (the user's ruling: a
+            // click here must equal a click on the layer itself). Same id, so the same
+            // `comp_node{layer id}` ask, the same row lookup, the same scroll target;
+            // and the same `op`/`root` flags, because those are what
+            // [`crate::panel::action_for`] reads to decide what a click means. Copying
+            // them is what makes the two clicks one rule rather than two branches that
+            // have to be kept in step: the panel decides for both, and it decides by the
+            // target layer's own kind of row.
+            //
+            // The label names the layer rather than spelling its identifier: this leaf
+            // *is* a mention of that layer, and the user's ruling is that a layer reads
+            // the same everywhere.
+            let target = tree.layer(&group.key.target_layer);
             vec![TreeNode {
                 id: group.key.target_layer.clone(),
                 kind: TreeNodeKind::Layer,
-                label: format!("\u{2192} {}", group.key.target_layer),
+                label: match target {
+                    Some(t) => format!(
+                        "\u{2192} {}",
+                        layer_description(t).unwrap_or_else(|| display_name_of(t))
+                    ),
+                    None => format!("\u{2192} {}", strip_anon_prefix(&group.key.target_layer)),
+                },
                 prim: None,
-                op: false,
-                root: false,
+                op: target.is_some_and(|t| t.op),
+                root: target.is_some_and(is_root_layer),
                 secondary: None,
+                // The leaf names the layer on the row, so its tooltip says what the row
+                // *is* -- the edge that reached it -- and the wire identifier of the
+                // layer, which the `→ name` label no longer spells.
+                hover: Some(format!(
+                    "\u{2192} {} 的层 {} · 点击等于点该层本体",
+                    group.key.kind, group.key.target_layer
+                )),
                 children: Vec::new(),
             }]
         } else {
@@ -599,11 +661,12 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         children.push(TreeNode {
             id,
             kind: TreeNodeKind::Arc,
-            label: group.label(),
+            label: group.label(&layer_display_name(&tree.layers, &group.key.target_layer)),
             prim,
             op: false,
             root: false,
             secondary: None,
+            hover: None,
             children: kids,
         });
     }
@@ -630,6 +693,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 op: false,
                 root: false,
                 secondary: None,
+                hover: None,
                 children: vset
                     .variants
                     .iter()
@@ -645,6 +709,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                         op: false,
                         root: false,
                         secondary: None,
+                        hover: None,
                         children: Vec::new(),
                     })
                     .collect(),
@@ -658,34 +723,60 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     TreeNode {
         id: layer.id.clone(),
         kind: TreeNodeKind::Layer,
-        label: if layer.op {
-            // A preview control (v1.4): the row's title is what says *which* op this
-            // is, and v1.5 makes that the generator's own schema name instead of an
-            // anonymous layer identifier; `≤` is the marker that says clicking it
-            // previews *up to* here rather than inspecting it. The identifier is not
-            // lost: it is the row's subtitle's second half (`op_row_subtitle`), and
-            // it is what `preview{upto}` takes.
-            format!(
-                "≤ {} [{} · {}/{}]",
-                op_row_title(layer),
-                layer.kind,
-                layer.strength,
-                tree.layers.len()
-            )
-        } else {
-            format!(
-                "{} [{} · {}/{}]",
-                layer.id,
-                layer.kind,
-                layer.strength,
-                tree.layers.len()
-            )
-        },
+        label: layer_row_label(tree, layer),
         prim: None,
         op: layer.op,
         root: is_root_layer(layer),
-        secondary: layer.op.then(|| op_row_subtitle(layer)),
+        secondary: layer_row_secondary(tree, layer),
+        hover: Some(format!("层 {}", layer.id)),
         children,
+    }
+}
+
+/// A layer row's **title**: its [`display name`](display_name_of), then the facts the
+/// row is read with -- `[kind · rank/total]`, and `≤` for a cook op's preview control.
+///
+/// A layer with an authored description is titled by it instead: the user's ruling is
+/// that Description comes first, so the sentence is the title and the display name
+/// moves to the subtitle ([`layer_row_secondary`]). The identifier (`anon:60:...`) is in
+/// neither: it is the wire's, and the row's hover tooltip is where a reader finds it.
+///
+/// The `≤` marker is the op row's only (v1.4); the root row's is the panel's to add,
+/// and it adds it while that row *is* the prefix in force (v1.5.3), which is a fact only
+/// the panel holds.
+pub fn layer_row_label(tree: &CompositionTree, layer: &LayerNode) -> String {
+    let rank = format!(
+        "[{} \u{00b7} {}/{}]",
+        layer.kind,
+        layer.strength,
+        tree.layers.len()
+    );
+    let title = match layer_description(layer) {
+        Some(description) => description,
+        None => display_name_of(layer),
+    };
+    if layer.op {
+        format!("\u{2264} {title} {rank}")
+    } else {
+        format!("{title} {rank}")
+    }
+}
+
+/// A layer row's dim second half: its display name when the description is the title,
+/// and a cook op's `{input} → {output}` after that.
+///
+/// `None` for a row with neither a description nor an op, which is every plain
+/// sublayer and (from v1.5.1) every op the server sent no metadata for.
+pub fn layer_row_secondary(tree: &CompositionTree, layer: &LayerNode) -> Option<String> {
+    let named = layer_description(layer).map(|_| display_name_of(layer));
+    match (named, layer.op) {
+        (Some(named), true) => Some(format!(
+            "{named} \u{00b7} {}",
+            op_row_subtitle(layer, Some(tree))
+        )),
+        (Some(named), false) => Some(named),
+        (None, true) => Some(op_row_subtitle(layer, Some(tree))),
+        (None, false) => None,
     }
 }
 
@@ -714,20 +805,26 @@ pub fn is_pseudo_root(path: &str) -> bool {
 /// The header line of a layer section in a prim's detail: the layer, and what the tree
 /// knows about it.
 ///
-/// `{id} [{kind} · {strength}]`, with a cook op's generator name after it -- the same
-/// facts, in the same words, that the layer's own row prints, so a section and the row
-/// it came from read as one thing. `None` is a layer the tree does not list: its
-/// identifier alone, because a kind or a rank would have to be invented.
+/// `{display name} [{kind} · {strength}]`, with a cook op's generator name after it --
+/// the same name and the same facts the layer's own row prints, because a section and
+/// the row it came from are one layer and a reader reads one name for it.
+///
+/// The layer's **description is not repeated** here: it has its own line above this one
+/// ([`NodeDetail::lines`] prints it first, per the user's ruling), so a header that also
+/// carried it would say it twice.
+///
+/// `None` is a layer the tree does not list. Its kind and rank would have to be
+/// invented, so the header is the name the identifier gives up on its own
+/// ([`strip_anon_prefix`]) and nothing else: still a name and never the `anon:N:`
+/// spelling, whose `N` means nothing to a reader.
 pub fn layer_header(id: &str, layer: Option<&LayerNode>) -> String {
     let Some(layer) = layer else {
-        return id.to_owned();
+        return strip_anon_prefix(id);
     };
+    let name = display_name_of(layer);
     match &layer.op_name {
-        Some(name) => format!(
-            "{} [{} \u{00b7} {}] {name}",
-            layer.id, layer.kind, layer.strength
-        ),
-        None => format!("{} [{} \u{00b7} {}]", layer.id, layer.kind, layer.strength),
+        Some(op) if layer.op => format!("{name} [{} \u{00b7} {}] {op}", layer.kind, layer.strength),
+        _ => format!("{name} [{} \u{00b7} {}]", layer.kind, layer.strength),
     }
 }
 
@@ -750,37 +847,45 @@ pub const PARAMETRIC: &str = "(parametric)";
 /// it: v1.5.1's 「output 摘要 = identifier 截断 ≤ 20 字符 + …」.
 pub const OUTPUT_SUMMARY_CHARS: usize = 20;
 
-/// An op row's **title**: the generator's schema name (`RusdSamplePoints`,
-/// `RusdInstances`, `RusdScatter`), or the layer's own identifier when the server
-/// sent no `op_name`.
-///
-/// The fallback is the pre-v1.5 label, so a server from before this field existed
-/// draws exactly the rows it used to (`docs/PROTOCOL.md` v1.5.1: `op_name` null =>
-/// 回退 anon identifier).
-pub fn op_row_title(layer: &LayerNode) -> &str {
-    layer.op_name.as_deref().unwrap_or(layer.id.as_str())
+/// An op's **schema name** when the answer carried one (`RusdSamplePoints`,
+/// `RusdInstances`, `RusdScatter`), which is what [`display_name_of`] names an op layer
+/// by. `None` for a layer the server built no `op_name` for, which is a pre-v1.5 server
+/// or a stack the cook never built; such a row falls back to the name its identifier
+/// gives up, exactly as it did before v1.5.
+pub fn op_row_schema_name(layer: &LayerNode) -> Option<&str> {
+    layer.op_name.as_deref()
 }
 
-/// An op row's **subtitle**: `{input} → {output summary}` (v1.5.1).
+/// An op row's **subtitle**: `{input} → {output name}` (v1.5.1).
 ///
 /// `input` is `None` for a generator with no input geometry, printed as
-/// [`PARAMETRIC`]; the output half is [`output_summary`] of the op's output layer.
-pub fn op_row_subtitle(layer: &LayerNode) -> String {
+/// [`PARAMETRIC`]; the output half names the op's output layer by the same display name
+/// its own row would show ([`output_summary`]).
+/// `{input} → {output name}` (v1.5.1), the output named the way its own row names it.
+pub fn op_row_subtitle(layer: &LayerNode, tree: Option<&CompositionTree>) -> String {
     format!(
         "{} → {}",
         layer.input.as_deref().unwrap_or(PARAMETRIC),
-        output_summary(layer)
+        output_summary(layer, tree)
     )
 }
 
-/// An op's output identifier, elided to [`OUTPUT_SUMMARY_CHARS`] characters.
+/// An op's output layer, **named the way the rest of the viewer names it**, then elided
+/// to [`OUTPUT_SUMMARY_CHARS`] characters.
 ///
-/// The output layer's own id is the fallback when the server's join to
-/// `CookOp.layer_id` was missing (`docs/PROTOCOL.md` v1.5.1: join 缺失 =>
-/// `output` = 条目 id). Counted in **characters**, not bytes, so a non-ASCII
-/// identifier is elided at a boundary a reader can see.
-pub fn output_summary(layer: &LayerNode) -> String {
-    elide(layer.output.as_deref().unwrap_or(layer.id.as_str()))
+/// The identifier the server joined (`CookOp.layer_id`, or the entry's own id when the
+/// join was missing, `docs/PROTOCOL.md` v1.5.1) is what arrives; the `anon:N:` prefix is
+/// dropped and, when the tree lists that layer, its display name is used -- so an op's
+/// subtitle names its output the way that output's own row does (the user's ruling: one
+/// layer, one name). Counted in **characters**, not bytes, so a non-ASCII name is elided
+/// at a boundary a reader can see.
+pub fn output_summary(layer: &LayerNode, tree: Option<&CompositionTree>) -> String {
+    let out = layer.output.as_deref().unwrap_or(layer.id.as_str());
+    let named = match tree.and_then(|t| t.layer(out)) {
+        Some(target) => display_name_of(target),
+        None => strip_anon_prefix(out),
+    };
+    elide(&named)
 }
 
 /// [`OUTPUT_SUMMARY_CHARS`] characters, then `…` when there was more.
@@ -790,6 +895,86 @@ pub fn elide(id: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// **The one name a layer is shown by**, wherever this viewer names it.
+///
+/// The user's ruling is that the same layer must read the same everywhere -- the tree
+/// row, an arc's label, a detail section's header, the top bar's preview badge -- and
+/// the identifier (`anon:60:rusd_instances.usda`) is the one spelling that is *not* a
+/// name: it is a wire identifier, and it is kept for the tooltip and for the request
+/// that takes it. So the layer is named once, here, and every drawing site asks.
+///
+/// The rule, in this order:
+///
+/// 1. a **cook op's** output layer is named by its generator schema (`RusdInstances`),
+///    because that is what says which op it is;
+/// 2. the stack's **root** and the **session** layer are named by their kind
+///    (`root`, `session`) -- they are the two layers whose identity is a role, and
+///    they have no file name that would mean anything;
+/// 3. every other layer is named by its **basename without the `anon:N:` prefix**
+///    (`rusd_instances.usda`), which is the file's own name and survives every
+///    renumber the server's anonymous ids go through;
+/// 4. an `id` no layer answers to falls back to the id itself -- a caller naming a
+///    layer the tree does not list still gets a sentence rather than nothing.
+///
+/// Pure over the layer list, so a row, a header and the badge cannot disagree about a
+/// name: they call this with the same list and the same id.
+pub fn layer_display_name(layers: &[LayerNode], id: &str) -> String {
+    match layers.iter().find(|l| l.id == id) {
+        Some(layer) => display_name_of(layer),
+        None => id.to_owned(),
+    }
+}
+
+/// [`layer_display_name`] for a layer the caller already holds, so a row does not look
+/// its own layer up again.
+pub fn display_name_of(layer: &LayerNode) -> String {
+    if layer.op
+        && let Some(name) = &layer.op_name
+    {
+        return name.clone();
+    }
+    match layer.kind.as_str() {
+        "root" => "root".to_owned(),
+        "session" => "session".to_owned(),
+        _ => strip_anon_prefix(&layer.id),
+    }
+}
+
+/// `layer`'s **authored description**, collapsed to one line: what a row or a header
+/// shows first when the layer has one, and `None` when it does not.
+///
+/// Collapsed because a description is a sentence that may be wrapped in the layer's
+/// annotation node, and a row is one line: a newline in a label would break the tree's
+/// own layout. The panel's detail prints it as it arrived.
+pub fn layer_description(layer: &LayerNode) -> Option<String> {
+    layer.description.as_deref().map(one_line)
+}
+
+/// `text` with every run of whitespace folded to one space, and the ends trimmed.
+pub fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `id` without an `anon:<n>:` prefix: the layer's own file name.
+///
+/// The server names an anonymous layer `anon:<n>:<file>`, the `<n>` being a per-stage
+/// counter that moves whenever the stack is rebuilt. The prefix therefore carries no
+/// identity at all, and dropping it is what lets one layer read the same name across a
+/// rebuild. An `id` with no such prefix (an authored path, a named layer) is returned
+/// unchanged, as is a bare `anon:<n>` with no file behind it.
+pub fn strip_anon_prefix(id: &str) -> String {
+    let Some(rest) = id.strip_prefix("anon:") else {
+        return id.to_owned();
+    };
+    let Some((n, file)) = rest.split_once(':') else {
+        return id.to_owned();
+    };
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) || file.is_empty() {
+        return id.to_owned();
+    }
+    file.to_owned()
 }
 
 /// One `comp_node{id}` answer, parsed into the four shapes v1.2 defines.
@@ -810,6 +995,9 @@ pub struct LayerDetail {
     pub strength: usize,
     pub usda_text: String,
     pub spec_count: usize,
+    /// The layer's authored description when `comp_node` carries one, which is the
+    /// same sentence `composition_tree` sends for the same layer. Absent is absent.
+    pub description: Option<String>,
 }
 
 /// An arc's detail: its ends and the target prim spec's authored fields.
@@ -971,6 +1159,7 @@ impl NodeDetail {
                     .unwrap_or("")
                     .to_owned(),
                 spec_count: value.get("spec_count").and_then(Value::as_u64).unwrap_or(0) as usize,
+                description: optional_string(value, "description"),
             })),
             "arc" => Ok(NodeDetail::Arc(ArcDetail {
                 id: string(value, "id", "comp_node(arc)")?,
@@ -1042,16 +1231,42 @@ impl NodeDetail {
 
     /// The panel's lines for this detail, so what a test asserts and what the
     /// panel draws are the same strings.
-    pub fn lines(&self) -> Vec<String> {
+    ///
+    /// `tree`, when the caller has one, is what lets every line that names a layer name
+    /// it the way the rest of the viewer does ([`layer_display_name`]). Without it a
+    /// line still reads a name, because the identifier alone gives one up
+    /// ([`strip_anon_prefix`]); what is lost is only a kind and a rank, which no line
+    /// here invents.
+    pub fn lines(&self, tree: Option<&CompositionTree>) -> Vec<String> {
+        let name = |id: &str| match tree {
+            Some(t) => layer_display_name(&t.layers, id),
+            None => strip_anon_prefix(id),
+        };
         match self {
             NodeDetail::Layer(l) => {
-                let mut out = vec![
-                    format!("layer {}", l.identifier),
-                    format!(
-                        "{} · strength {} · {} specs",
-                        l.kind, l.strength, l.spec_count
-                    ),
-                ];
+                // **The description first** when the layer has one (the user's ruling:
+                // 有 description 的节点，行和详情都把 Description 放最前): the sentence its
+                // author wrote says what the layer is, and the name, kind, spec count and
+                // identifier follow it. An empty description is no description.
+                //
+                // The tree's copy stands in when this answer carried none: both are the
+                // same annotation node's text, and the row is titled by it, so a detail
+                // that dropped it would disagree with the row it came from.
+                let description = l
+                    .description
+                    .as_deref()
+                    .filter(|d| !d.trim().is_empty())
+                    .map(str::to_owned)
+                    .or_else(|| layer_description(tree.and_then(|t| t.layer(&l.id))?));
+                let mut out: Vec<String> = match &description {
+                    Some(d) => d.lines().map(str::to_owned).collect(),
+                    None => Vec::new(),
+                };
+                out.push(layer_header(&l.id, tree.and_then(|t| t.layer(&l.id))));
+                out.push(format!(
+                    "{} specs \u{00b7} identifier {}",
+                    l.spec_count, l.identifier
+                ));
                 let mut body: Vec<String> = l.usda_text.lines().map(str::to_owned).collect();
                 out.append(&mut body);
                 out
@@ -1060,8 +1275,11 @@ impl NodeDetail {
                 let mut out = vec![
                     format!("arc {} ({})", a.id, a.kind),
                     format!(
-                        "{}:{} → {}:{}",
-                        a.source_layer, a.source_prim, a.target_layer, a.target_prim
+                        "{}:{} \u{2192} {}:{}",
+                        name(&a.source_layer),
+                        a.source_prim,
+                        name(&a.target_layer),
+                        a.target_prim
                     ),
                     format!("target spec fields: {}", a.target_spec_fields.len()),
                 ];
@@ -1075,20 +1293,22 @@ impl NodeDetail {
                 // *layer* says what, not which prim has opinions. Each section is headed
                 // by the layer and followed by that layer's spec line and attributes.
                 //
-                // `lines()` has no tree here, so the headers are the bare ones
-                // [`layer_header`] gives for an unknown layer; the panel draws
-                // [`PrimDetail::layer_sections`] with the tree, which is what knows a
-                // layer's kind and strength. Both share this body's grouping, and the
-                // panel's copy is the one with the fuller headers.
+                // The header names the layer the way its row does, so a section and the
+                // row it came from read as one layer. [`PrimDetail::layer_sections`] is
+                // the panel's copy of this grouping, with the fuller header.
                 let mut out = vec![format!("prim {}", p.path)];
                 out.push(format!(
-                    "{} layers author it · {} arcs out · {} variant sets",
+                    "{} layers author it \u{00b7} {} arcs out \u{00b7} {} variant sets",
                     p.opinions.len(),
                     p.arcs_out.len(),
                     p.variant_sets.len()
                 ));
                 for op in &p.opinions {
-                    out.push(format!("\u{2500}\u{2500} {} [{}]", op.layer, op.specifier));
+                    out.push(format!(
+                        "\u{2500}\u{2500} {} [{}]",
+                        name(&op.layer),
+                        op.specifier
+                    ));
                     for f in &op.fields {
                         out.push(format!("    {} = {}", f.name, f.value_text()));
                     }
@@ -1102,14 +1322,14 @@ impl NodeDetail {
                     format!("variants: {}", v.variants.join(", ")),
                 ];
                 for (variant, layers) in &v.per_variant {
-                    out.push(format!("  {variant} authored in {}", layers.join(", ")));
+                    let named: Vec<String> = layers.iter().map(|l| name(l)).collect();
+                    out.push(format!("  {variant} authored in {}", named.join(", ")));
                 }
                 out
             }
         }
     }
 }
-
 fn parse_opinion(v: &Value) -> Result<Opinion, String> {
     Ok(Opinion {
         layer: string(v, "layer", "opinions[]")?,
@@ -1426,4 +1646,3 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
-
