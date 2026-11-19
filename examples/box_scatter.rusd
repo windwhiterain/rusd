@@ -36,8 +36,7 @@ schema = "Camera"
 
 # --- 第一阶段的输入与产出 ----------------------------------------------------
 [World.Volume]
-schema = "Cube"
-size = 6.0
+references = "volume.usda:/World/Volume"
 
 [World.Samples]
 count = 60
@@ -91,3 +90,6 @@ layer = "root"
 [doc.terrain]
 description = "10x10 起伏地面素材（由 prim 级 reference 弧打开，不在本文件的层栈里）"
 layer = "terrain.usda"
+[doc.volume]
+description = "第一阶段的采样域：一个 Cube 素材（由 prim 级 reference 弧打开）"
+layer = "volume.usda"
