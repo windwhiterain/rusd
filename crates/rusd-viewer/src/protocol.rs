@@ -179,6 +179,23 @@ pub fn preview_params(upto: Option<&str>) -> Value {
     json!({"upto": upto.map(|u| Value::String(u.to_owned())).unwrap_or(Value::Null)})
 }
 
+/// `preview{solo}`: ask for **one layer's content and nothing else** — every other layer
+/// muted, the session layer excepted ([`preview_params`]'s prefix is the other
+/// composition, `preview{upto}`).
+///
+/// This is the material (reference / plain sublayer) row's click: an op or root row asks
+/// for `upto`, which is a *cook prefix*, and a document's own sublayers are not that —
+/// they are only reachable by showing them alone. Which of the two a row sends is the
+/// tree's to say (`crate::tree::TreeNode::op` / `root`), never a list of layer names
+/// kept anywhere else.
+///
+/// The reply and the snapshot follow [`preview_params`]'s rules exactly: the scene
+/// arrives as a `stage_snapshot` whose `upto` names this layer, the version does not
+/// move, and an unknown id is `-32602`.
+pub fn preview_solo_params(layer: &str) -> Value {
+    json!({"solo": layer})
+}
+
 /// `undo` / `redo`: server-side, over both edit surfaces.
 pub fn edit_line(id: u64, redo: bool) -> String {
     request_line(

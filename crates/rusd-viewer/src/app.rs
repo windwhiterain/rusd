@@ -38,6 +38,8 @@ use winit::window::{Window, WindowId};
 use crate::anchor::Anchor;
 use crate::camera::{Orbit, plane_hit};
 use crate::net::{NetCommand, NetEvent, NetWorker, RenderCommand, RenderWorker};
+use serde_json::json;
+
 use crate::protocol::{self, Notification, OpinionOp};
 use crate::session::{ClientModel, Drag, Effect, MadeScene};
 use crate::startup::{self, Startup};
@@ -59,6 +61,18 @@ pub struct ViewArgs {
     /// screen — so a screenshot answers "is the frame fresh, and is it 1:1?"
     /// without another probe.
     pub debug_ui: bool,
+    /// The v1.7 control channel's address, when the caller asked for one.
+    ///
+    /// `None` is the default and means **no socket at all**: a viewer started
+    /// without `--control` has no listening port to find, which is what makes the
+    /// channel an opt-in rather than a surface every run exposes.
+    pub control: Option<String>,
+    /// The address the control channel actually bound, once [`crate::app::App::open_control`]
+    /// has run: `--control 127.0.0.1:0` asks the OS for a port, so the request and the
+    /// bound address are two different facts and only the second one can be connected to.
+    ///
+    /// Not a flag, so [`ViewArgs::parse`] never sets it.
+    pub control_addr: Option<std::net::SocketAddr>,
 }
 
 impl ViewArgs {
@@ -68,6 +82,7 @@ impl ViewArgs {
         let mut connect = None;
         let mut usdc = None;
         let mut debug_ui = false;
+        let mut control = None;
         let mut it = args.iter();
         while let Some(a) = it.next() {
             let (flag, inline) = match a.split_once('=') {
@@ -88,6 +103,23 @@ impl ViewArgs {
                         return Err("--usdc needs a path".to_owned());
                     }
                 }
+                "--control" => {
+                    let addr = take();
+                    let Some(addr) = addr.filter(|a| !a.is_empty()) else {
+                        return Err("--control needs an address (127.0.0.1:port)".to_owned());
+                    };
+                    // The rule is checked here, before any socket exists: a control
+                    // channel a network can reach is remote control of the user's
+                    // desktop session, so a non-loopback address is a refusal at
+                    // startup rather than a listener nobody notices.
+                    if !crate::control::is_loopback_text(&addr) {
+                        return Err(format!(
+                            "--control {addr}: only a loopback address is allowed \
+                             (127.0.0.1:port, [::1]:port or localhost:port)"
+                        ));
+                    }
+                    control = Some(addr);
+                }
                 "--debug-ui" => debug_ui = true,
                 other => return Err(format!("unexpected argument {other:?}")),
             }
@@ -97,6 +129,8 @@ impl ViewArgs {
             connect,
             usdc,
             debug_ui,
+            control,
+            control_addr: None,
         })
     }
 }
@@ -117,6 +151,9 @@ const CAPTURE_TAG: &str = "capture";
 /// `preview{upto}` (v1.4). Its answer is `{version}`, which the *notification* is the
 /// authority for: the prefix itself arrives as a `stage_snapshot` carrying `upto`.
 const PREVIEW_TAG: &str = "preview";
+/// `open{path}` (v1.7): the control channel's document open, answered under this tag so
+/// the request's own reply is the one a script gets.
+const OPEN_TAG: &str = "open";
 
 /// What wakes the window thread.
 #[derive(Debug, Clone, PartialEq)]
@@ -132,6 +169,17 @@ struct DragState {
     start: egui::Pos2,
     /// Where it was last tick (deltas are per tick).
     last: egui::Pos2,
+}
+
+/// What the control channel hands the shell once, at startup.
+///
+/// Two fields and no behaviour: the queue the listener fills (`Some` only when
+/// `--control` was given) and the address it is bound to, which `state` reports so a
+/// script that asked for port 0 can learn the port the OS chose.
+#[derive(Debug, Default)]
+pub struct ControlWiring {
+    pub queue: Option<crate::control::Queue>,
+    pub addr: Option<std::net::SocketAddr>,
 }
 
 /// Everything the window owns.
@@ -227,6 +275,14 @@ pub struct Shell {
     fps: f64,
     last_frame_at: Instant,
     offline_usdc: Option<String>,
+    /// The `host:port` this viewer was told to connect to (`--connect`), kept for the
+    /// control channel's `state`: the address the viewer is *aimed* at, which is what a
+    /// script needs to tell "the server is not up" from "this viewer is not aimed at it".
+    connect: String,
+    /// Where the control channel is listening, when `--control` opened one. Reported by
+    /// `state` so a script that started the viewer with `--control 127.0.0.1:0` can learn
+    /// the port the OS chose (`crate::control::Control::addr`).
+    control_addr: Option<std::net::SocketAddr>,
 
     /// The composition-tree panel (`docs/PROTOCOL.md` v1.2/v1.3).
     tree: crate::panel::TreePanel,
@@ -256,6 +312,143 @@ pub struct Shell {
     /// platform output of a pass, so a copy asked for in this pass is handed to
     /// `ctx.copy_text` at the **end** of it (`Shell::flush_copy`).
     pending_copy: Option<String>,
+
+    /// The v1.7 control channel's queue, when `--control` opened one
+    /// (`crate::control`). `None` is every run without the flag: nothing was ever
+    /// bound, so nothing can reach this window.
+    ///
+    /// **Only the receiving end lives here.** The listener and one thread per
+    /// connection own the sockets; a request arrives as a value plus where to write
+    /// its answer, and every method below is a call to the function the widget calls.
+    control: Option<crate::control::Queue>,
+    /// Control requests waiting for a **deferred** answer: a method whose result is
+    /// the server's reply to a request this shell sent (`open`, `preview`, and the
+    /// `comp_node` half of `tree`/`select`).
+    ///
+    /// A short FIFO rather than one slot per method, because two connections may ask
+    /// at once and the answers come back in the order the requests went out: matching
+    /// by tag in send order is what keeps each caller's `id` with its own result.
+    waiting: Vec<Waiting>,
+}
+
+/// One control request that cannot be answered until a reply comes back.
+///
+/// `awaiting` names the **reply tags** still owed — a row's click can owe two (a layer
+/// row asks its `comp_node` detail *and* a preview), which is why this is a list and
+/// not a flag. `results` holds what has arrived, keyed by those tags, and `shape` says
+/// how to spell the answer: some methods pass the server's reply through, some wrap it
+/// in what the click did.
+struct Waiting {
+    reply: crate::control::Replier,
+    awaiting: Vec<&'static str>,
+    results: BTreeMap<&'static str, Result<serde_json::Value, (i64, String)>>,
+    shape: Shape,
+}
+
+impl Waiting {
+    /// A waiter holding `reply`, owing nothing yet.
+    fn new(reply: crate::control::Replier, shape: Shape) -> Self {
+        Self {
+            reply,
+            awaiting: Vec::new(),
+            results: BTreeMap::new(),
+            shape,
+        }
+    }
+}
+
+/// How a control request's answer is spelled once its replies are in.
+#[derive(Clone, Debug, PartialEq)]
+enum Shape {
+    /// `open` and `preview`: the server's own reply, as it came (`preview`'s is
+    /// `{version}` — the prefix itself arrives as a `stage_snapshot`, so the reply says
+    /// the request was accepted and never claims a frame).
+    Server,
+    /// `tree{id}`: what the click was, plus the detail it gathered.
+    Row {
+        id: String,
+        kind: String,
+        action: &'static str,
+        live_preview: bool,
+    },
+    /// `select{path}`: the path, the selection, and the `comp_node` node it resolved to.
+    Pick { path: String },
+}
+
+impl Shape {
+    /// The answer this shape spells from what the replies said.
+    fn answer(
+        &self,
+        results: &BTreeMap<&'static str, Result<serde_json::Value, (i64, String)>>,
+    ) -> Result<serde_json::Value, (i64, String)> {
+        // A refusal from the server is the answer: `-32602` for an unknown layer id is
+        // exactly what a script has to see, not something this side rewrites.
+        for (tag, r) in results {
+            if let Err((code, message)) = r {
+                return Err((*code, format!("{tag}: {message}")));
+            }
+        }
+        match self {
+            Shape::Server => Ok(results
+                .values()
+                .next()
+                .and_then(|r| r.as_ref().ok())
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)),
+            Shape::Row {
+                id,
+                kind,
+                action,
+                live_preview,
+            } => Ok(json!({
+                "id": id,
+                "kind": kind,
+                "action": action,
+                "detail": lookup(results, NODE_TAG),
+                "preview": lookup(results, PREVIEW_TAG),
+                "preview_control": live_preview,
+            })),
+            Shape::Pick { path } => Ok(json!({
+                "path": path,
+                "selected": true,
+                "node": lookup(results, NODE_TAG),
+            })),
+        }
+    }
+}
+
+/// What one tag's reply said, or `null` when that tag was not owed.
+fn lookup(
+    results: &BTreeMap<&'static str, Result<serde_json::Value, (i64, String)>>,
+    tag: &str,
+) -> serde_json::Value {
+    results
+        .get(tag)
+        .and_then(|r| r.as_ref().ok())
+        .cloned()
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// An orbit as the control channel reports it.
+fn orbit_json(o: Orbit) -> serde_json::Value {
+    json!({
+        "yaw": o.yaw,
+        "pitch": o.pitch,
+        "dist": o.distance,
+        "target": [o.target[0], o.target[1], o.target[2]],
+    })
+}
+
+/// The word a row's click is reported as (`TreeAction` in the caller's terms).
+fn action_word(action: &crate::panel::TreeAction) -> &'static str {
+    match action {
+        crate::panel::TreeAction::Select(_) => "select",
+        crate::panel::TreeAction::Layer { preview: true, .. } => "layer-preview",
+        crate::panel::TreeAction::Layer { preview: false, .. } => "layer-detail",
+        crate::panel::TreeAction::Preview(_) => "preview",
+        crate::panel::TreeAction::Refresh => "refresh",
+        crate::panel::TreeAction::None => "none",
+    }
 }
 
 impl Shell {
@@ -269,6 +462,7 @@ impl Shell {
         args: &ViewArgs,
         proxy: EventLoopProxy<AppEvent>,
         startup: &mut Startup,
+        control: ControlWiring,
     ) -> Result<Self, String> {
         let egui_ctx = egui::Context::default();
         // Before the first frame: the status bar's Chinese labels draw as tofu
@@ -392,6 +586,13 @@ impl Shell {
             fps: 0.0,
             last_frame_at: Instant::now(),
             offline_usdc: args.usdc.clone(),
+            connect: args.connect.clone(),
+            // The socket, when one was asked for, is opened by `App` before the window
+            // exists (`--control`), and its address is handed in here: nothing about the
+            // window depends on it, and a viewer without the flag never opens one.
+            control: control.queue,
+            control_addr: control.addr,
+            waiting: Vec::new(),
             debug_ui: args.debug_ui,
             // **Expanded by default**, because the numbers are what the overlay exists
             // for, and the area bound already keeps it to a quarter of the viewport.
@@ -441,6 +642,13 @@ impl Shell {
                 NetEvent::Closed(diags) => {
                     self.status = join_diags(&diags);
                     self.model.mark_closed();
+                    // A control request whose answer was this connection's (`open`,
+                    // `preview`, a row's detail) can never be answered now: say so
+                    // rather than leave a script on a socket until its own timeout.
+                    self.fail_control_waiters(
+                        "the server connection ended before this 
+                                                 request was answered",
+                    );
                     // Nothing will arrive: fall back to the file the user named,
                     // if any, and say so rather than show an empty window.
                     if self.model.version.is_none()
@@ -659,11 +867,16 @@ impl Shell {
     }
 
     /// A `NetCommand::Call` was answered: route it by its tag.
+    ///
+    /// **The control channel's waiters see the reply first** (`note_control_result`): a
+    /// request that asked for this tag gets its answer before the GUI's own handling runs,
+    /// and both see the same value — the reply is not consumed by either.
     fn on_reply(&mut self, tag: String, result: Result<serde_json::Value, protocol::RpcError>) {
         let reply = match result {
             Ok(v) => Ok(v),
             Err(e) => Err((e.code, e.message)),
         };
+        self.note_control_result(&tag, &reply);
         match tag.as_str() {
             TREE_TAG => {
                 self.tree.apply_tree(reply);
@@ -925,6 +1138,588 @@ impl Shell {
         };
         self.ask_render();
         self.window.request_redraw();
+    }
+
+    // --- the control channel (v1.7) ---------------------------------------
+
+    /// Carry out every control request queued since the last pass, in order.
+    ///
+    /// One pass drains the queue, so two requests that arrived together are applied to
+    /// one state and the frame after them shows both. Nothing here blocks: a method
+    /// whose answer needs the server *sends* its request and leaves a [`Waiting`]
+    /// behind, and [`Shell::note_control_result`] answers it when the reply lands.
+    fn drain_control(&mut self) {
+        let Some(queue) = self.control.as_ref() else {
+            return;
+        };
+        let mut batch = Vec::new();
+        while let Ok(q) = queue.try_recv() {
+            batch.push(q);
+        }
+        if batch.is_empty() {
+            return;
+        }
+        for q in batch {
+            self.on_control(q);
+        }
+        // One control pass can move the camera, the selection or the frame: ask for the
+        // picture that shows it, the way a click does.
+        self.request_repaint();
+    }
+
+    /// One request: pick the method, carry it out, and answer — now, or on the reply.
+    ///
+    /// Every arm below calls the function the widget calls. That is the whole design of
+    /// v1.7 (`docs/PROTOCOL.md`: 所有方法走和 GUI 事件同一条路径): a control method is
+    /// a **name for a click**, never a second implementation of one.
+    fn on_control(&mut self, q: crate::control::Queued) {
+        let crate::control::Queued { req, reply } = q;
+        let args = crate::control::Args {
+            method: &req.method,
+            map: &req.params,
+        };
+        // The two halves of the table, told apart by what the answer *is*: a **deferred**
+        // method's result is a reply from the server, so it leaves a waiter behind and
+        // returns `None`; a **local** one reads state this shell already holds and answers
+        // in this pass. Each deferred arm takes a clone of the replier, so the waiter it
+        // keeps and the refusal it may return are the same answer channel.
+        let immediate: Option<Result<serde_json::Value, (i64, String)>> = match req.method.as_str()
+        {
+            "open" => self.control_open(&args, reply.clone()),
+            "preview" => self.control_preview(&args, reply.clone()),
+            "tree" => self.control_tree(&args, reply.clone()),
+            "select" => self.control_select(&args, reply.clone()),
+            "state" => Some(Ok(self.control_state())),
+            "isolate" => self.control_isolate(&args),
+            "fit" => self.control_fit(),
+            "orbit" => self.control_orbit(&args),
+            "capture" | "shot" => self.control_capture(&args),
+            // Unreachable: the connection thread refuses an unknown method before the
+            // request is queued (`crate::control::parse_line`). Answered rather than
+            // ignored so a change of that rule cannot leave a caller waiting.
+            other => Some(Err((
+                crate::control::METHOD_NOT_FOUND,
+                format!("unknown method: {other}"),
+            ))),
+        };
+        if let Some(outcome) = immediate {
+            reply.answer(outcome);
+        }
+    }
+
+    /// `state`: the whole of what the GUI is showing, in one object.
+    ///
+    /// **Always answerable** (the contract says so): it reads fields the shell already
+    /// holds and touches no socket, so a script can ask before the server has answered —
+    /// and a viewer that never connected says so, in a shape a script can branch on.
+    fn control_state(&self) -> serde_json::Value {
+        use crate::tree::TreeModel;
+        let tree = match &self.tree.model {
+            TreeModel::Idle => json!({ "state": "idle" }),
+            TreeModel::Loading => json!({ "state": "loading" }),
+            TreeModel::Ready(t) => json!({
+                "state": "ready",
+                "layers": t.layers.len(),
+                "arcs": t.arcs.len(),
+                "prims": t.prims.len(),
+                "variants": t.variants.len(),
+            }),
+            TreeModel::Unavailable(m) => json!({ "state": "unavailable", "message": m }),
+            TreeModel::Failed(m) => json!({ "state": "failed", "message": m }),
+        };
+        json!({
+            "connected": self.model.state.is_live(),
+            "server": self.connect,
+            "control": self.control_addr.map(|a| a.to_string()),
+            "version": self.model.version,
+            "preview": self.model.preview,
+            "selection": self.model.selection,
+            "isolate": self.only_selected,
+            "prims": self.model.item_count,
+            "offline": self.model.offline,
+            "tree": tree,
+            "orbit": self.orbit.map(orbit_json),
+            "frame": self.frame.as_ref().map(|(f, _)| {
+                json!({ "seq": f.seq, "width": f.width, "height": f.height })
+            }),
+            "status": self.status,
+        })
+    }
+
+    /// What a method that needs the server answers when there is none.
+    fn need_server(&self) -> Result<(), (i64, String)> {
+        if self.model.state.is_live() {
+            Ok(())
+        } else {
+            Err((
+                crate::control::NOT_CONNECTED,
+                "not connected: this viewer has no live server connection (start it with \
+                 --connect and wait for `state` to say connected)"
+                    .to_owned(),
+            ))
+        }
+    }
+
+    /// `open{path}`: the document open, forwarded to the server, answered with the
+    /// server's own reply.
+    ///
+    /// The scene, the tree and the camera all follow as they do for an `open` a user
+    /// caused: the reply arrives on the network worker, `state_changed{reason:"open"}`
+    /// after it re-reads the tree and refits (`crate::view`). `{"path": …}` is the
+    /// server's own parameter (`rusd-agent`'s `open`), so nothing is translated.
+    fn control_open(
+        &mut self,
+        args: &crate::control::Args<'_>,
+        reply: crate::control::Replier,
+    ) -> Option<Result<serde_json::Value, (i64, String)>> {
+        let path = match args.text("path") {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Err(e) = self.need_server() {
+            return Some(Err(e));
+        }
+        self.waiting.push(Waiting::new(reply, Shape::Server));
+        self.status = format!("open {path}: 请求中…");
+        self.send_net(NetCommand::Call {
+            tag: OPEN_TAG.to_owned(),
+            method: "open".to_owned(),
+            params: json!({ "path": path }),
+        });
+        None
+    }
+
+    /// `preview{upto}` / `preview{solo}`: the preview controls' click, in the two forms
+    /// the wire has.
+    ///
+    /// `upto: <layer id>` is a **prefix** (v1.4/v1.5.3 — the op and root rows' click),
+    /// `upto: null` is 「final」, and `solo: <layer id>` is the material (reference /
+    /// plain sublayer) row's click, which shows that layer's content and nothing else.
+    /// Exactly one of the two keys may be given, and `upto` must be **spelled** as null
+    /// for 「final」 rather than omitted: the server keeps preview state per connection,
+    /// so an omission would leave it where it was (`crate::protocol::preview_params`).
+    fn control_preview(
+        &mut self,
+        args: &crate::control::Args<'_>,
+        reply: crate::control::Replier,
+    ) -> Option<Result<serde_json::Value, (i64, String)>> {
+        let has_upto = args.map.contains_key("upto");
+        let has_solo = args.map.contains_key("solo");
+        let params = match (has_upto, has_solo) {
+            (true, false) => match args.opt_text("upto") {
+                Ok(upto) => protocol::preview_params(upto.as_deref()),
+                Err(e) => return Some(Err(e)),
+            },
+            (false, true) => match args.text("solo") {
+                Ok(id) => protocol::preview_solo_params(&id),
+                Err(e) => return Some(Err(e)),
+            },
+            (true, true) => {
+                return Some(Err(args.bad(
+                    "give `upto` or `solo`, not both: they are two different compositions",
+                )));
+            }
+            (false, false) => {
+                return Some(Err(args.bad(
+                    "`upto` (a layer id, or null for the final composition) or `solo` \
+                     (a layer id) is required",
+                )));
+            }
+        };
+        if let Err(e) = self.need_server() {
+            return Some(Err(e));
+        }
+        self.waiting.push(Waiting::new(reply, Shape::Server));
+        self.send_net(NetCommand::Call {
+            tag: PREVIEW_TAG.to_owned(),
+            method: "preview".to_owned(),
+            params,
+        });
+        None
+    }
+
+    /// `tree{id}`: the click on that row — or, with no `id`, the rows themselves.
+    ///
+    /// The click half is `action_for`'s answer carried out by the arms the panel's
+    /// [`crate::panel::TreeAction`] takes (`on_tree_layer`, `on_tree_select`,
+    /// `ask_preview`), so a script naming a row gets the same detail, the same selection
+    /// and the same preview a user's click gets — including the two-ask shape a layer
+    /// row has.
+    ///
+    /// The listing half is what makes a script possible at all: it prints the rows with
+    /// their ids, and those ids are exactly the strings this method and `comp_node` take.
+    fn control_tree(
+        &mut self,
+        args: &crate::control::Args<'_>,
+        reply: crate::control::Replier,
+    ) -> Option<Result<serde_json::Value, (i64, String)>> {
+        let id = match args.opt_text("id") {
+            Ok(v) => v.filter(|s| !s.is_empty()),
+            Err(e) => return Some(Err(e)),
+        };
+        let rows = crate::tree::flatten(&self.tree.model.roots());
+        let Some(id) = id else {
+            // No id: the tree as rows. Read from the panel's model — the copy the GUI is
+            // drawing — because a listing that could disagree with the screen would make
+            // `tree{id}` and the click two trees.
+            let rows: Vec<serde_json::Value> = rows
+                .into_iter()
+                .map(|(depth, node)| {
+                    json!({
+                        "id": node.id,
+                        "kind": node.kind.as_str(),
+                        "label": node.label,
+                        "depth": depth,
+                        "op": node.op,
+                        "root": node.root,
+                        "prim": node.prim,
+                        "rows_below": node.children.len(),
+                    })
+                })
+                .collect();
+            return Some(Ok(json!({
+                "state": if self.tree.model.ready() { "ready" } else { "not_ready" },
+                "status": self.tree.model.status_zh(),
+                "preview": self.model.preview,
+                    "rows": rows,
+            })));
+        };
+        if let Err(e) = self.need_server() {
+            return Some(Err(e));
+        }
+        let Some((_, node)) = rows.iter().find(|(_, n)| n.id == id) else {
+            let known: Vec<&str> = rows.iter().map(|(_, n)| n.id.as_str()).collect();
+            let shown: Vec<&str> = known.iter().take(40).copied().collect();
+            let more = if known.len() > shown.len() {
+                format!(
+                    " … and {} more (ask tree{} for the whole list)",
+                    known.len() - shown.len(),
+                    ""
+                )
+            } else {
+                String::new()
+            };
+            return Some(Err(args.bad(format!(
+                "no row with id {id:?} in the composition tree; it has: {}{more}",
+                shown.join(", ")
+            ))));
+        };
+        let row = node.clone();
+        // What a click on this row means — the panel's own rule, not a copy of it.
+        let action = crate::panel::action_for(&row);
+        let shape = Shape::Row {
+            id: row.id.clone(),
+            kind: row.kind.as_str().to_owned(),
+            action: action_word(&action),
+            live_preview: matches!(
+                &action,
+                crate::panel::TreeAction::Layer { preview: true, .. }
+            ) || matches!(&action, crate::panel::TreeAction::Preview(_)),
+        };
+        // The replier is in hand **before** the click runs: `on_tree_*` sends its request
+        // on the spot, and that request's reply is what this one waits for.
+        self.waiting.push(Waiting::new(reply, shape));
+        match action {
+            crate::panel::TreeAction::Select(sel) => self.on_tree_select(sel),
+            crate::panel::TreeAction::Layer { selection, preview } => {
+                self.on_tree_layer(selection, preview)
+            }
+            crate::panel::TreeAction::Preview(upto) => self.ask_preview(upto),
+            // `action_for` never returns these for a row that exists (`Refresh` is the
+            // panel's button and `None` is "no click"), so nothing was sent: the waiter
+            // has no tag to wait for and `note_control_result` would never see it.
+            crate::panel::TreeAction::Refresh | crate::panel::TreeAction::None => {
+                let w = self.waiting.pop();
+                if let Some(w) = w {
+                    w.reply.ok(json!({
+                        "id": row.id,
+                        "kind": row.kind.as_str(),
+                        "label": row.label,
+                        "action": "none",
+                        "note": "this row's click asks for nothing",
+                    }));
+                }
+            }
+        }
+        None
+    }
+
+    /// `select{path}`: the viewport pick of a prim named by path.
+    ///
+    /// The pick path's own second half, with no pixel involved: the selection,
+    /// `ask_render` for the outline, and `inspect_picked` for the per-layer detail —
+    /// exactly what `Shell::click` does once it has resolved a pixel to a path.
+    ///
+    /// A path the scene does not hold is `-32602` naming the miss: a selection that
+    /// outlines nothing is worse than a refusal a script can read.
+    ///
+    /// **The clipboard is not written.** A GUI pick copies the path onto the desktop
+    /// clipboard (`on_tree_select`'s precedent); a script doing the same would overwrite
+    /// whatever the user had there, so the control path leaves it alone — the path is
+    /// in the answer instead.
+    fn control_select(
+        &mut self,
+        args: &crate::control::Args<'_>,
+        reply: crate::control::Replier,
+    ) -> Option<Result<serde_json::Value, (i64, String)>> {
+        let path = match args.text("path") {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        if let Err(e) = self.need_server() {
+            return Some(Err(e));
+        }
+        if !self.model.centers.contains_key(&path) {
+            return Some(Err(args.bad(format!(
+                "no prim at {path:?} in the scene on screen ({} prims); \
+                 select takes a prim path the current scene contains",
+                self.model.item_count
+            ))));
+        }
+        let shape = Shape::Pick { path: path.clone() };
+        let row = self.tree.model.prim_id(&path).map(str::to_owned);
+        let Some(node_id) = row else {
+            // A prim the composition tree does not describe: ordinary for a flattened cook
+            // output (a city's instances are such prims). The selection still happens —
+            // that is what a viewport pick does too — and the detail panel says why it has
+            // no per-layer view instead of going quiet (`inspect_picked`'s own words).
+            self.select_path(&path);
+            return Some(Ok(json!({
+                "path": path,
+                "selected": true,
+                "node": serde_json::Value::Null,
+                "detail": serde_json::Value::Null,
+                "note": "the composition tree lists no node for this path (a cook \
+                         output), so there is no per-layer detail to show",
+            })));
+        };
+        self.waiting.push(Waiting::new(reply, shape));
+        self.select_path(&path);
+        self.ask_node(&node_id);
+        let _ = node_id;
+        None
+    }
+
+    /// Select a prim the way a viewport pick does: the selection, the outline's
+    /// re-render, the per-layer detail, and the status line.
+    ///
+    /// One function for both entry points — [`Shell::click`] resolves a pixel to a path
+    /// and calls this; `select{path}` has the path already and calls the same thing. The
+    /// copy to the clipboard is **not** here: a click copies the path for the user, a
+    /// control request reports it in its answer instead, and putting that decision at the
+    /// two callers is what keeps a script from overwriting the desktop clipboard.
+    fn select_path(&mut self, path: &str) {
+        self.model.selection = Some(path.to_owned());
+        self.tree.detail = None;
+        self.tree.detail_error = None;
+        self.ask_render();
+        self.inspect_picked(path);
+        self.status = self.model.status_line_zh(|id| self.layer_name(id));
+        self.window.request_redraw();
+    }
+
+    /// `isolate{on}`: the 「只看选中 (i)」 switch, asked for as a state.
+    ///
+    /// `{on: true}` is the key `i` pressed once from off, `{on: false}` once from on;
+    /// asking for the state it is already in does nothing. The work is
+    /// [`Shell::toggle_only_selected`] — the same function the key and the button call.
+    fn control_isolate(
+        &mut self,
+        args: &crate::control::Args<'_>,
+    ) -> Option<Result<serde_json::Value, (i64, String)>> {
+        let on = match args.boolean("on") {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
+        if self.only_selected != on {
+            self.toggle_only_selected();
+        }
+        Some(Ok(json!({
+            "isolate": self.only_selected,
+            "selection": self.model.selection,
+        })))
+    }
+
+    /// `fit`: the Fit button.
+    fn control_fit(&mut self) -> Option<Result<serde_json::Value, (i64, String)>> {
+        if self.model.bbox.is_none() {
+            return Some(Err((
+                crate::control::NOT_READY,
+                "fit: no scene has arrived yet, so there is nothing to frame".to_owned(),
+            )));
+        }
+        self.fit();
+        Some(Ok(json!({
+            "orbit": self.orbit.map(orbit_json),
+            "camera": self.orbit.map(|o| crate::capture::camera_json(&o)),
+        })))
+    }
+
+    /// `orbit{yaw, pitch, dist, target?}`: the camera, set outright.
+    ///
+    /// Not a gesture but the state a gesture ends in: a drag adds a delta to `yaw` /
+    /// `pitch`, the wheel scales `dist`, and this asks for the resulting numbers. The
+    /// pitch is clamped the way [`crate::camera::Orbit`] clamps a drag (the poles are
+    /// degenerate), and a non-positive `dist` is refused rather than quietly replaced.
+    ///
+    /// A viewer with no orbit yet starts from the fit a gesture would have started from,
+    /// so a script can set a camera before the user has touched anything.
+    fn control_orbit(
+        &mut self,
+        args: &crate::control::Args<'_>,
+    ) -> Option<Result<serde_json::Value, (i64, String)>> {
+        let yaw = args.number("yaw");
+        let pitch = args.number("pitch");
+        let dist = args.number("dist");
+        let target = args.opt_vec3("target");
+        if let Err(e) = yaw {
+            return Some(Err(e));
+        }
+        if let Err(e) = pitch {
+            return Some(Err(e));
+        }
+        if let Err(e) = dist {
+            return Some(Err(e));
+        }
+        if let Err(e) = target {
+            return Some(Err(e));
+        }
+        let (Ok(yaw), Ok(pitch), Ok(dist), Ok(target)) = (yaw, pitch, dist, target) else {
+            return Some(Err(args.bad("`yaw`, `pitch` and `dist` are required")));
+        };
+        if dist <= 0.0 {
+            return Some(Err(args.bad(format!(
+                "`dist` must be positive (got {dist}); it is the eye-to-target distance"
+            ))));
+        }
+        let start = self.orbit.or_else(|| {
+            self.model
+                .bbox
+                .map(|(min, max)| crate::view::orbit_for_bounds((min, max), self.viewport_aspect()))
+        });
+        let Some(mut orbit) = start else {
+            return Some(Err((
+                crate::control::NOT_READY,
+                "orbit: no scene has arrived yet, so there is no camera to move".to_owned(),
+            )));
+        };
+        orbit.yaw = yaw;
+        orbit.pitch = pitch.clamp(-crate::camera::PITCH_LIMIT, crate::camera::PITCH_LIMIT);
+        orbit.distance = dist;
+        if let Some(t) = target {
+            orbit.target = t;
+        }
+        self.orbit = Some(orbit);
+        self.ask_render();
+        self.window.request_redraw();
+        Some(Ok(json!({
+            "orbit": orbit_json(orbit),
+            "camera": crate::capture::camera_json(&orbit),
+        })))
+    }
+
+    /// `capture{path}` / `shot{path}`: **the frame on screen**, written as a PNG.
+    ///
+    /// The reader's half of 「选区截图」 with no selection: the pixels are the ones the
+    /// viewport drew (`crate::net::Frame::beauty`, outline included), so this costs no
+    /// render and cannot disagree with what a screenshot of the window would show. The
+    /// encoding is `crate::capture`'s — the one the wire's captures already use.
+    fn control_capture(
+        &mut self,
+        args: &crate::control::Args<'_>,
+    ) -> Option<Result<serde_json::Value, (i64, String)>> {
+        let path = match args.text("path") {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        let Some((frame, _)) = self.frame.as_ref() else {
+            return Some(Err((
+                crate::control::NOT_READY,
+                "capture: no frame yet (ask again once the viewport has drawn one)".to_owned(),
+            )));
+        };
+        let png = match crate::capture::encode_png(frame.width, frame.height, &frame.beauty) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                return Some(Err((
+                    crate::control::NOT_READY,
+                    format!("capture: PNG encoding failed: {e}"),
+                )));
+            }
+        };
+        let written = std::path::Path::new(&path);
+        if let Some(dir) = written.parent().filter(|d| !d.as_os_str().is_empty())
+            && !dir.is_dir()
+        {
+            return Some(Err((
+                crate::control::LOCAL_IO,
+                format!("capture: no directory {}", dir.display()),
+            )));
+        }
+        if let Err(e) = std::fs::write(written, &png) {
+            return Some(Err((
+                crate::control::LOCAL_IO,
+                format!("capture: cannot write {path}: {e}"),
+            )));
+        }
+        let absolute = std::path::absolute(written)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| path.clone());
+        self.status = format!("capture: {absolute} ({} bytes)", png.len());
+        Some(Ok(json!({
+            "path": absolute,
+            "width": frame.width,
+            "height": frame.height,
+            "bytes": png.len(),
+            "frame": frame.seq,
+            "version": self.model.version,
+            "camera": crate::capture::camera_json_of(&frame.camera),
+        })))
+    }
+
+    /// Feed one server reply to the control request that asked for it.
+    ///
+    /// Called from [`Shell::on_reply`] before the GUI's own handling, with the tag the
+    /// reply came under. **The oldest waiter that owes this tag gets it**: two
+    /// connections may both have an `open` in flight, the server answers in send order,
+    /// and pairing by order is what keeps each caller's `id` with its own result. When
+    /// the last tag a waiter owes is filled, the control reply goes out.
+    ///
+    /// Costs one length check when no control channel is open.
+    fn note_control_result(
+        &mut self,
+        tag: &str,
+        result: &Result<serde_json::Value, (i64, String)>,
+    ) {
+        if self.waiting.is_empty() {
+            return;
+        }
+        let name = match tag {
+            OPEN_TAG => OPEN_TAG,
+            PREVIEW_TAG => PREVIEW_TAG,
+            NODE_TAG => NODE_TAG,
+            _ => return,
+        };
+        let Some(i) = self.waiting.iter().position(|w| w.awaiting.contains(&name)) else {
+            return;
+        };
+        self.waiting[i].results.insert(name, result.clone());
+        self.waiting[i].awaiting.retain(|t| *t != name);
+        if !self.waiting[i].awaiting.is_empty() {
+            return;
+        }
+        let w = self.waiting.remove(i);
+        w.reply.answer(w.shape.answer(&w.results));
+    }
+
+    /// Answer every control request still waiting: the connection ended, so their
+    /// replies can never arrive and a script must not be left on a socket until its own
+    /// timeout. Called from the `NetEvent::Closed` arm of [`Shell::drain_net`].
+    fn fail_control_waiters(&mut self, message: &str) {
+        let waiting = std::mem::take(&mut self.waiting);
+        for w in waiting {
+            w.reply.err(crate::control::NOT_CONNECTED, message);
+        }
     }
 
     // --- UI ---------------------------------------------------------------
@@ -1337,7 +2132,10 @@ impl Shell {
             // ordinary (a flattened cook output has prims no layer spec authored),
             // so it is said plainly rather than treated as a failure.
             if let Some(path) = self.model.selection.clone() {
-                // v1.3: picking a prim in the viewport copies its path, same as a tree click.
+                // v1.3: picking a prim in the viewport copies its path, same as a tree
+                // click. **The copy stays on this path and not in `select_path`**: the
+                // control channel's `select{path}` reports the path in its answer
+                // instead, and a script must not overwrite the desktop clipboard.
                 self.copy_toast(path.clone());
                 self.inspect_picked(&path);
             } else {
@@ -1840,6 +2638,14 @@ pub struct App {
     startup: Startup,
     /// Whether the first frame has been marked (`FIRST_PAINT`).
     painted: bool,
+    /// The control channel's receiving end, once opened (`--control`).
+    ///
+    /// Held here rather than in the shell because the socket must exist **before** the
+    /// window does: a script started the viewer and began asking, and a request that
+    /// arrived while the GPU was still warming up used to have nowhere to go. The shell
+    /// receives it from `resumed` ([`ControlWiring`]), so from the first pass on it is the
+    /// shell that drains it.
+    control: Option<crate::control::Queue>,
 }
 
 impl App {
@@ -1850,7 +2656,33 @@ impl App {
             proxy,
             startup,
             painted: false,
+            control: None,
         }
+    }
+
+    /// Open the control channel, when `--control` asked for one.
+    ///
+    /// Called once, before `EventLoop::run_app`: an address that cannot be bound is the
+    /// caller's to report, and a viewer that refused it prints one line and exits rather
+    /// than opening a window nobody can drive. **Without the flag this does nothing at
+    /// all** — no socket, no thread, nothing listening.
+    ///
+    /// The nudge handed to the listener threads is the same `EventLoopProxy` the network
+    /// and render workers use, so a request wakes the window thread exactly as a frame or
+    /// a notification does; nothing polls.
+    pub fn open_control(&mut self, wake: crate::control::Nudge) -> Result<(), String> {
+        let Some(addr) = self.args.control.clone() else {
+            return Ok(());
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let control = crate::control::spawn(&addr, tx, wake)?;
+        eprintln!(
+            "{{\"code\":\"N_CONTROL\",\"message\":\"control channel on {}\"}}",
+            control.addr
+        );
+        self.args.control_addr = Some(control.addr);
+        self.control = Some(rx);
+        Ok(())
     }
 }
 
@@ -1878,7 +2710,17 @@ impl ApplicationHandler<AppEvent> for App {
                 return;
             }
         };
-        match Shell::new(window, &self.args, self.proxy.clone(), &mut self.startup) {
+        let wiring = ControlWiring {
+            queue: self.control.take(),
+            addr: self.args.control_addr,
+        };
+        match Shell::new(
+            window,
+            &self.args,
+            self.proxy.clone(),
+            &mut self.startup,
+            wiring,
+        ) {
             Ok(shell) => {
                 shell.window.request_redraw();
                 self.shell = Some(shell);
@@ -1892,6 +2734,10 @@ impl ApplicationHandler<AppEvent> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: AppEvent) {
         if let Some(shell) = self.shell.as_mut() {
+            // Control requests first: a script that asked for something sees the effect of
+            // it in the frame this event's redraw paints, and `drain_net` below may then
+            // answer an earlier request's waiter with a reply that has just arrived.
+            shell.drain_control();
             shell.drain_net();
             shell.drain_frames();
         }
@@ -1953,6 +2799,7 @@ impl ApplicationHandler<AppEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                shell.drain_control();
                 shell.drain_net();
                 shell.drain_frames();
                 shell.paint();
@@ -1997,6 +2844,20 @@ pub fn run(args: ViewArgs) -> i32 {
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
     let mut app = App::new(args, proxy, startup);
+    // **The control channel opens before the window does.** A script starts the viewer
+    // and asks at once; a socket created in `resumed` would refuse those first requests
+    // while the GPU warms up. A bind that fails ends the run here, with one line, rather
+    // than leaving a window up that nothing can drive.
+    {
+        let wake_proxy = app.proxy.clone();
+        let wake = crate::control::nudge(move || {
+            let _ = wake_proxy.send_event(AppEvent::Wake);
+        });
+        if let Err(e) = app.open_control(wake) {
+            eprintln!("{{\"code\":\"E_CONTROL\",\"message\":\"{e}\"}}");
+            return 2;
+        }
+    }
     if let Err(e) = event_loop.run_app(&mut app) {
         eprintln!("{{\"code\":\"E_EVENT_LOOP\",\"message\":\"{e}\"}}");
         return 1;

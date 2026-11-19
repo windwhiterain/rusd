@@ -30,8 +30,10 @@ pub struct Orbit {
 }
 
 /// How far past the poles a pitch may go (radians): at exactly ±π/2 the up vector
-/// and the view direction are parallel and the basis degenerates.
-const PITCH_LIMIT: f64 = std::f64::consts::FRAC_PI_2 - 1e-3;
+/// and the view direction are parallel and the basis degenerates. A drag (`Orbit::orbit`)
+/// and a control request (`Shell::control_orbit`) both clamp to it, which is why it is
+/// public: one rule, not two clamps that could drift.
+pub const PITCH_LIMIT: f64 = std::f64::consts::FRAC_PI_2 - 1e-3;
 
 impl Orbit {
     /// The orbit that reproduces `cam` exactly: same eye, same target, same fov.

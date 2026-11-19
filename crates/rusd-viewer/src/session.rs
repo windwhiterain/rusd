@@ -196,6 +196,12 @@ pub struct ClientModel {
     /// prefix says which prefix that was, and this is the echo the status bar and
     /// the overlay print. A client that recorded only its own request would claim a
     /// prefix while the pixels were still the final scene.
+    ///
+    /// **A solo frame reports its layer here too** (the material row's click,
+    /// `preview{solo}`): the wire puts the layer in the same field, and which of the two
+    /// compositions an id names is the **tree's** to say — an op or root layer is a
+    /// prefix, every other layer is a solo — not a second field this model would have to
+    /// keep in step.
     pub preview: Option<String>,
 }
 

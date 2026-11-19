@@ -50,12 +50,16 @@
 //! - [`viewport`]: where the render thread's frame lands on screen — pure rect/UV
 //!   arithmetic, so the image covers the viewport 1:1 at any `pixels_per_point`.
 //! - [`app`]: the winit + egui shell that ties them together (`view`).
+//! - [`control`]: the v1.7 control channel (`view --control <addr>`) — the GUI's
+//!   every operation as a named JSON-RPC method on a loopback socket, parsed there
+//!   and carried out by the shell's own functions (`crate::app::Shell::on_control`).
 
 pub mod anchor;
 pub mod app;
 pub mod camera;
 pub mod capture;
 pub mod compose;
+pub mod control;
 pub mod fonts;
 pub mod gizmo;
 pub mod gpu;
