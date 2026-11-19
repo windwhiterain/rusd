@@ -14,12 +14,24 @@ use crate::diag::Diagnostic;
 use crate::path::PrimPath;
 use crate::value::Value;
 
-/// One prim block: its path, declared schema, and raw properties.
+/// One prim block: its path, declared schema, raw properties, and the layer its
+/// `references` key names.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PrimBlock {
     pub path: PrimPath,
+    /// The schema the table declares. **Empty** means it declares none: a prim
+    /// whose type is composed from the layer its `references` names (v1.5.10)
+    /// must not author a `typeName` of its own. A local type is the strongest
+    /// opinion there is and would win over the arc, turning the prim into an
+    /// empty `Xform` with the material's geometry lost.
     pub schema: String,
     pub props: BTreeMap<String, Value>,
+    /// `references = "asset:prim"` (v1.5.10): a **composition arc, not a
+    /// property**. It names another layer and a prim inside it, whose spec
+    /// composes underneath this prim's own; nothing about it is written as an
+    /// attribute, so it never reaches the geometry layer. One string, split and
+    /// resolved by `rusd_scene::reference` (asset half first, then prim half).
+    pub references: Option<String>,
 }
 
 /// A **layer annotation**: a document node that says something about a layer
@@ -56,6 +68,13 @@ pub struct Annotation {
 pub struct ParsedDocument {
     pub stage: BTreeMap<String, Value>,
     pub prims: Vec<PrimBlock>,
+    /// The directory the document was read from (v1.5.10), set by [`parse_in`]
+    /// and otherwise `None`. It is what a **relative** reference or prototype
+    /// asset resolves against: the root layer the adapter authors is anonymous and
+    /// anchors nothing. A document handed in as text (`open{content}`) has no
+    /// directory, so a relative layer is a diagnostic rather than a guess at the
+    /// process's cwd.
+    pub doc_dir: Option<String>,
     /// Layer annotations (`[doc.<name>]` with `layer` + `description`), sorted by
     /// node path so the surface stays deterministic. Two may name one layer; that
     /// is `E_ANNOTATION` at validation, not something this parser resolves.
@@ -138,8 +157,18 @@ pub fn parse(text: &str) -> Result<ParsedDocument, Vec<Diagnostic>> {
     Ok(ParsedDocument {
         stage,
         prims,
+        doc_dir: None,
         annotations,
     })
+}
+
+/// Parse a document that came from a file, remembering the directory it lives
+/// in: that is what a relative `references`/`prototype` asset resolves against
+/// (v1.5.10). The directory is not touched, only joined against after the fact.
+pub fn parse_in(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Diagnostic>> {
+    let mut doc = parse(text)?;
+    doc.doc_dir = doc_dir.map(str::to_owned);
+    Ok(doc)
 }
 
 /// An annotation leaf: a `layer` and no `schema`. The `schema` test is what tells
@@ -252,6 +281,7 @@ fn walk_prim(
 ) {
     let mut props = BTreeMap::new();
     let mut schema: Option<String> = None;
+    let mut references: Option<String> = None;
 
     for (key, item) in table.iter() {
         match item {
@@ -261,6 +291,17 @@ fn walk_prim(
                     Diagnostic::error("E_SCHEMA", "schema must be a string")
                         .at_prim(path.as_str())
                         .at_property("schema"),
+                ),
+            },
+            Item::Value(v) if key == "references" => match v.as_str() {
+                Some(s) => references = Some(s.to_owned()),
+                None => diags.push(
+                    Diagnostic::error(
+                        "E_REFERENCE",
+                        "references must be one string: \"asset:prim\"",
+                    )
+                    .at_prim(path.as_str())
+                    .at_property("references"),
                 ),
             },
             Item::Value(v) => match convert(v) {
@@ -295,6 +336,13 @@ fn walk_prim(
 
     let schema = match schema {
         Some(s) => s,
+        None if references.is_some() => {
+            // v1.5.10: a prim that names a `references` arc declares no schema of
+            // its own. That is not an omission — a local `typeName` would outrank
+            // the arc and empty the prim — it is the point of the key: the type is
+            // composed from the material layer.
+            String::new()
+        }
         None if table.is_implicit() => "Xform".to_owned(),
         None => {
             diags.push(
@@ -311,6 +359,7 @@ fn walk_prim(
         path,
         schema,
         props,
+        references,
     });
 }
 

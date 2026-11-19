@@ -5,7 +5,30 @@
 use rusd_core::syntax::ParsedDocument;
 use rusd_core::{Diagnostic, PrimPath, Value};
 
+use crate::reference::{self, AssetRefError};
 use crate::schema::{self, PropType};
+
+/// The diagnostic for a `references` value that did not name a prim.
+///
+/// `E_REFERENCE_ASSET` for the asset half — a layer that does not exist, or a
+/// relative path in a document with no directory behind it — and `E_REFERENCE`
+/// for a prim half that is not a prim path. A missing layer's message carries the
+/// **full** path that was looked for, not the spelling the document used: the
+/// document's own directory is what the path was relative to, and an agent cannot
+/// find a file it was never told the location of.
+pub(crate) fn reference_diag(error: &AssetRefError, prim: &str, raw: &str) -> Diagnostic {
+    match error {
+        AssetRefError::Path { why, .. } => {
+            Diagnostic::error("E_REFERENCE", format!("references {raw:?}: {why}"))
+        }
+        AssetRefError::Asset { authored, why } => Diagnostic::error(
+            "E_REFERENCE_ASSET",
+            format!("references asset {authored:?}: {why}"),
+        ),
+    }
+    .at_prim(prim)
+    .at_property("references")
+}
 
 /// Validate every prim. Returns all diagnostics (errors and warnings).
 pub fn validate(doc: &ParsedDocument) -> Vec<Diagnostic> {
@@ -31,6 +54,24 @@ pub fn validate(doc: &ParsedDocument) -> Vec<Diagnostic> {
         }
     }
     for prim in &doc.prims {
+        // v1.5.10: `references = "asset:prim"` is a composition arc, so it is
+        // checked here, before anything composes: a layer that is not there would
+        // otherwise become an unresolved arc somewhere inside the pipeline, and the
+        // path that was looked for is exactly what the agent needs to see.
+        if let Some(raw) = &prim.references
+            && let Err(e) = reference::parse(raw, doc.doc_dir.as_deref())
+        {
+            diags.push(reference_diag(&e, prim.path.as_str(), raw));
+        }
+        // A prim that declares no schema but names a `references` arc is not
+        // missing one: its type composes from the layer the arc opens. There is no
+        // registry entry to look up, and asking for the empty name would report
+        // `unknown schema ''` about a prim that is doing exactly what the surface
+        // says it may. (`schema = ""` with no reference is still the old unknown
+        // schema, since then nothing composes a type at all.)
+        if prim.schema.is_empty() && prim.references.is_some() {
+            continue;
+        }
         let Some(schema) = schema::lookup(&prim.schema) else {
             diags.push(
                 Diagnostic::warning(

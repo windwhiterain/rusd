@@ -1094,7 +1094,7 @@ impl Session {
                 ok: false,
             };
         };
-        let doc = match rusd_core::syntax::parse(&text) {
+        let doc = match rusd_core::syntax::parse_in(&text, self.agent.doc_dir()) {
             Ok(doc) => doc,
             Err(diags) => return Pipeline::failed(diags),
         };
@@ -1155,7 +1155,7 @@ impl Session {
                 ok: false,
             };
         };
-        let doc = match rusd_core::syntax::parse(&text) {
+        let doc = match rusd_core::syntax::parse_in(&text, self.agent.doc_dir()) {
             Ok(doc) => doc,
             Err(diags) => return Pipeline::failed(diags),
         };

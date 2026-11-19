@@ -9,6 +9,7 @@
 
 pub mod adapter;
 pub mod geometry;
+pub mod reference;
 pub mod schema;
 pub mod validate;
 

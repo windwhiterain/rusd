@@ -5,7 +5,10 @@
 #              （同栈 reference 指向 /World/Boxes——实例的实例）
 #
 # 结果：quad 表面上摆了 40 簇、每簇 60 个 box（外加原点的原型簇）。
-# box 原型本身仍在素材层 prototypes.usda（由跨资产 reference 打开，独立成层）。
+#
+# 两个素材层都由 reference 弧打开，各自独立成层、都不进本文件的层栈：
+#   prototypes.usda —— box 原型库（generator 的 prototype 参数，跨资产实例化）
+#   terrain.usda    —— 10x10 起伏地面（prim 级 references 键，类型与几何全部合成）
 #
 #   upto = null（root）         → 只见 Volume 盒 + Terrain
 #   upto = /World/Samples       → 只见体积点云
@@ -14,7 +17,7 @@
 #   upto = /World/Clusters      → 只见含簇前的状态/最终同
 #
 # 替换语义逐 op 成立：sample 盖住 Volume、instances 盖住体积点云、
-# 表面 sample 盖住 Terrain、最后一段 instances 盖住表面点云。
+# 表面 sample 盖住 Terrain、末尾一段 instances 盖住表面点云。
 
 [stage]
 default_prim = "/World"
@@ -52,22 +55,11 @@ schema = "RusdInstances"
 seed = 11
 
 # --- 第二阶段的输入与产出 ----------------------------------------------------
-# 一块 10×10 的起伏地面（4 个四边形），与 mesh_scatter.rusd 同款。
+# 一块 10x10 的起伏地面（4 个四边形）。几何在素材层 examples/terrain.usda：
+# 本表只留一条 prim 级 reference 弧，自己没有 schema——/World/Terrain 的类型与
+# 几何都由引用合成（引用弧打开素材层，素材层不进本文件的层栈）。
 [World.Terrain]
-faceVertexCounts = [4, 4, 4, 4]
-faceVertexIndices = [0, 1, 4, 3, 1, 2, 5, 4, 3, 4, 7, 6, 4, 5, 8, 7]
-points = [
-    [0.0, 0.0, 0.0],
-    [5.0, 0.0, 0.5],
-    [10.0, 0.0, 0.0],
-    [0.0, 5.0, 0.5],
-    [5.0, 5.0, 1.5],
-    [10.0, 5.0, 0.4],
-    [0.0, 10.0, 0.0],
-    [5.0, 10.0, 0.3],
-    [10.0, 10.0, 0.0],
-]
-schema = "Mesh"
+references = "terrain.usda:/World/Terrain"
 
 [World.SurfaceSamples]
 count = 40
@@ -94,3 +86,8 @@ layer = "prototypes.usda"
 [doc.root]
 description = "box_scatter.rusd：两段实例化的作者层"
 layer = "root"
+
+# 地形素材层：prim 级 reference 打开，同样不在本文件的层栈里。
+[doc.terrain]
+description = "10x10 起伏地面素材（由 prim 级 reference 弧打开，不在本文件的层栈里）"
+layer = "terrain.usda"

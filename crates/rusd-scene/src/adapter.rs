@@ -21,6 +21,28 @@ fn author_base(stage: &Stage, doc: &ParsedDocument) -> Result<(), Vec<Diagnostic
         _ => 1.0,
     };
     let root_id = stage.root_layer().identifier().to_owned();
+    // Every `references` value resolved **before** the layer is edited: a missing
+    // layer is a diagnostic about a document, not an authoring failure, and the
+    // edit closure can only carry an `AuthoringError`. Frame the answer to the same
+    // `Vec<Diagnostic>` the rest of lowering answers with.
+    let mut unresolved: Vec<Diagnostic> = Vec::new();
+    let references: Vec<Option<crate::reference::AssetRef>> = doc
+        .prims
+        .iter()
+        .map(|prim| {
+            let raw = prim.references.as_deref()?;
+            match crate::reference::parse(raw, doc.doc_dir.as_deref()) {
+                Ok(parsed) => Some(parsed),
+                Err(e) => {
+                    unresolved.push(crate::validate::reference_diag(&e, prim.path.as_str(), raw));
+                    None
+                }
+            }
+        })
+        .collect();
+    if !unresolved.is_empty() {
+        return Err(unresolved);
+    }
     let mut root = stage.layer_mut(&root_id).expect("root layer exists");
     root.edit(|l| {
         let d = l.data_mut();
@@ -33,12 +55,23 @@ fn author_base(stage: &Stage, doc: &ParsedDocument) -> Result<(), Vec<Diagnostic
         d.set_field(&pseudo, "upAxis", SdfValue::Token("Z".into()));
         d.set_field(&pseudo, "metersPerUnit", SdfValue::Double(meters));
 
-        for prim in &doc.prims {
+        for (index, prim) in doc.prims.iter().enumerate() {
             let schema = schema::lookup(&prim.schema);
             let custom = schema
                 .map(|s| s.kind == SchemaKind::Generator)
                 .unwrap_or(true);
+            // v1.5.10: a prim with no declared schema composes its type from the
+            // layer its `references` names, so its own spec declares none.
             PrimSpec::new(d, prim.path.as_str(), Specifier::Def, prim.schema.clone())?;
+            // The `references` arc, authored as a composition field on this very
+            // spec (the way `RusdInstances` authors an instance's arc onto the
+            // prototype). It is **not** an attribute: nothing of it is written as a
+            // property, so it never reaches the geometry layer. The key already
+            // resolved to an absolute layer above, which is what makes the
+            // anonymous root layer able to name it at all.
+            if let Some(reference) = &references[index] {
+                author_reference(d, &prim.path, reference)?;
+            }
             for (name, val) in &prim.props {
                 // v1.5.9: a generator node's `description` is metadata about the
                 // node, not geometry — the tree reports it beside the layer, and the
@@ -66,6 +99,33 @@ fn author_base(stage: &Stage, doc: &ParsedDocument) -> Result<(), Vec<Diagnostic
         Ok(())
     })
     .map_err(|e| vec![Diagnostic::error("E_LOWER", e.to_string())])?;
+    Ok(())
+}
+
+/// Author one prim's `references` arc (v1.5.10) onto its own spec: the layer the
+/// key names, as authored, and the prim inside it.
+///
+/// The arc is a **composition field**, written the way `RusdInstances` writes an
+/// instance's arc (`sdf::ReferenceListOp::explicit` + `FieldKey::References`), so a
+/// reader of the layer sees a reference and not an attribute that happens to be
+/// named like one. An internal reference (a prim of this stage) leaves
+/// `asset_path` empty, which is USD's spelling for it.
+fn author_reference(
+    d: &mut dyn sdf::AbstractData,
+    prim: &rusd_core::PrimPath,
+    reference: &crate::reference::AssetRef,
+) -> Result<(), openusd::sdf::AuthoringError> {
+    let path = sdf::path(prim.as_str())?;
+    let op = sdf::ReferenceListOp::explicit([sdf::Reference {
+        asset_path: reference.asset.clone().unwrap_or_default(),
+        prim_path: reference.path.clone(),
+        ..Default::default()
+    }]);
+    d.set_field(
+        &path,
+        sdf::FieldKey::References.as_str(),
+        SdfValue::ReferenceListOp(op),
+    );
     Ok(())
 }
 

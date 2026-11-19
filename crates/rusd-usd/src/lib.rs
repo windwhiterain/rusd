@@ -34,7 +34,7 @@ pub fn export_text(
     out: &str,
     bake: bool,
 ) -> Result<ExportInfo, Vec<Diagnostic>> {
-    let doc = rusd_core::syntax::parse(text)?;
+    let doc = rusd_core::syntax::parse_in(text, doc_dir)?;
     let vdiags = rusd_scene::validate(&doc);
     if vdiags.iter().any(|d| d.severity == Severity::Error) {
         return Err(vdiags);

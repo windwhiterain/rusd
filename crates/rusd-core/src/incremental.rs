@@ -105,6 +105,10 @@ impl IncrementalParser {
         Ok(ParsedDocument {
             stage,
             prims,
+            // v1.5.10: an incremental pass sees one document's text and nothing
+            // else, so it learns no directory; a relative `references` asset is
+            // `parse`'s question, not this one's.
+            doc_dir: None,
             annotations: annotations.into_values().collect(),
         })
     }

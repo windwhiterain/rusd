@@ -117,6 +117,20 @@ pub fn expand_doc(
     doc: &ParsedDocument,
     doc_dir: Option<&str>,
 ) -> Result<ExpandOutput, Vec<Diagnostic>> {
+    // v1.5.10: a prim-level `references` arc resolves a relative asset against the
+    // directory of the document that named it, and the adapter reads that directory
+    // off the parsed document. A caller that parsed the text without it (and knows
+    // it separately) hands it over here, so both spellings reach the same lowering.
+    let with_dir;
+    let doc = if doc.doc_dir.is_none() && doc_dir.is_some() {
+        with_dir = ParsedDocument {
+            doc_dir: doc_dir.map(str::to_owned),
+            ..doc.clone()
+        };
+        &with_dir
+    } else {
+        doc
+    };
     let stage = rusd_scene::lower(doc)?;
     let root_id = stage.root_layer().identifier().to_owned();
     let nodes = nodes_from_doc(doc, doc_dir);
