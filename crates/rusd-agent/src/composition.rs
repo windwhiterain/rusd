@@ -94,6 +94,12 @@ struct LayerEntry {
     /// was built with the cook's [`CookOp`] list and one of its rows names this
     /// layer as its output. Always `None` on a layer that is not an op.
     op_name: Option<String>,
+    /// The **anchor prim path** of the node that wrote this layer (v1.8): the
+    /// generator node's own path, which is the `CookOp`'s `id`. A client that has a
+    /// layer row and wants the generator node (its `comp_node`, its inputs) gets the
+    /// node by name instead of guessing it from the prims the layer happens to
+    /// author. Always `None` on a layer that is not an op.
+    node: Option<String>,
     /// The `input_points` prim the generator read. `None` when it read no
     /// geometry at all — a parametric generator — and when no cook op answered
     /// for this layer; the wire tells those two apart by [`LayerEntry::op`] and
@@ -275,6 +281,7 @@ impl CompositionTree {
                     strength,
                     op,
                     op_name: joined.map(|o| o.generator.clone()),
+                    node: joined.map(|o| o.id.clone()),
                     op_input: joined.and_then(|o| o.input.clone()),
                     description,
                 }
@@ -331,12 +338,7 @@ impl CompositionTree {
                 specs: Vec::new(),
             })
             .collect();
-        Some(json!({
-            "id": layer.id,
-            "kind": layer.kind,
-            "description": layer.description,
-            "specs": layer_spec_rows(stage, &layer.id, &scans),
-        }))
+        Some(op_layer_json(stage, layer, &scans))
     }
 
     /// The wire shape of `composition_tree{}`.
@@ -354,12 +356,15 @@ impl CompositionTree {
                     "description": l.description,
                 });
                 // PROTOCOL v1.5.1: only an op row carries the generator's name
-                // and its input; the three fields are additive, so a client that
-                // predates them ignores what it does not know.
+                // and its input; the four fields are additive, so a client that
+                // predates them ignores what it does not know. v1.8 adds `node`,
+                // the generator node's anchor prim path — `op_name` says which
+                // generator ran, `node` says which node of the document it was.
                 if l.op {
                     row["op_name"] = json!(l.op_name);
                     row["input"] = json!(l.op_input);
                     row["output"] = json!(l.id);
+                    row["node"] = json!(l.node);
                 }
                 row
             }).collect::<Vec<_>>(),
@@ -384,6 +389,42 @@ impl CompositionTree {
                 "selection": v.selection,
             })).collect::<Vec<_>>(),
         })
+    }
+
+    /// The arcs a composed prim **itself** authors, as arc ids: the outgoing
+    /// edges of this prim, read across the arcs that opened it (v1.8).
+    ///
+    /// An arc's `source_prim` is a path **in its own layer**, so matching it against
+    /// the composed path finds an arc only when the two spellings coincide. Under a
+    /// reference they do not: `/World/Clusters/i000000/i000009`'s reference to the
+    /// prototype is authored by `cluster.usda` at `/World/Boxes/i000009`, so the plain
+    /// comparison found nothing and a nested prim reported no outgoing edges.
+    /// `Prim::prim_stack` supplies the translation, and the arc is this prim's when
+    /// its source is one of the specs contributing to it.
+    fn arcs_out(&self, stage: &Stage, path: &str) -> Vec<String> {
+        let Ok(wanted) = sdf::path(path) else {
+            return Vec::new();
+        };
+        let Ok(prim) = stage.prim(&wanted) else {
+            return Vec::new();
+        };
+        let sites: Vec<(String, String)> = match prim.prim_stack() {
+            Ok(sites) => sites
+                .into_iter()
+                .map(|s| (s.layer, s.path.as_str().to_owned()))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        self.arcs
+            .iter()
+            .filter(|arc| {
+                arc.source_prim == path
+                    || sites
+                        .iter()
+                        .any(|(layer, site)| *layer == arc.source_layer && *site == arc.source_prim)
+            })
+            .map(|arc| arc.id.clone())
+            .collect()
     }
 
     /// The detail of one node (`comp_node{id}`), or `None` when nothing carries
@@ -421,11 +462,8 @@ impl CompositionTree {
                 "kind_type": "prim",
                 "id": id,
                 "path": path,
-                "opinions": opinions(stage, &self.layers, path),
-                "arcs_out": self.arcs.iter()
-                    .filter(|a| a.source_prim == path)
-                    .map(|a| a.id.clone())
-                    .collect::<Vec<_>>(),
+                "opinions": opinions(stage, path),
+                "arcs_out": self.arcs_out(stage, path),
                 "variant_sets": self.vsets.iter()
                     .filter(|v| v.prim == path)
                     .map(|v| v.id.clone())
@@ -472,6 +510,29 @@ fn arc_rank(kind: &str) -> usize {
 fn with_layer<T>(stage: &Stage, layer: &str, f: impl FnOnce(&sdf::Layer) -> T) -> Option<T> {
     let guard = stage.layer(layer)?;
     Some(f(&guard))
+}
+
+/// One `layer{id}` answer (PROTOCOL v1.5.5, extended by v1.8): what the layer
+/// authors, and — for an op layer — which generator node wrote it.
+///
+/// `node` is the same field [`CompositionTree::to_json`] puts on an op row, so a
+/// client that reached this layer from the tree and a client that asked for it by
+/// id get one answer. A layer that is not an op carries no `node` at all, for the
+/// reason it carries no `op_name`: nothing generated it, so there is no node to
+/// name.
+fn op_layer_json(stage: &Stage, layer: &LayerEntry, scans: &[LayerScan]) -> Value {
+    let mut answer = json!({
+        "id": layer.id,
+        "kind": layer.kind,
+        "description": layer.description,
+        "specs": layer_spec_rows(stage, &layer.id, scans),
+    });
+    if layer.op {
+        answer["op_name"] = json!(layer.op_name);
+        answer["input"] = json!(layer.op_input);
+        answer["node"] = json!(layer.node);
+    }
+    answer
 }
 
 /// Every spec in a layer, with its type. Read as a whole so later scans need no
@@ -639,6 +700,39 @@ fn spec_type_of(stage: &Stage, layer: &str, path: &sdf::Path) -> Option<SpecType
     with_layer(stage, layer, |borrow| borrow.data().spec_type(path)).flatten()
 }
 
+/// Which layers a composed prim **composes from**, strongest first: the layers
+/// whose specs contribute to it, in the order composition applies them.
+///
+/// This is `Prim::prim_stack`, not a scan of each layer's own spec list, and the
+/// difference is the whole point (v1.8): under a reference, the contributing spec
+/// sits in the target layer at a **different path**. `/World/Clusters/i000000/i000009`
+/// is authored as `/World/Boxes/i000009` inside `cluster.usda`, and that spec is
+/// itself under a reference to `prototypes.usda`'s `/World/Prototypes/Box`. Only
+/// the composed stack knows that; a layer's own `spec_paths` never mentions the
+/// stage path at all.
+///
+/// A layer outside the stage is simply not in the answer, and a prim no layer
+/// authors answers empty — the two are not distinguished, because a client can
+/// tell neither apart in the tree either.
+fn authored_in(stage: &Stage, path: &str) -> Vec<String> {
+    let Ok(path) = sdf::path(path) else {
+        return Vec::new();
+    };
+    let Ok(prim) = stage.prim(&path) else {
+        return Vec::new();
+    };
+    let Ok(sites) = prim.prim_stack() else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for site in sites {
+        if !out.contains(&site.layer) {
+            out.push(site.layer);
+        }
+    }
+    out
+}
+
 /// One prim's opinions, strongest layer first: what the inspector shows for a
 /// prim node.
 ///
@@ -650,28 +744,34 @@ fn spec_type_of(stage: &Stage, layer: &str, path: &sdf::Path) -> Option<SpecType
 /// (`primChildren`, `propertyChildren`, `variantSetChildren`) and the specifier
 /// are left out: they describe the layer's structure, and the specifier is
 /// reported apart.
-fn opinions(stage: &Stage, layers: &[LayerEntry], path: &str) -> Vec<Value> {
+///
+/// Each row is read **at the path the spec actually occupies in its own layer**
+/// (v1.8), which under a reference is not the composed path. That is what makes a
+/// nested asset's prim detail say something: the spec for
+/// `/World/Clusters/i000000/i000009` lives in `cluster.usda` at
+/// `/World/Boxes/i000009`, so reading `cluster.usda` at the composed path would find
+/// nothing and report an empty opinion list. `Prim::prim_stack` pairs each
+/// contributing layer with its own path, which is exactly the translation needed.
+fn opinions(stage: &Stage, path: &str) -> Vec<Value> {
     let Ok(wanted) = sdf::path(path) else {
         return Vec::new();
     };
+    let Ok(prim) = stage.prim(&wanted) else {
+        return Vec::new();
+    };
+    let Ok(sites) = prim.prim_stack() else {
+        return Vec::new();
+    };
     let mut out = Vec::new();
-    for layer in layers {
-        // `with_layer` answers `None` for a layer the stage does not hold, and the
-        // closure answers `None` for a layer that authors no spec for this prim.
+    for site in sites {
         let spec = with_layer(
             stage,
-            &layer.id,
+            &site.layer,
             |borrow| -> Option<(Vec<Value>, &'static str)> {
                 let data = borrow.data();
-                let at = data.spec_paths().into_iter().find(|candidate| {
-                    candidate == &wanted
-                        || (matches!(
-                            data.spec_type(candidate),
-                            Some(SpecType::Prim | SpecType::Variant)
-                        ) && candidate.strip_all_variant_selections() == wanted)
-                })?;
+                let at = &site.path;
                 let specifier = match data
-                    .try_field(&at, FieldKey::Specifier.as_str())
+                    .try_field(at, FieldKey::Specifier.as_str())
                     .ok()
                     .flatten()
                     .map(|v| v.into_owned())
@@ -682,19 +782,19 @@ fn opinions(stage: &Stage, layers: &[LayerEntry], path: &str) -> Vec<Value> {
                     _ => "",
                 };
                 let mut fields = Vec::new();
-                for name in data.list_fields(&at).unwrap_or_default() {
+                for name in data.list_fields(at).unwrap_or_default() {
                     if BOOKKEEPING.contains(&name.as_str()) || name == FieldKey::Specifier.as_str()
                     {
                         continue;
                     }
-                    let Some(value) = data.try_field(&at, &name).ok().flatten() else {
+                    let Some(value) = data.try_field(at, &name).ok().flatten() else {
                         continue;
                     };
                     fields.push(json!({ "name": name, "value": sdf_to_json(&value) }));
                 }
                 // A property spec is an opinion on its prim: the override a
                 // gizmo writes is one of these, not a field of the prim spec.
-                for property in property_names(data, &at) {
+                for property in property_names(data, at) {
                     let Ok(property_path) = at.append_property(property.as_str()) else {
                         continue;
                     };
@@ -717,8 +817,12 @@ fn opinions(stage: &Stage, layers: &[LayerEntry], path: &str) -> Vec<Value> {
             continue;
         };
         out.push(json!({
-            "layer": layer.id,
+            "layer": site.layer,
             "specifier": specifier,
+            // The spec's path in its own layer, which differs from the composed
+            // path under a reference. Reported so a client can tell a nested asset's
+            // opinion from a same-namespace one without re-deriving the arc chain.
+            "path": site.path.as_str(),
             "fields": fields,
         }));
     }
@@ -905,23 +1009,6 @@ fn scan_namespace(
     scans: &[LayerScan],
     layers: &[LayerEntry],
 ) -> (Vec<PrimEntry>, Vec<VariantSetEntry>) {
-    // Who authors each prim, strongest first. A spec inside a variant is an
-    // opinion on the prim once its selections are stripped, so both spellings
-    // land on one key.
-    let mut authored: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for scan in scans {
-        for (path, ty) in &scan.specs {
-            if !matches!(ty, SpecType::Prim | SpecType::Variant) {
-                continue;
-            }
-            let key = path.strip_all_variant_selections().as_str().to_owned();
-            let list = authored.entry(key).or_default();
-            if !list.iter().any(|id| id == &scan.id) {
-                list.push(scan.id.clone());
-            }
-        }
-    }
-
     let mut paths: Vec<String> = Vec::new();
     let _ = stage.traverse(PrimPredicate::ALL, |p| paths.push(p.as_str().to_owned()));
     paths.retain(|p| !p.is_empty() && p != "/");
@@ -929,21 +1016,22 @@ fn scan_namespace(
     paths.dedup();
     let prims: Vec<PrimEntry> = paths
         .into_iter()
-        .map(|path| {
-            let key = sdf::path(&path)
-                .map(|p| p.strip_all_variant_selections().as_str().to_owned())
-                .unwrap_or_else(|_| path.clone());
-            PrimEntry {
-                id: format!("prim:{path}"),
-                authored_in: authored.get(&key).cloned().unwrap_or_default(),
-                path,
-            }
+        .map(|path| PrimEntry {
+            authored_in: authored_in(stage, &path),
+            id: format!("prim:{path}"),
+            path,
         })
         .collect();
 
     // Variant sets, one row per `(prim, set)`: the variants any layer declares,
     // in the order the strongest declaring layer lists them, plus who authors
     // each variant's spec.
+    //
+    // Variant specs live in the layers that declare them, and a variant set is
+    // declared on a prim spec — so the declaring layer is always one that authors
+    // the prim itself. A layer scan is therefore the right source here in a way it
+    // is not for `authored_in`: a variant set is an authored fact about a layer,
+    // while which layers a prim *composes from* crosses arcs.
     let mut found: Vec<(String, String)> = Vec::new();
     let mut declared: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for scan in scans {
@@ -1143,6 +1231,10 @@ pub fn sdf_to_json(value: &SdfValue) -> Value {
         }
         S::TokenListOp(op) => json!({
             "explicit": op.explicit,
+            // The items of an `explicit` list op are its *explicit_items*, not `add`:
+            // an authored `references = @x.usda@` is `explicit([x])`, so dropping this
+            // field reported every authored arc as an empty list (v1.8).
+            "explicit_items": op.explicit_items.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
             "prepend": op.prepended_items.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
             "add": op.added_items.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
             "append": op.appended_items.iter().map(|t| t.as_str()).collect::<Vec<_>>(),
@@ -1150,6 +1242,7 @@ pub fn sdf_to_json(value: &SdfValue) -> Value {
         }),
         S::StringListOp(op) => json!({
             "explicit": op.explicit,
+            "explicit_items": op.explicit_items,
             "prepend": op.prepended_items,
             "add": op.added_items,
             "append": op.appended_items,
@@ -1157,6 +1250,7 @@ pub fn sdf_to_json(value: &SdfValue) -> Value {
         }),
         S::PathListOp(op) => json!({
             "explicit": op.explicit,
+            "explicit_items": op.explicit_items.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
             "prepend": op.prepended_items.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
             "add": op.added_items.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
             "append": op.appended_items.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
@@ -1164,6 +1258,7 @@ pub fn sdf_to_json(value: &SdfValue) -> Value {
         }),
         S::ReferenceListOp(op) => json!({
             "explicit": op.explicit,
+            "explicit_items": op.explicit_items.iter().map(reference_json).collect::<Vec<_>>(),
             "prepend": op.prepended_items.iter().map(reference_json).collect::<Vec<_>>(),
             "add": op.added_items.iter().map(reference_json).collect::<Vec<_>>(),
             "append": op.appended_items.iter().map(reference_json).collect::<Vec<_>>(),
@@ -1171,6 +1266,7 @@ pub fn sdf_to_json(value: &SdfValue) -> Value {
         }),
         S::PayloadListOp(op) => json!({
             "explicit": op.explicit,
+            "explicit_items": op.explicit_items.iter().map(payload_json).collect::<Vec<_>>(),
             "prepend": op.prepended_items.iter().map(payload_json).collect::<Vec<_>>(),
             "add": op.added_items.iter().map(payload_json).collect::<Vec<_>>(),
             "append": op.appended_items.iter().map(payload_json).collect::<Vec<_>>(),
