@@ -575,3 +575,40 @@ prim**（视口描边高亮 + `comp_node` 详情，与视口 pick 同一条路�
 **任何情况下不出现 prim 行**（v1.3 裁定）。聚合行（`xN`）不可展开、无 chevron；单个 mesh 的检视
 走视口 pick -> 详情按层视图，或 `i` 只看选中。`composition_tree` 的 `prim_nodes` 仍随 wire 发送，
 供 pick 解析，只不画。
+
+## v1.7 增补（viewer 控制 RPC：GUI 的每个操作都有对等的 agent 入口；2026-11-18）
+
+**目的**：agent 不该用 computer use 去点 viewer 的 GUI（会和用户抢鼠标）。viewer 以
+`view --connect <server> [--control <addr>]` 启动时，在 `--control` 地址上开一条
+**NDJSON JSON-RPC** 控制通道（一请求一行，同 server wire 的形状），把 GUI 的每个操作
+暴露成有名字的方法。所有方法走 **和 GUI 事件同一条路径**（egui 线程上的同一处理函数），
+不是第二套实现。
+
+### 方法表（v1）
+
+| 方法 | 参数 | 语义（= GUI 上哪一下） |
+| --- | --- | --- |
+| `state` | — | 当前连接、version、preview、selection、isolate、树是否已载入 |
+| `open` | `{path}` | 等同文档打开（转发给 server 的 `open`，回 server 的答复） |
+| `preview` | `{upto: <层 id> \| null}` | 点该层行 / final 按钮（预览控制） |
+| `tree` | `{id}` | 点树上该 id 的行（按行类型：层行=选中+详情+预览，弧=详情，最终与 GUI 同一 `action_for`） |
+| `select` | `{path}` | 等同视口 pick：选中该 prim（描边+详情） |
+| `isolate` | `{on: bool}` | 「只看选中」开关（= 键 `i` / 底栏按钮） |
+| `fit` | — | Fit 按钮 |
+| `orbit` | `{yaw, pitch, dist, target:[x,y,z]?}` | 轨道相机（等同鼠标拖/滚） |
+| `capture` | `{path}` | 把当前帧写成 PNG（等同「选区截图」去掉选区：整帧） |
+| `shot` | `{path}` | 同上（别名，留给脚本习惯） |
+
+- 答复形状与 server wire 一致：`{"jsonrpc":"2.0","id":n,"result":{...}}` / `"error":{code,message}`；
+  `state` 永远可答；涉及 server 的方法在没有连接时答 `-32000`（未连接）。
+- 未知方法 `-32601`；参数错 `-32602`。
+- 控制端口默认**关闭**（不加 `--control` 不监听）；默认只绑 loopback。
+- 纯 GUI 驱动：控制 RPC **不改合成、不推快照**——preview/open 仍是 viewer 自己那条 server
+  连接上的普通请求，语义与用户点出来的完全一样。
+
+### 验收
+
+- 脚本（无 GUI 交互）能完成：open → tree 列出层 → preview 到某 op 层 → select 一个实例 →
+  isolate 开 → capture 出 PNG → preview null 恢复 —— 全部只经控制 RPC。
+- 未知方法/未连接/参数错三种错误码按上表。
+- 既有点击路径不变（控制 RPC 是同一处理函数的第二入口）。
