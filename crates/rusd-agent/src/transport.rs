@@ -1269,6 +1269,30 @@ impl Session {
     /// the picture should be: the target contributes nothing without the arc that
     /// reaches it, and that arc is authored in an op layer, which the stop mutes.
     fn snapshot_line(&self, version: u64, upto: Option<Preview>) -> Result<String, String> {
+        // A **solo** stop is not a prefix of this stage: an asset layer enters
+        // composition only through the arcs that reference it, so muting the
+        // referencing layers would leave the asset with no arcs at all (0 prims,
+        // measured). Solo therefore builds a stage **of that one layer** -- the
+        // node renders its own thing (v1.8).
+        if let Some(Preview::Solo(id)) = &upto {
+            let solo = Stage::open(id).map_err(|e| format!("solo stage {id}: {e}"))?;
+            let flat = solo.flatten().map_err(|e| format!("flatten failed: {e}"))?;
+            let format = sdf::LayerRegistry::find_by_id("usdc")
+                .ok_or("the usdc file format is not registered")?;
+            let written = format
+                .write_bytes(flat.data())
+                .map_err(|e| format!("usdc write failed: {e}"))?;
+            let params = json!({
+                "version": version,
+                "format": "usdc",
+                "data": base64_encode(&written.bytes),
+                "upto": id,
+            });
+            return Ok(to_line(&json!({
+                "method": "stage_snapshot",
+                "params": params,
+            })));
+        }
         let Some(stage) = self.stage.as_ref() else {
             return Err("no scene open; nothing to snapshot".into());
         };
