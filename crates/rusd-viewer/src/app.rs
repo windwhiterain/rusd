@@ -289,6 +289,10 @@ pub struct Shell {
     /// Whether the composition-tree panel is expanded. Collapsing it gives the width
     /// back to the viewport on the next pass — the same path a drag-resize takes.
     tree_open: bool,
+    /// The **scene tree** panel (`docs/PROTOCOL.md` v1.3's prims, reached): the prims the
+    /// scene has, as a hierarchy, kept apart from the composition tree because that panel
+    /// draws structure only. Closed by default — the viewport is what the window is for.
+    scene: crate::scenetree::ScenePanel,
     /// Whether `composition_tree{}` has been asked for this connection: asked once
     /// when the first snapshot arrives, and again on 「刷新」.
     tree_asked: bool,
@@ -346,11 +350,26 @@ struct Waiting {
 }
 
 impl Waiting {
-    /// A waiter holding `reply`, owing nothing yet.
+    /// A waiter holding `reply`, owing nothing: the caller fills in what it sent.
     fn new(reply: crate::control::Replier, shape: Shape) -> Self {
         Self {
             reply,
             awaiting: Vec::new(),
+            results: BTreeMap::new(),
+            shape,
+        }
+    }
+
+    /// A waiter that will be answered when the tags in `owed` have all come back.
+    ///
+    /// `owed` is what the click this waiter stands for is about to send — one tag for a
+    /// row's detail, two for a layer row that also asks for a composition. It is written
+    /// here rather than discovered from the replies, because a request that is never sent
+    /// (nothing to ask) must not leave a waiter that nothing will ever fill.
+    fn with(reply: crate::control::Replier, shape: Shape, owed: Vec<&'static str>) -> Self {
+        Self {
+            reply,
+            awaiting: owed,
             results: BTreeMap::new(),
             shape,
         }
@@ -369,7 +388,6 @@ enum Shape {
         id: String,
         kind: String,
         action: &'static str,
-        live_preview: bool,
     },
     /// `select{path}`: the path, the selection, and the `comp_node` node it resolved to.
     Pick { path: String },
@@ -395,18 +413,12 @@ impl Shape {
                 .and_then(|r| r.as_ref().ok())
                 .cloned()
                 .unwrap_or(serde_json::Value::Null)),
-            Shape::Row {
-                id,
-                kind,
-                action,
-                live_preview,
-            } => Ok(json!({
+            Shape::Row { id, kind, action } => Ok(json!({
                 "id": id,
                 "kind": kind,
                 "action": action,
                 "detail": lookup(results, NODE_TAG),
                 "preview": lookup(results, PREVIEW_TAG),
-                "preview_control": live_preview,
             })),
             Shape::Pick { path } => Ok(json!({
                 "path": path,
@@ -443,8 +455,9 @@ fn orbit_json(o: Orbit) -> serde_json::Value {
 fn action_word(action: &crate::panel::TreeAction) -> &'static str {
     match action {
         crate::panel::TreeAction::Select(_) => "select",
-        crate::panel::TreeAction::Layer { preview: true, .. } => "layer-preview",
-        crate::panel::TreeAction::Layer { preview: false, .. } => "layer-detail",
+        crate::panel::TreeAction::Layer { ask: Some(ask), .. } => ask.as_str(),
+        crate::panel::TreeAction::Layer { ask: None, .. } => "layer-detail",
+        crate::panel::TreeAction::PreviewSolo(_) => "preview-solo",
         crate::panel::TreeAction::Preview(_) => "preview",
         crate::panel::TreeAction::Refresh => "refresh",
         crate::panel::TreeAction::None => "none",
@@ -601,6 +614,7 @@ impl Shell {
             overlay_collapsed: false,
             tree: crate::panel::TreePanel::new(),
             tree_open: true,
+            scene: crate::scenetree::ScenePanel::new(),
             tree_asked: false,
             capture_armed: false,
             only_selected: false,
@@ -623,7 +637,9 @@ impl Shell {
                     // status bar must now say. Without this the view kept
                     // claiming "connecting" while snapshots were arriving.
                     self.model.mark_live();
-                    self.status = self.model.status_line_zh(|id| self.layer_name(id));
+                    self.status = self
+                        .model
+                        .status_line_zh(self.preview_kind(), |id| self.layer_name(id));
                     self.ask_tree();
                     self.request_repaint();
                 }
@@ -669,7 +685,9 @@ impl Shell {
                 self.on_state_changed(version, &reason);
             }
             Effect::Status => {
-                self.status = self.model.status_line_zh(|id| self.layer_name(id));
+                self.status = self
+                    .model
+                    .status_line_zh(self.preview_kind(), |id| self.layer_name(id));
                 self.request_repaint();
             }
             Effect::Nothing => {}
@@ -720,7 +738,9 @@ impl Shell {
             // The rows are on screen until the answer replaces them (`view::ask_tree`).
             self.tree_asked = true;
         }
-        self.status = self.model.status_line_zh(|id| self.layer_name(id));
+        self.status = self
+            .model
+            .status_line_zh(self.preview_kind(), |id| self.layer_name(id));
         self.request_repaint();
     }
 
@@ -749,7 +769,9 @@ impl Shell {
         // The composition on screen, echoed to the panel so its op row can be marked
         // and its 「final」 button reads the state the viewport is actually in (v1.4).
         self.tree.preview = self.model.preview.clone();
-        self.status = self.model.status_line_zh(|id| self.layer_name(id));
+        self.status = self
+            .model
+            .status_line_zh(self.preview_kind(), |id| self.layer_name(id));
         self.preview = None;
         self.gizmo = None;
         // The first scene of a session is when `composition_tree{}` becomes
@@ -866,6 +888,28 @@ impl Shell {
         });
     }
 
+    /// Ask `preview{solo: <layer>}` for a **material layer row's** click (v1.8): that
+    /// layer's own content and nothing else, every other layer muted (the session layer
+    /// excepted, so an override stays visible).
+    ///
+    /// The other composition a layer row can ask for, and the reason a row names which
+    /// one it wants ([`crate::panel::LayerAsk`]): a reference or a plain sublayer is not a
+    /// stop in the cook order, so `preview{upto}` has nothing to say about it.
+    ///
+    /// Everything after the request is the same as [`Shell::ask_preview`]'s: the scene
+    /// arrives as an ordinary `stage_snapshot` whose `upto` names this layer, the version
+    /// does not move, `model.preview` follows the frame (never the request) — which is what
+    /// keeps a refused id (`-32602`) from leaving the bar claiming a composition the
+    /// viewport never showed.
+    fn ask_solo(&mut self, layer: String) {
+        self.status = format!("solo {layer}: 请求中…");
+        self.net.send(NetCommand::Call {
+            tag: PREVIEW_TAG.to_owned(),
+            method: "preview".to_owned(),
+            params: protocol::preview_solo_params(&layer),
+        });
+    }
+
     /// A `NetCommand::Call` was answered: route it by its tag.
     ///
     /// **The control channel's waiters see the reply first** (`note_control_result`): a
@@ -912,10 +956,19 @@ impl Shell {
                     self.status = "preview：服务器无此方法（server 版本）".to_owned();
                 }
                 Err((code, message)) => {
-                    // `-32602` for an unknown `upto`: the panel keeps the previous frame,
-                    // and `model.preview` still names it — which is why the field follows
-                    // the snapshot rather than the request.
-                    self.status = format!("preview failed: {message} (code {code})");
+                    // `-32602` for an unknown id (the panel keeps the previous frame, and
+                    // `model.preview` still names it — which is why the field follows the
+                    // snapshot rather than the request), or a `solo` a server from before
+                    // v1.8 does not have. The second reads as a version note, because a
+                    // material row's click is the only thing that can send it.
+                    self.status = if message.contains("solo") {
+                        format!(
+                            "preview{{solo}}：服务器无此参数（server 版本）——{message} \
+                             (code {code})"
+                        )
+                    } else {
+                        format!("preview failed: {message} (code {code})")
+                    };
                 }
             },
             CAPTURE_TAG => match reply {
@@ -986,20 +1039,28 @@ impl Shell {
 
     /// A **layer row** was clicked: the one click a layer has, whatever drew it.
     ///
-    /// The detail first -- a layer row always shows that layer's `comp_node` -- then the
-    /// jump to the layer's own row, then the preview when the layer is a control
-    /// (`preview: true`, which `action_for` sets for exactly the root and cook op
-    /// layers). Asking both is the user's ruling made executable: 点 reference 的层叶子
-    /// == 点这个 layer 本体, so neither half may be skipped for either row.
+    /// The detail first — a layer row always shows that layer's `comp_node` — then the
+    /// jump to the layer's own row, then the composition the row asks for
+    /// ([`crate::panel::ask_for`]): `preview{upto}` for a cook op or the root layer,
+    /// `preview{solo}` for a material (reference / plain sublayer) layer, nothing for the
+    /// session layer. Asking both halves is the user's ruling made executable: 点
+    /// reference 的层叶子 == 点这个 layer 的本身
+    /// (`docs/PROTOCOL.md` v1.5.5), so neither half may be skipped for either row.
     ///
-    /// The preview goes through [`Shell::ask_preview`] like the 「final」 button does, so
-    /// a refused `upto` (`-32602`) is reported the same way rather than leaving the bar
-    /// claiming a prefix the viewport never showed.
-    fn on_tree_layer(&mut self, selection: crate::tree::TreeSelection, preview: bool) {
+    /// The preview goes through [`Shell::ask_preview`] / [`Shell::ask_solo`] like the
+    /// 「final」 button does, so a refused id (`-32602`) is reported the same way rather
+    /// than leaving the bar claiming a composition the viewport never showed.
+    fn on_tree_layer(
+        &mut self,
+        selection: crate::tree::TreeSelection,
+        ask: Option<crate::panel::LayerAsk>,
+    ) {
         let id = selection.id.clone();
         self.on_tree_select(selection);
-        if preview {
-            self.ask_preview(Some(id));
+        match ask {
+            Some(crate::panel::LayerAsk::Upto) => self.ask_preview(Some(id)),
+            Some(crate::panel::LayerAsk::Solo) => self.ask_solo(id),
+            None => {}
         }
     }
 
@@ -1372,6 +1433,16 @@ impl Shell {
                         "depth": depth,
                         "op": node.op,
                         "root": node.root,
+                        "session": node.session,
+                        // Which composition this row's click asks for, in the words the
+                        // channel's own `preview` method takes: a script reads this and
+                        // sends `preview{upto}` / `preview{solo}` rather than re-deriving
+                        // the rule from the flags it can see.
+                        "preview_ask": match crate::panel::ask_for(&node) {
+                            Some(crate::panel::LayerAsk::Upto) => "upto",
+                            Some(crate::panel::LayerAsk::Solo) => "solo",
+                            None => "none",
+                        },
                         "prim": node.prim,
                         "rows_below": node.children.len(),
                     })
@@ -1381,7 +1452,15 @@ impl Shell {
                 "state": if self.tree.model.ready() { "ready" } else { "not_ready" },
                 "status": self.tree.model.status_zh(),
                 "preview": self.model.preview,
-                    "rows": rows,
+                // Which composition the frame on screen is, in the same words a row's
+                // `preview_ask` uses: `upto` for a cook prefix, `solo` for a bare layer, and
+                // `final` when nothing is muted.
+                "composition": match (self.model.preview.is_some(), self.preview_kind()) {
+                    (false, _) => "final",
+                    (true, Some(crate::panel::LayerAsk::Solo)) => "solo",
+                    (true, _) => "upto",
+                },
+                "rows": rows,
             })));
         };
         if let Err(e) = self.need_server() {
@@ -1411,20 +1490,25 @@ impl Shell {
             id: row.id.clone(),
             kind: row.kind.as_str().to_owned(),
             action: action_word(&action),
-            live_preview: matches!(
-                &action,
-                crate::panel::TreeAction::Layer { preview: true, .. }
-            ) || matches!(&action, crate::panel::TreeAction::Preview(_)),
+        };
+        // Which reply tags that click will owe. A `Layer` arm asks its layer's `comp_node`
+        // detail, and when the row names a composition it asks for that too — one preview
+        // tag whichever form (both are the `preview` method). A plain `Select` asks its
+        // detail alone; whether it has a prim node at all was settled above.
+        let owed = match &action {
+            crate::panel::TreeAction::Layer { ask: Some(_), .. } => vec![NODE_TAG, PREVIEW_TAG],
+            _ => vec![NODE_TAG],
         };
         // The replier is in hand **before** the click runs: `on_tree_*` sends its request
         // on the spot, and that request's reply is what this one waits for.
-        self.waiting.push(Waiting::new(reply, shape));
+        self.waiting.push(Waiting::with(reply, shape, owed));
         match action {
             crate::panel::TreeAction::Select(sel) => self.on_tree_select(sel),
-            crate::panel::TreeAction::Layer { selection, preview } => {
-                self.on_tree_layer(selection, preview)
+            crate::panel::TreeAction::Layer { selection, ask } => {
+                self.on_tree_layer(selection, ask)
             }
             crate::panel::TreeAction::Preview(upto) => self.ask_preview(upto),
+            crate::panel::TreeAction::PreviewSolo(layer) => self.ask_solo(layer),
             // `action_for` never returns these for a row that exists (`Refresh` is the
             // panel's button and `None` is "no click"), so nothing was sent: the waiter
             // has no tag to wait for and `note_control_result` would never see it.
@@ -1469,10 +1553,18 @@ impl Shell {
         if let Err(e) = self.need_server() {
             return Some(Err(e));
         }
-        if !self.model.centers.contains_key(&path) {
+        // A path is selectable when **either** side knows it: the frame on screen (an
+        // outline follows a selection there) or the composition report (`prim_nodes`, which
+        // is what the scene tree draws and what a per-layer detail needs). Requiring the
+        // frame alone refused a scene-tree row whose prim the last render did not contain —
+        // a report and a frame are two answers about the same stack, and they need not
+        // arrive in the same breath.
+        let in_scene = self.model.centers.contains_key(&path);
+        let in_report = self.tree.model.prim_id(&path).is_some();
+        if !in_scene && !in_report {
             return Some(Err(args.bad(format!(
-                "no prim at {path:?} in the scene on screen ({} prims); \
-                 select takes a prim path the current scene contains",
+                "no prim at {path:?}: the scene on screen has {} prims and the composition \
+                 report lists none by that path",
                 self.model.item_count
             ))));
         }
@@ -1514,7 +1606,9 @@ impl Shell {
         self.tree.detail_error = None;
         self.ask_render();
         self.inspect_picked(path);
-        self.status = self.model.status_line_zh(|id| self.layer_name(id));
+        self.status = self
+            .model
+            .status_line_zh(self.preview_kind(), |id| self.layer_name(id));
         self.window.request_redraw();
     }
 
@@ -1738,7 +1832,10 @@ impl Shell {
                 // box right here), and it is the one a user reads. The detailed
                 // ASCII line follows for diagnostics and for a viewer whose
                 // font did not load.
-                ui.label(self.model.status_line_zh(|id| self.layer_name(id)));
+                ui.label(
+                    self.model
+                        .status_line_zh(self.preview_kind(), |id| self.layer_name(id)),
+                );
                 ui.separator();
                 ui.label(&self.status);
                 ui.separator();
@@ -1784,6 +1881,30 @@ impl Shell {
                             self.tree_open = false;
                         }
                     });
+                    // The list of what the panel holds: the composition tree (layers, arcs,
+                    // variant sets) and, beside it, the **scene tree** (the prims). Two
+                    // panels rather than one because v1.3 ruled prim rows out of the
+                    // composition tree and the ruling still holds; the scene tree is where
+                    // the prims are, and it is closed until asked for.
+                    let mut scene_changed = false;
+                    ui.horizontal(|ui| {
+                        let text = if self.scene.open {
+                            "场景树 ✓"
+                        } else {
+                            "场景树"
+                        };
+                        if ui
+                            .small_button(text)
+                            .on_hover_text("该场景的 prim 层级树（默认收起；点行即选中）")
+                            .clicked()
+                        {
+                            self.scene.open = !self.scene.open;
+                            scene_changed = true;
+                        }
+                    });
+                    if scene_changed {
+                        self.window.request_redraw();
+                    }
                     // The detail gets its own bottom section inside the panel: the tree is
                     // a full-height scroll area, so a detail drawn *after* it lands below
                     // the visible rect and is never seen (v1.5.5 lesson: the feature
@@ -1798,12 +1919,37 @@ impl Shell {
                         });
                     match crate::panel::tree_panel(ui, &mut self.tree) {
                         crate::panel::TreeAction::Select(sel) => self.on_tree_select(sel),
-                        crate::panel::TreeAction::Layer { selection, preview } => {
-                            self.on_tree_layer(selection, preview)
+                        crate::panel::TreeAction::Layer { selection, ask } => {
+                            self.on_tree_layer(selection, ask)
                         }
                         crate::panel::TreeAction::Preview(upto) => self.ask_preview(upto),
+                        crate::panel::TreeAction::PreviewSolo(layer) => self.ask_solo(layer),
                         crate::panel::TreeAction::Refresh => self.ask_tree(),
                         crate::panel::TreeAction::None => {}
+                    }
+                    // The scene tree, below the composition tree and in a section of its
+                    // own: a scroll area of its own, so the two trees scroll apart and one
+                    // being long does not hide the other.
+                    if self.scene.open {
+                        ui.separator();
+                        egui::Panel::bottom("scene-tree-panel")
+                            .resizable(true)
+                            .default_size(320.0)
+                            .min_size(64.0)
+                            .show(ui, |ui| {
+                                let roots = crate::scenetree::build(&self.prim_paths());
+                                match crate::scenetree::scene_tree_panel(
+                                    ui,
+                                    &mut self.scene,
+                                    &roots,
+                                    self.model.selection.as_deref(),
+                                ) {
+                                    crate::scenetree::SceneAction::Select(path) => {
+                                        self.select_path(&path)
+                                    }
+                                    crate::scenetree::SceneAction::None => {}
+                                }
+                            });
                     }
                 })
         } else {
@@ -2010,6 +2156,37 @@ impl Shell {
             Some(tree) => tree.display_name(id),
             None => crate::tree::strip_anon_prefix(id),
         }
+    }
+
+    /// Every prim path the composition report lists, in the wire's own order.
+    ///
+    /// `composition_tree`'s `prim_nodes` is what says which prims the scene has
+    /// (`docs/PROTOCOL.md` v1.5.7 keeps the field precisely so a client can resolve a path to
+    /// a node, even though v1.3 stopped drawing it). The scene tree is the one reader that
+    /// wants all of them at once — every other reader asks for one by path or id — so this is
+    /// the only place the whole list is taken.
+    ///
+    /// Empty before a report arrives: a scene tree drawn then is empty, which is the truth.
+    fn prim_paths(&self) -> Vec<String> {
+        match self.tree.model.tree() {
+            Some(tree) => tree.prims.iter().map(|p| p.path.clone()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Which composition the layer the viewport is showing names, as the **tree** says:
+    /// a cook prefix for an op or root layer, a solo for any other document layer, and
+    /// `None` when the tree cannot tell (not arrived yet, or the id is not one of its
+    /// layers — a badge then keeps the prefix's wording, which is what every pre-v1.8
+    /// frame was).
+    ///
+    /// One reader for the status bar and the overlay, so the two cannot word the same frame
+    /// differently; the rule itself is [`crate::panel::ask_for_layer`], the same one the row's
+    /// click uses.
+    fn preview_kind(&self) -> Option<crate::panel::LayerAsk> {
+        let id = self.model.preview.as_deref()?;
+        let tree = self.tree.model.tree()?;
+        crate::panel::ask_for_layer(tree.layer(id)?)
     }
 
     /// Pointer input over the viewport: orbit, pan, zoom, pick, and the gizmo.
@@ -2344,7 +2521,8 @@ impl Shell {
             0,
             format!(
                 "composition {}",
-                self.model.preview_label(|id| self.layer_name(id))
+                self.model
+                    .preview_label_kind(self.preview_kind(), |id| self.layer_name(id))
             ),
         );
         // The two groups that name a DPI defect as a number rather than a story:

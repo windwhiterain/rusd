@@ -20,7 +20,7 @@
 //! - **an op row is a preview control** (v1.4): a cook generator's output layer is
 //!   drawn with `≤` and clicking it sends `preview{upto: <that layer>}` instead of a
 //!   `comp_node` ask. The 「final」 button beside 「刷新」 sends `preview{upto: null}`.
-//!   Clicking any other row is unchanged: `comp_node{id}`, and the preview stays where
+//!   Clicking any other row is unchanged: `comp_node{id}`, and the composition stays where
 //!   it was (`docs/PROTOCOL.md` v1.4).
 //! - **the root layer's row is a preview control too** (v1.5.3): clicking it sends
 //!   `preview{upto: <root layer id>}`, which composes the root and the session
@@ -28,12 +28,20 @@
 //!   starts from. It carries the same `≤` marker and the same click as an op
 //!   row, and it selects nothing: a control row's click is its preview
 //!   (`docs/PROTOCOL.md` v1.5.3: 「root 行成为预览控制行」).
+//! - **a material layer's row is the other form of control** (v1.8): a reference or a
+//!   plain sublayer is not a stop in the cook order, so 「up to here」 has nothing to say
+//!   about it; its click sends `preview{solo: <that layer>}` instead — that layer's content
+//!   and nothing else. Which form a row asks for is [`ask_for`]'s answer over the row's own
+//!   `op`/`root`/`session` flags, and the session layer is the one row that asks for
+//!   nothing (its click is detail only). Both forms are the same `preview` method on the
+//!   wire, so a refused id is reported the same way for either.
 //! - **an op row says which op it is and what it reads and writes** (v1.5): the title
 //!   is the generator's schema name (`RusdSamplePoints`, `RusdInstances`,
-//!   `RusdScatter`) rather than an anonymous identifier, and a dim subtitle reads
-//!   `{input} → {output summary}`, with `(parametric)` where the op has no input
-//!   geometry. A row whose answer carried no `op_name` falls back to the identifier,
-//!   which is exactly the pre-v1.5 picture.
+//!   `RusdScatter`) — with the op's anchor prim after it from v1.8, so two instances of
+//!   one generator read `RusdInstances /World/Boxes` and `RusdInstances /World/Tufts` — and
+//!   a dim subtitle reads `{input} → {output summary}`, with `(parametric)` where the op
+//!   has no input geometry. A row whose answer carried no `op_name` falls back to the
+//!   identifier, which is exactly the pre-v1.5 picture.
 //! - **a variant set expands** into its variants, the selected one first shown in
 //!   the row (`size = small`).
 //! - **clicking any row** selects it and asks `comp_node{id}` for its detail. A row
@@ -50,6 +58,34 @@ use crate::tree::{
     NodeDetail, TreeModel, TreeNode, TreeNodeKind, TreeSelection, clipboard_for, flatten,
 };
 
+/// Which composition a **layer row's** click asks the server for (`docs/PROTOCOL.md`
+/// v1.7's two preview forms).
+///
+/// The two are different questions about the same stack, and which one a row asks is the
+/// **row's** to say — never a list of layer names kept anywhere else:
+///
+/// - [`LayerAsk::Upto`] is 「composed up to here」: everything the cook order reaches at or
+///   before this layer. Only a cook op's output layer and the stack's root layer have
+///   such a position.
+/// - [`LayerAsk::Solo`] is 「this layer alone」: every other layer muted (the session layer
+///   excepted, so an override stays visible). That is the only composition a document's
+///   own material layer has — it is not a stop in the cook order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayerAsk {
+    Upto,
+    Solo,
+}
+
+impl LayerAsk {
+    /// The word a control reply reports this ask as (`tree{id}`'s `action`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LayerAsk::Upto => "preview-upto",
+            LayerAsk::Solo => "preview-solo",
+        }
+    }
+}
+
 /// What a click in the tree asks the shell to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TreeAction {
@@ -63,22 +99,35 @@ pub enum TreeAction {
     ///
     /// One variant carrying both halves, because the two are not alternatives: a layer
     /// row selects that layer (so its `comp_node{id}` detail is shown and the tree jumps
-    /// to the layer's own row) **and**, when it is a preview control, asks the server for
-    /// the prefix composed up to it. `preview` says which: `true` for a root or cook op
-    /// layer, which is the only thing `preview{upto}` accepts today, and `false` for
-    /// every other layer, which is detail only.
+    /// to the layer's own row) **and**, when the layer is one of the two compositions a
+    /// click can ask for, sends that request.
+    ///
+    /// `ask` says which, and there are three cases rather than two since v1.8:
+    ///
+    /// - `Some(Upto)` for a cook op's output layer (v1.4) or the stack's root layer
+    ///   (v1.5.3) — a **cook prefix**, `preview{upto}`;
+    /// - `Some(Solo)` for a **material** layer — a reference or a plain sublayer, which is
+    ///   not a stop in the cook order at all, so `preview{upto}` has nothing to say about
+    ///   it and the click asks to see that layer's content and nothing else instead;
+    /// - `None` for a layer that is neither (the session layer, an arc's target leaf that
+    ///   names a layer of the first two kinds' opposites…): the click is detail only.
     ///
     /// Two variants would let a row send a detail *instead of* a preview or the other way
     /// round, which is exactly the disagreement the user's ruling removes: 点 reference
     /// 的层叶子 == 点这个 layer 本体.
     Layer {
         selection: TreeSelection,
-        preview: bool,
+        ask: Option<LayerAsk>,
     },
-    /// A **preview control row** was clicked: an op row (v1.4) or the root layer's
-    /// row (v1.5.3). Ask the server for the prefix composed up to that layer;
-    /// `None` is the 「final」 control — the whole composition.
+    /// A **layer row** was clicked, and the row is a preview control in one of the two
+    /// forms (`docs/PROTOCOL.md` v1.7): ask the server for the composition this names.
+    ///
+    /// Never produced by [`action_for`] — a layer row is a [`TreeAction::Layer`] and its
+    /// `ask` says which form it wants. It exists for the 「final」 button
+    /// ([`final_action`]), which is not a row at all, and for the shell's own
+    /// `preview{upto}` / `preview{solo}` entry points.
     Preview(Option<String>),
+    PreviewSolo(String),
     /// The 「刷新」 button: ask `composition_tree{}` again.
     Refresh,
 }
@@ -209,28 +258,98 @@ impl TreePanel {
 /// A **layer row** is one kind of click whatever drew it: the layer's own root row, and
 /// an arc's leaf that names it, are the same layer at the same id, so they are the same
 /// [`TreeAction::Layer`] — select it, ask its detail, jump the tree to its own row, and
-/// preview up to it when it is a preview control. Every other row is a plain selection.
+/// ask for the composition [`ask_for`] names. Every other row is a plain selection.
 pub fn action_for(node: &TreeNode) -> TreeAction {
     let selection = TreeSelection::of(node);
     match node.kind {
         TreeNodeKind::Layer => TreeAction::Layer {
             selection,
-            preview: is_preview_control(node),
+            ask: ask_for(node),
         },
         _ => TreeAction::Select(selection),
     }
 }
 
-/// Whether `node` is a row whose click is a **preview** rather than a selection:
-/// a cook op's layer row (v1.4) or the stack's root layer row (v1.5.3).
+/// Which composition a **layer row's** click asks for, or `None` when it asks for none.
 ///
-/// One predicate for the click, the highlight and the drawing, because all three are
-/// the same question asked at three places: a row that previews must look like one
-/// (the `≤` marker), be marked when it is the prefix in force, and send `preview`
-/// when clicked. An arc's leaf that *names* a layer is a `Layer` row too and is
-/// deliberately not one of these: it points at a branch and is clicked to inspect it.
+/// **One rule, over the row's own flags** — never a list of layer names, and never a
+/// second opinion held by the control channel. The three cases are the three shapes a
+/// layer in a stack actually has (`docs/PROTOCOL.md` v1.4 / v1.5.3 / v1.8):
+///
+/// - a cook op's output layer, and the stack's root layer, are **stops in the cook
+///   order**: 「compose up to here」 is a question about them, so they ask
+///   [`LayerAsk::Upto`] (`preview{upto}`);
+/// - every other layer of a document — a reference, a plain sublayer — is **not** a stop
+///   and has no prefix to show, so its click asks [`LayerAsk::Solo`] (`preview{solo}`:
+///   that layer's content and nothing else);
+/// - the session layer is neither: it is the layer every composition already starts from,
+///   so `preview{upto: <session>}` would compose nothing at all and `solo` would hide the
+///   document entirely. Its click is detail only, which is also v1.4's rule for a row
+///   that is not a control.
+///
+/// An arc's leaf that *names* a layer carries the target's own `op`/`root` flags
+/// (`crate::tree::layer_subtree`), so this answers for it exactly as for the layer's own
+/// row — which is the user's ruling that the two clicks are one click.
+pub fn ask_for(node: &TreeNode) -> Option<LayerAsk> {
+    if node.kind != TreeNodeKind::Layer {
+        return None;
+    }
+    ask_for_flags(node.op, node.root, node.session)
+}
+
+/// [`ask_for`] for a **layer** rather than a row: the same rule, for a caller that holds
+/// the composition tree's layer list and no row (the status bar's badge, which names a
+/// layer the tree may not currently have drawn).
+pub fn ask_for_layer(layer: &crate::tree::LayerNode) -> Option<LayerAsk> {
+    ask_for_flags(
+        layer.op,
+        crate::tree::is_root_layer(layer),
+        crate::tree::is_session_layer(layer),
+    )
+}
+
+/// **The rule itself**, over the three flags every layer row and layer carries.
+///
+/// One body and two adapters ([`ask_for`], [`ask_for_layer`]), because a row and the layer
+/// it names must answer the same question the same way: a badge that said 「只看」 about a
+/// layer whose row says 「预览 ≤」 would be two opinions of one click.
+fn ask_for_flags(op: bool, root: bool, session: bool) -> Option<LayerAsk> {
+    if op || root {
+        Some(LayerAsk::Upto)
+    } else if session {
+        None
+    } else {
+        Some(LayerAsk::Solo)
+    }
+}
+
+/// Whether `node` is the stack's **session layer** (`kind == "session"`), read off the
+/// row's own flag.
+///
+/// The flag is on the row for the same reason [`TreeNode::op`] and [`TreeNode::root`] are:
+/// the row says what a click means, and a leaf naming the layer carries the same flag as
+/// the layer's own row (`crate::tree::layer_subtree`).
+pub fn is_session_layer(node: &TreeNode) -> bool {
+    node.kind == TreeNodeKind::Layer && node.session
+}
+
+/// Whether `node` is a row whose click asks for a **cook prefix**: a cook op's layer row
+/// (v1.4) or the stack's root layer row (v1.5.3).
+///
+/// The narrower half of [`is_preview_row`]: this is the row that carries the `≤` marker in
+/// its label, because `≤` means 「composed up to here」 and only a cook stop has such a
+/// position. A material row's click asks for a **solo** ([`LayerAsk::Solo`]), which is a
+/// different picture and gets the panel's marker instead (`≤` on the row in force,
+/// [`control_row_title`]).
 pub fn is_preview_control(node: &TreeNode) -> bool {
     node.kind == TreeNodeKind::Layer && (node.op || node.root)
+}
+
+/// Whether `node` is a layer row whose click asks for a composition of **any** form
+/// ([`ask_for`]) — the predicate the drawing, the marker and the tooltip read, so a
+/// material row looks like the control it is and not like an inert label.
+pub fn is_preview_row(node: &TreeNode) -> bool {
+    ask_for(node).is_some()
 }
 
 /// The 「final」 control's action: the whole composition (`preview{upto: null}`).
@@ -241,15 +360,14 @@ pub fn final_action() -> TreeAction {
     TreeAction::Preview(None)
 }
 
-/// Whether `node` is the layer row the viewport is currently composed up to
-/// (`docs/PROTOCOL.md` v1.4: the panel marks the prefix in force).
+/// Whether `node` is the layer row the viewport is **currently composed up to** —
+/// whichever form the row asks for ([`is_preview_row`]) and whether the echoed layer is
+/// this row's id.
 ///
-/// Pure, so the highlight rule is testable without a screen: a preview control row
-/// ([`is_preview_control`] -- an op row, or the root layer's row since v1.5.3) whose
-/// id is the echoed `upto`. A prim or arc row whose id happened to equal the string
-/// is not a preview row and must not be coloured as one.
+/// Pure, so the highlight rule is testable without a screen. A prim or arc row whose id
+/// happened to equal the string is not a preview row and must not be coloured as one.
 pub fn is_current_preview(node: &TreeNode, preview: Option<&str>) -> bool {
-    is_preview_control(node) && preview == Some(node.id.as_str())
+    is_preview_row(node) && preview == Some(node.id.as_str())
 }
 
 /// Draw the tree panel's whole body: its status line, then either the rows or the
@@ -379,9 +497,7 @@ fn row(
     // (v1.4), and the root row gains it while it is the prefix in force (v1.5.3).
     let title = control_row_title(node, is_current_preview);
     let text = match node.kind {
-        TreeNodeKind::Layer if is_preview_control(node) => {
-            RichText::new(title).strong().underline()
-        }
+        TreeNodeKind::Layer if is_preview_row(node) => RichText::new(title).strong().underline(),
         TreeNodeKind::Layer => RichText::new(title).strong(),
         TreeNodeKind::Arc => RichText::new(&node.label).italics(),
         TreeNodeKind::Prim | TreeNodeKind::VariantSet => RichText::new(&node.label),
@@ -409,7 +525,7 @@ fn row(
     let wants_scroll = depth == 0 && scroll_to.as_deref() == Some(node.id.as_str());
 
     let mut clicked: Option<TreeAction> = None;
-    if is_preview_control(node) {
+    if is_preview_row(node) {
         // **A control row is a control, not a twisty.** Its click previews; if it also
         // collapsed its subtree, one click would mean two things and the user could not
         // expand without changing what the viewport composes. A control layer's children
@@ -444,7 +560,7 @@ fn row(
             indent(ui, depth);
             let response = ui
                 .selectable_label(is_selected || is_current_preview, text)
-                .on_hover_text(row_hover_text(node, false));
+                .on_hover_text(row_hover_text(node, is_preview_row(node)));
             if wants_scroll {
                 response.scroll_to_me(Some(Align::Center));
                 *scroll_to = None;
@@ -498,7 +614,7 @@ fn row(
             }
             let response = ui
                 .selectable_label(is_selected || is_current_preview, text)
-                .on_hover_text(row_hover_text(node, false));
+                .on_hover_text(row_hover_text(node, is_preview_row(node)));
             if wants_scroll {
                 response.scroll_to_me(Some(Align::Center));
                 *scroll_to = None;
@@ -520,7 +636,7 @@ fn row(
 }
 
 /// The title a control row **draws**: its label, with the `≤` marker on it when that
-/// row is the prefix in force.
+/// row is the composition in force.
 ///
 /// Op rows carry the marker in the label itself (`crate::tree::roots` builds
 /// `≤ <generator> [...]`, v1.4), because for them it says "clicking previews up to
@@ -528,7 +644,8 @@ fn row(
 /// marker as part of *being the current preview* — 「`preview == root id` 时高亮 +
 /// `≤` 标记」 — so it is added here, at the one place that knows both the row and the
 /// state, rather than baked into a label the model cannot re-derive when the preview
-/// moves.
+/// moves. A **material** row (v1.8: `preview{solo}`) is the same case, for the same
+/// reason.
 ///
 /// A row titled by its **description** (the user's ruling for every described layer) is a
 /// control row like any other: the marker is still about the click, not about the text.
@@ -543,6 +660,11 @@ pub fn control_row_title(node: &TreeNode, is_current_preview: bool) -> String {
 /// What a row says when the pointer rests on it: what its click means (for a control
 /// row), then the **wire identifier** of the layer the row stands for.
 ///
+/// The sentence names the **request the click sends**, so a user reading a tooltip can
+/// write the same call a script would: `preview{upto: …}` for a cook prefix (an op row, or
+/// the root row — which composes no op at all), `preview{solo: …}` for a material layer,
+/// and neither sentence for the session layer, whose click is detail only.
+///
 /// The identifier is here and nowhere else on the row, because a row is titled by a
 /// display name now: `anon:60:rusd_instances.usda` is what a request takes and what a log
 /// line shows, so a user who needs to quote it hovers rather than reading it off every
@@ -551,13 +673,19 @@ pub fn control_row_title(node: &TreeNode, is_current_preview: bool) -> String {
 fn row_hover_text(node: &TreeNode, control: bool) -> String {
     let mut parts: Vec<String> = Vec::new();
     if control {
-        parts.push(if node.op {
-            format!("预览到此 op 之前：preview{{upto: \"{}\"}}", node.id)
-        } else {
-            format!(
+        parts.push(match ask_for(node) {
+            Some(LayerAsk::Upto) if node.op => {
+                format!("预览到此 op 之前：preview{{upto: \"{}\"}}", node.id)
+            }
+            Some(LayerAsk::Upto) => format!(
                 "预览到根层（不含任何 op）：preview{{upto: \"{}\"}}",
                 node.id
-            )
+            ),
+            Some(LayerAsk::Solo) => format!(
+                "只看这一层（其余除 session 全 mute）：preview{{solo: \"{}\"}}",
+                node.id
+            ),
+            None => String::new(),
         });
     }
     if let Some(hover) = &node.hover {

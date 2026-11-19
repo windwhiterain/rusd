@@ -79,6 +79,14 @@ pub struct LayerNode {
     /// `None` when the join is missing; the reader falls back to the layer's own id,
     /// which is the contract's fallback (`output` = 条目 id).
     pub output: Option<String>,
+    /// The **prim the op is anchored at** (v1.8's `node` field), when the answer carried
+    /// one: `RusdInstances` at `/World/Boxes` writes its instances there.
+    ///
+    /// It is what tells two layers of the same schema apart in the tree — both are named
+    /// `RusdInstances`, and the prim says which one is which. `None` for a layer nobody sent
+    /// one for (a pre-v1.8 server, or a stack the cook never built), and the name falls back
+    /// to the bare schema name exactly as it did before the field existed.
+    pub node: Option<String>,
     /// The layer's **authored description**: the `description` every layer entry now
     /// carries, from the annotation node its author wrote it on (`docs/PROTOCOL.md`).
     ///
@@ -287,6 +295,9 @@ impl CompositionTree {
                     op_name: optional_string(l, "op_name"),
                     input: optional_string(l, "input"),
                     output: optional_string(l, "output"),
+                    // v1.8: the op's anchor prim. Optional like its two neighbours above,
+                    // and nothing is guessed from its absence.
+                    node: optional_string(l, "node"),
                     // Every layer may carry one, and its absence is absence: nothing
                     // is invented for a layer nobody described.
                     description: optional_string(l, "description"),
@@ -485,6 +496,16 @@ pub struct TreeNode {
     /// It is a flag beside [`TreeNode::op`] for the same reason: the row says what a
     /// click means, and the panel decides nothing on its own.
     pub root: bool,
+    /// Whether this row is the **session layer's** row -- `layers[].kind == "session"`.
+    ///
+    /// A third flag beside [`TreeNode::op`] and [`TreeNode::root`], and for the same
+    /// reason: from v1.8 a layer row's click asks for a composition, and the session layer
+    /// is the one layer whose click asks for **none** — `preview{upto: <session>}` would
+    /// compose nothing at all (every other layer is stronger) and `preview{solo: <session>}`
+    /// would hide the document entirely. The panel reads this flag rather than the row's
+    /// label, so a change of wording cannot silently change what a click sends, and an arc's
+    /// leaf naming this layer carries it too.
+    pub session: bool,
     /// Children, in the order a panel draws them.
     pub children: Vec<TreeNode>,
 }
@@ -607,6 +628,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 prim: None,
                 op: target.is_some_and(|t| t.op),
                 root: target.is_some_and(is_root_layer),
+                session: target.is_some_and(is_session_layer),
                 secondary: None,
                 // The leaf names the layer on the row, so its tooltip says what the row
                 // *is* -- the edge that reached it -- and the wire identifier of the
@@ -665,6 +687,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
             prim,
             op: false,
             root: false,
+            session: false,
             secondary: None,
             hover: None,
             children: kids,
@@ -692,6 +715,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 prim: Some(prim.path.clone()),
                 op: false,
                 root: false,
+                session: false,
                 secondary: None,
                 hover: None,
                 children: vset
@@ -708,6 +732,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                         prim: Some(prim.path.clone()),
                         op: false,
                         root: false,
+                        session: false,
                         secondary: None,
                         hover: None,
                         children: Vec::new(),
@@ -727,6 +752,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         prim: None,
         op: layer.op,
         root: is_root_layer(layer),
+        session: is_session_layer(layer),
         secondary: layer_row_secondary(tree, layer),
         hover: Some(format!("层 {}", layer.id)),
         children,
@@ -805,9 +831,13 @@ pub fn is_pseudo_root(path: &str) -> bool {
 /// The header line of a layer section in a prim's detail: the layer, and what the tree
 /// knows about it.
 ///
-/// `{display name} [{kind} · {strength}]`, with a cook op's generator name after it --
-/// the same name and the same facts the layer's own row prints, because a section and
-/// the row it came from are one layer and a reader reads one name for it.
+/// `{display name} [{kind} · {strength}]` -- the same name and the same facts the layer's
+/// own row prints, because a section and the row it came from are one layer and a reader
+/// reads one name for it.
+///
+/// An **op's** schema name is inside that display name from v1.8 (`{op_name} {node}`, see
+/// [`display_name_of`]), not appended after the bracket: the header would otherwise say
+/// `RusdInstances [sublayer · 3] RusdInstances`.
 ///
 /// The layer's **description is not repeated** here: it has its own line above this one
 /// ([`NodeDetail::lines`] prints it first, per the user's ruling), so a header that also
@@ -821,11 +851,16 @@ pub fn layer_header(id: &str, layer: Option<&LayerNode>) -> String {
     let Some(layer) = layer else {
         return strip_anon_prefix(id);
     };
-    let name = display_name_of(layer);
-    match &layer.op_name {
-        Some(op) if layer.op => format!("{name} [{} \u{00b7} {}] {op}", layer.kind, layer.strength),
-        _ => format!("{name} [{} \u{00b7} {}]", layer.kind, layer.strength),
-    }
+    // **No schema name appended any more** (v1.8): the display name of an op now carries
+    // `{op_name} {node}`, so appending `op_name` again would say it twice. A layer whose
+    // answer sent no `node` is named by the bare schema name, which is the whole of what
+    // the header said before the field existed.
+    format!(
+        "{} [{} \u{00b7} {}]",
+        display_name_of(layer),
+        layer.kind,
+        layer.strength
+    )
 }
 
 /// Whether `layer` is the stack's **root layer** (`kind == "root"`), whose row is
@@ -836,6 +871,17 @@ pub fn layer_header(id: &str, layer: Option<&LayerNode>) -> String {
 /// against the same predicate instead of each spelling `"root"` on its own.
 pub fn is_root_layer(layer: &LayerNode) -> bool {
     layer.kind == "root"
+}
+
+/// Whether `layer` is the stack's **session layer** (`kind == "session"`), the one layer
+/// every composition starts from.
+///
+/// It is the layer whose row asks for **no** composition at all (`crate::panel::ask_for`):
+/// a prefix composed up to the session layer contains nothing (every other layer is
+/// stronger), and a solo of it hides the document. Reading it off `kind` here and off the
+/// row's flag in the panel keeps one layer with one name and one meaning.
+pub fn is_session_layer(layer: &LayerNode) -> bool {
+    layer.kind == "session"
 }
 
 /// The word an op row's subtitle prints where the op reads no geometry: `input`
@@ -929,11 +975,19 @@ pub fn layer_display_name(layers: &[LayerNode], id: &str) -> String {
 
 /// [`layer_display_name`] for a layer the caller already holds, so a row does not look
 /// its own layer up again.
+///
+/// An op is named `{op_name} {node}` when the answer carried the generator's anchor path
+/// (v1.8's `node`, e.g. `/World/Boxes`): two `RusdInstances` layers are told apart by the
+/// prim each one reads or writes, not by their anonymous identifiers. A server from before
+/// the field sends none and the name is the bare schema name, exactly as it was.
 pub fn display_name_of(layer: &LayerNode) -> String {
     if layer.op
         && let Some(name) = &layer.op_name
     {
-        return name.clone();
+        return match &layer.node {
+            Some(node) if !node.is_empty() => format!("{name} {node}"),
+            _ => name.clone(),
+        };
     }
     match layer.kind.as_str() {
         "root" => "root".to_owned(),
@@ -970,7 +1024,11 @@ pub fn strip_anon_prefix(id: &str) -> String {
         // shows the file's own name -- `\\?\C:\...\prototypes.usda` is the path,
         // not the layer.
         let last = id.rsplit(['\\', '/']).next().unwrap_or(id);
-        return if last.is_empty() { id.to_owned() } else { last.to_owned() };
+        return if last.is_empty() {
+            id.to_owned()
+        } else {
+            last.to_owned()
+        };
     };
     let Some((n, file)) = rest.split_once(':') else {
         return id.to_owned();

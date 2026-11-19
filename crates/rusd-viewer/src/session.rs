@@ -480,7 +480,15 @@ impl ClientModel {
     /// as the row the user clicked to get there (the user's ruling: one layer, one name,
     /// everywhere). An `anon:N:` identifier is what the wire echoes, never what a reader
     /// is shown.
-    pub fn status_line_zh(&self, name: impl Fn(&str) -> String) -> String {
+    ///
+    /// `kind` is which composition the echoed layer names ([`preview_label_kind`]) — a cook
+    /// prefix or a solo — and the caller supplies it because only the tree knows. `None`
+    /// prints the prefix's wording, which is what every pre-v1.8 frame was.
+    pub fn status_line_zh(
+        &self,
+        kind: Option<crate::panel::LayerAsk>,
+        name: impl Fn(&str) -> String,
+    ) -> String {
         let conn = if self.offline {
             "离线"
         } else if self.state.is_live() {
@@ -501,7 +509,8 @@ impl ClientModel {
         };
         let mut line = format!("{conn} · {version} · {prims} · {sel}");
         if let Some(upto) = &self.preview {
-            line.push_str(&format!(" · 预览 ≤ {}", name(upto)));
+            line.push_str(&format!(" · {}", self.preview_label_kind(kind, &name)));
+            let _ = upto;
         }
         if let Some(r) = &self.last_reason {
             line.push_str(&format!(" · {}", reason_zh(r)));
@@ -519,9 +528,30 @@ impl ClientModel {
     /// that layer's display name, supplied by the caller for the same reason
     /// [`ClientModel::status_line_zh`] takes one: the overlay must name the layer the way
     /// the tree does.
+    ///
+    /// Called [`preview_label_kind`] with `None`: an identifier alone does not say whether
+    /// the frame is a cook prefix or a solo (v1.8 puts a solo's layer in the same echoed
+    /// field), and only the caller holding the tree knows.
     pub fn preview_label(&self, name: impl Fn(&str) -> String) -> String {
+        self.preview_label_kind(None, name)
+    }
+
+    /// The same line, told **which composition the echoed layer names**.
+    ///
+    /// `kind` is what the tree says the layer is: `Some(Upto)` for an op or root layer (a
+    /// cook prefix), `Some(Solo)` for a material layer (that layer alone), `None` when the
+    /// tree cannot say — before it has arrived, or for a layer it no longer lists — and then
+    /// the wording is the prefix's, which is what every pre-v1.8 frame was.
+    pub fn preview_label_kind(
+        &self,
+        kind: Option<crate::panel::LayerAsk>,
+        name: impl Fn(&str) -> String,
+    ) -> String {
         match &self.preview {
-            Some(upto) => format!("预览 ≤ {}", name(upto)),
+            Some(id) => match kind {
+                Some(crate::panel::LayerAsk::Solo) => format!("只看 {}", name(id)),
+                _ => format!("预览 ≤ {}", name(id)),
+            },
             None => "最终".to_owned(),
         }
     }

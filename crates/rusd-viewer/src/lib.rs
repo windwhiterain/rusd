@@ -27,6 +27,10 @@
 //!   frame was drawn with, and the clipboard payloads.
 //! - [`panel`]: the tree and capture panels' widgets, which only draw and report —
 //!   the shell carries out what they ask.
+//! - [`scenetree`]: the scene tree — the prims the scene on screen has, as a hierarchy
+//!   built from `composition_tree`'s `prim_nodes`. A **second** panel, because v1.3 ruled
+//!   prims out of the composition tree (it is about structure) while leaving them
+//!   reachable; a click selects the prim the way a viewport pick does.
 //! - [`overlay`]: the `--debug-ui` overlay's plan — font, width and area bounds, the
 //!   wrap rule that keeps a long line whole, and the collapsed one-row form
 //!   (`docs/PROTOCOL.md` v1.4's overlay compact).
@@ -70,6 +74,7 @@ pub mod panel;
 pub mod platform_metrics;
 pub mod protocol;
 pub mod scene;
+pub mod scenetree;
 pub mod session;
 pub mod startup;
 pub mod tree;
