@@ -573,28 +573,10 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         // `source_prim: "/"`, which is the stage itself and not a mesh an instance
         // stands for ([`is_pseudo_root`]). Without that, every sublayer edge would
         // grow a `prim:/` child that selects the whole stage.
-        kids.extend(
-            group
-                .arcs
-                .iter()
-                .filter(|arc| !is_pseudo_root(&arc.source_prim))
-                .map(|arc| TreeNode {
-                    // A row that stands for a prim carries that prim's node id, which is
-                    // the only id `comp_node` takes for one (the server's own spelling,
-                    // [`prim_node_id`]). Nothing is looked up in `prim_nodes` first: a
-                    // report may legitimately not describe a cook output's prims, and
-                    // then the ask earns one `-32602` detail line rather than the row
-                    // silently naming an arc instead of the prim it says it is.
-                    id: prim_node_id(&arc.source_prim),
-                    kind: TreeNodeKind::Prim,
-                    label: arc.source_prim.clone(),
-                    prim: Some(arc.source_prim.clone()),
-                    op: false,
-                    root: false,
-                    secondary: None,
-                    children: Vec::new(),
-                }),
-        );
+        // **No prim rows** (v1.3 ruling, restated by the user for v1.5.4): a
+        // 240-instance class does not become 240 path rows in the tree. The row
+        // stays one line naming the class; one mesh is inspected by picking it in
+        // the viewport, whose detail is the per-layer view.
         // **What the row's click means** (v1.5.4 + the user's follow-up).
         //
         // A **single** edge keeps exactly the id and the selection it had before there
