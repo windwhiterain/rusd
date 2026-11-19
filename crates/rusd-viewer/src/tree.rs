@@ -966,7 +966,11 @@ pub fn one_line(text: &str) -> String {
 /// unchanged, as is a bare `anon:<n>` with no file behind it.
 pub fn strip_anon_prefix(id: &str) -> String {
     let Some(rest) = id.strip_prefix("anon:") else {
-        return id.to_owned();
+        // A layer opened from disk is identified by its full path; the panel
+        // shows the file's own name -- `\\?\C:\...\prototypes.usda` is the path,
+        // not the layer.
+        let last = id.rsplit(['\\', '/']).next().unwrap_or(id);
+        return if last.is_empty() { id.to_owned() } else { last.to_owned() };
     };
     let Some((n, file)) = rest.split_once(':') else {
         return id.to_owned();
