@@ -283,6 +283,9 @@ pub struct GeoItem {
     pub mesh: Mesh,
     pub transform: Mat,
     pub color: [f32; 3],
+    /// Local-space centres of a `Points` prim's markers. The viewer draws them as
+    /// **screen-space dots**; a point must never look like geometry.
+    pub markers: Option<Vec<[f32; 3]>>,
 }
 
 /// A simple look-at perspective camera (Rusd surface `Camera` schema).
@@ -345,6 +348,7 @@ pub fn extract(stage: &Stage) -> SceneGeometry {
             "Camera" => camera = Some(read_camera(&prim)),
             "Cube" | "Sphere" | "Cylinder" | "Mesh" | "Points" => {
                 let mut color = read_color(&prim);
+                let mut markers: Option<Vec<[f32; 3]>> = None;
                 let mesh = match type_name.as_str() {
                     "Cube" => cube_mesh(read_f64(&prim, "size").unwrap_or(2.0)),
                     "Sphere" => sphere_mesh(read_f64(&prim, "radius").unwrap_or(1.0), 24, 16),
@@ -373,6 +377,11 @@ pub fn extract(stage: &Stage) -> SceneGeometry {
                     "Points" => match local_points(&prim) {
                         Some(pts) if !pts.is_empty() => {
                             color = [0.95, 0.72, 0.15];
+                            markers = Some(
+                                pts.iter()
+                                    .map(|p| [p[0] as f32, p[1] as f32, p[2] as f32])
+                                    .collect(),
+                            );
                             points_mesh(&pts, marker_size(&pts))
                         }
                         _ => {
@@ -393,6 +402,7 @@ pub fn extract(stage: &Stage) -> SceneGeometry {
                     mesh,
                     transform: world,
                     color,
+                    markers,
                 });
             }
             _ => {} // Xform / generators / lights / materials: no direct geometry

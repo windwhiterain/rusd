@@ -38,6 +38,7 @@ struct Vertex {
     normal: [f32; 3],
     color: [f32; 3],
     id: u32,
+    flag: f32,
 }
 
 /// Shader byte-identical to `rusd_render`'s: beauty (directional + ambient) and
@@ -55,6 +56,7 @@ struct VsOut {
     @location(0) normal: vec3<f32>,
     @location(1) color: vec3<f32>,
     @location(2) @interpolate(flat) id: u32,
+    @location(3) flag: f32,
 };
 
 @vertex
@@ -63,17 +65,33 @@ fn vs_main(
     @location(1) normal: vec3<f32>,
     @location(2) color: vec3<f32>,
     @location(3) id: u32,
+    @location(4) flag: f32,
 ) -> VsOut {
     var out: VsOut;
-    out.pos = u.view_proj * vec4<f32>(pos, 1.0);
-    out.normal = normal;
     out.color = color;
     out.id = id;
+    out.flag = flag;
+    if (flag > 0.5) {
+        // A point marker is a screen-space dot: the quad is built in clip space
+        // from its centre, so zooming never turns a point into a tile.
+        var clip = u.view_proj * vec4<f32>(pos, 1.0);
+        clip.x = clip.x + normal.x * u.params.y * clip.w * 6.0;
+        clip.y = clip.y + normal.y * u.params.z * clip.w * 6.0;
+        out.pos = clip;
+        out.normal = vec3<f32>(0.0, 0.0, 1.0);
+    } else {
+        out.pos = u.view_proj * vec4<f32>(pos, 1.0);
+        out.normal = normal;
+    }
     return out;
 }
 
 @fragment
 fn fs_beauty(in: VsOut) -> @location(0) vec4<f32> {
+    if (in.flag > 0.5) {
+        // Markers are flat colour: no shading, so they can never pass for a mesh.
+        return vec4<f32>(in.color * (u.light.w + u.params.x), 1.0);
+    }
     let n = normalize(in.normal);
     let l = normalize(u.light.xyz);
     let diff = max(dot(n, l), 0.0);
@@ -195,6 +213,11 @@ impl Viewport {
                     format: wgpu::VertexFormat::Uint32,
                     offset: 36,
                     shader_location: 3,
+                },
+                wgpu::VertexAttribute {
+                    format: wgpu::VertexFormat::Float32,
+                    offset: 40,
+                    shader_location: 4,
                 },
             ],
         };
@@ -387,6 +410,8 @@ impl Viewport {
         uni[18] = cfg.light_dir[2];
         uni[19] = cfg.ambient;
         uni[20] = cfg.diffuse;
+        uni[21] = 2.0 / width as f32;
+        uni[22] = 2.0 / height as f32;
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&uni));
 
@@ -673,19 +698,52 @@ fn bake(
             }
             None => item.transform,
         };
-        let nm = NormalMatrix::new(transform);
-        for (p, n) in item.mesh.positions.iter().zip(&item.mesh.normals) {
-            let wp =
-                geometry::mat_transform_point(transform, [p[0] as f64, p[1] as f64, p[2] as f64]);
-            let wn = nm.apply(*n);
-            vertices.push(Vertex {
-                pos: [wp[0] as f32, wp[1] as f32, wp[2] as f32],
-                normal: wn,
-                color: item.color,
-                id,
-            });
+        if let Some(markers) = &item.markers {
+            // One screen-space quad per marker (6 vertices): `normal` carries the
+            // corner (-1..1) and `flag` tells the shader to build the dot in clip
+            // space, so a point keeps its pixel size at any zoom.
+            for c in markers {
+                let wp = geometry::mat_transform_point(
+                    transform,
+                    [c[0] as f64, c[1] as f64, c[2] as f64],
+                );
+                for (dx, dy) in [
+                    (-1.0, -1.0),
+                    (1.0, -1.0),
+                    (-1.0, 1.0),
+                    (1.0, -1.0),
+                    (1.0, 1.0),
+                    (-1.0, 1.0),
+                ] {
+                    vertices.push(Vertex {
+                        pos: [wp[0] as f32, wp[1] as f32, wp[2] as f32],
+                        normal: [dx, dy, 0.0],
+                        color: item.color,
+                        id,
+                        flag: 1.0,
+                    });
+                }
+                let n = vertices.len() as u32;
+                indices.extend_from_slice(&[n - 6, n - 5, n - 4, n - 3, n - 2, n - 1]);
+            }
+        } else {
+            let nm = NormalMatrix::new(transform);
+            for (p, n) in item.mesh.positions.iter().zip(&item.mesh.normals) {
+                let wp = geometry::mat_transform_point(
+                    transform,
+                    [p[0] as f64, p[1] as f64, p[2] as f64],
+                );
+                let wn = nm.apply(*n);
+                vertices.push(Vertex {
+                    pos: [wp[0] as f32, wp[1] as f32, wp[2] as f32],
+                    normal: wn,
+                    color: item.color,
+                    id,
+                    flag: 0.0,
+                });
+            }
+            indices.extend(item.mesh.indices.iter().map(|&idx| base + idx));
         }
-        indices.extend(item.mesh.indices.iter().map(|&idx| base + idx));
         paths.push(item.path.clone());
     }
     (vertices, indices, paths)
