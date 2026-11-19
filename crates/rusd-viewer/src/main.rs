@@ -38,7 +38,7 @@ fn main() {
 fn usage() {
     eprintln!(
         "usage:\n  \
-         rusd-viewer view     --connect <addr:port> [--usdc <fallback>]\n  \
+         rusd-viewer view     --connect <addr:port> [--usdc <fallback>] [--control <loopback:port>]\n  \
          rusd-viewer snapshot --usdc <path> --out <png> [--width {DEFAULT_WIDTH} --height {DEFAULT_HEIGHT}]\n  \
          rusd-viewer compose  --manifest <json> --out <png> [--width {DEFAULT_WIDTH} --height {DEFAULT_HEIGHT}]"
     );
