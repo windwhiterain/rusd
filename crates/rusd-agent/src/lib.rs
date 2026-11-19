@@ -162,7 +162,7 @@ impl Agent {
         } else {
             return Err("open: provide `path` or `content`".into());
         };
-        let doc = rusd_core::syntax::parse(&text).map_err(diags_msg)?;
+        let doc = rusd_core::syntax::parse_in(&text, dir.as_deref()).map_err(diags_msg)?;
         let diags = rusd_scene::validate(&doc);
         self.doc = Some(text.clone());
         self.doc_dir = dir;
@@ -188,7 +188,7 @@ impl Agent {
             });
         }
         let text = self.doc.as_ref().ok_or("no scene open; call open first")?;
-        let doc = rusd_core::syntax::parse(text).map_err(diags_msg)?;
+        let doc = rusd_core::syntax::parse_in(text, self.doc_dir.as_deref()).map_err(diags_msg)?;
         let vdiags = rusd_scene::validate(&doc);
         if vdiags.iter().any(|d| d.severity == Severity::Error) {
             return Err(diags_msg(vdiags));
@@ -205,7 +205,7 @@ impl Agent {
 
     fn validate(&self) -> Result<Value, String> {
         let text = self.doc.as_ref().ok_or("no scene open; call open first")?;
-        let doc = rusd_core::syntax::parse(text).map_err(diags_msg)?;
+        let doc = rusd_core::syntax::parse_in(text, self.doc_dir.as_deref()).map_err(diags_msg)?;
         let diags = rusd_scene::validate(&doc);
         Ok(json!({"prim_count": doc.prims.len(), "diags": diags_json(&diags)}))
     }
@@ -273,7 +273,7 @@ impl Agent {
             .ok_or("patch: `ops` array required")?;
         let current = self.doc.clone().ok_or("no scene open; call open first")?;
         let new_text = patch::apply(&current, ops)?;
-        let diags = match rusd_core::syntax::parse(&new_text) {
+        let diags = match rusd_core::syntax::parse_in(&new_text, self.doc_dir.as_deref()) {
             Ok(doc) => rusd_scene::validate(&doc),
             Err(d) => d,
         };

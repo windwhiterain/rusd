@@ -23,7 +23,7 @@ fn main() {
                 std::process::exit(2);
             };
             let text = read(path);
-            match rusd_core::syntax::parse(&text) {
+            match rusd_core::syntax::parse_in(&text, dir_of(path)) {
                 Ok(doc) => {
                     println!("[stage]");
                     for (k, v) in &doc.stage {
@@ -66,7 +66,7 @@ fn main() {
                 std::process::exit(2);
             };
             let text = read(path);
-            match rusd_core::syntax::parse(&text) {
+            match rusd_core::syntax::parse_in(&text, dir_of(path)) {
                 Ok(doc) => {
                     let diags = rusd_scene::validate(&doc);
                     let mut has_error = false;
@@ -92,7 +92,7 @@ fn main() {
                 std::process::exit(2);
             };
             let text = read(path);
-            match rusd_core::syntax::parse(&text) {
+            match rusd_core::syntax::parse_in(&text, dir_of(path)) {
                 Ok(doc) => match rusd_scene::lower(&doc) {
                     Ok(stage) => {
                         for d in rusd_scene::composition_diags(&stage) {
@@ -116,7 +116,7 @@ fn main() {
                 std::process::exit(2);
             };
             let text = read(path);
-            let doc = match rusd_core::syntax::parse(&text) {
+            let doc = match rusd_core::syntax::parse_in(&text, dir_of(path)) {
                 Ok(d) => d,
                 Err(diags) => print_diags(&diags),
             };
@@ -337,7 +337,7 @@ fn dir_of(path: &str) -> Option<&str> {
 /// Parse → validate → expand → extract, printing diagnostics and exiting on error.
 fn load_scene(path: &str) -> rusd_scene::geometry::SceneGeometry {
     let text = read(path);
-    let doc = match rusd_core::syntax::parse(&text) {
+    let doc = match rusd_core::syntax::parse_in(&text, dir_of(path)) {
         Ok(d) => d,
         Err(diags) => print_diags(&diags),
     };
