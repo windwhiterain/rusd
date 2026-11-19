@@ -22,4 +22,5 @@ pub use diag::{Diagnostic, Severity};
 pub use fmt::canonicalize;
 pub use incremental::{IncrementalParser, Stats};
 pub use path::{PathError, PrimPath};
+pub use syntax::{Annotation, ParsedDocument, PrimBlock};
 pub use value::Value;

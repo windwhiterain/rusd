@@ -13,7 +13,10 @@
 //! - **layers** — every layer the stage opened, with its kind and its rank in
 //!   the strength order (0 strongest: the session layer first). A layer a
 //!   generator cooked is marked `op`, and carries that node's `op_name`, its
-//!   `input` and its `output` layer (v1.5.1).
+//!   `input` and its `output` layer (v1.5.1). Which layers are ops is read off the
+//!   **cook's own op list** (v1.5.8); every layer also carries a `description`
+//!   (v1.5.9), an op's from its generator node, any other from a document layer
+//!   annotation.
 //! - **arcs** — the edges between them: `(source layer, source prim)` to
 //!   `(target layer, target prim)`, with the arc's kind. A sublayer edge runs
 //!   from `(parent layer, "/")` to `(sublayer, "/")`.
@@ -83,8 +86,9 @@ struct LayerEntry {
     kind: &'static str,
     strength: usize,
     /// Whether this layer is a **cook output layer** (`docs/PROTOCOL.md`
-    /// v1.4): a generator's authored sublayer, which a preview can stop the
-    /// composition at. See [`cook_output_layer`].
+    /// v1.4): a layer the cook inserted into the root layer stack. It is read off
+    /// the **cook's own op list** (v1.5.8), not guessed from the root's sublayer
+    /// stack — a document may name layers of its own, and those are not ops.
     op: bool,
     /// The **generator** that wrote this layer (PROTOCOL v1.5.1), when the tree
     /// was built with the cook's [`CookOp`] list and one of its rows names this
@@ -95,20 +99,12 @@ struct LayerEntry {
     /// for this layer; the wire tells those two apart by [`LayerEntry::op`] and
     /// reports both as `null`.
     op_input: Option<String>,
-}
-
-/// Whether `id` is a cook output layer of this stage: a layer the cook inserted
-/// into the root layer's sublayer stack. A `.rusd` document authors no
-/// `subLayers` (SPEC §4's v0 subset), so every sublayer of the root layer is one
-/// the cook wrote — and none of them is a document layer, an arc target or the
-/// session layer, which are the other kinds the tree knows.
-///
-/// The order is the cook's: the cook inserts each output layer at position 0 of
-/// the root's stack, so the stack lists them newest first and **cook order is the
-/// stack reversed**. [`cook_output_layers`] is the same rule, exported for the
-/// preview slice.
-fn cook_output_layer(id: &str, root_id: &str, root_sublayers: &[String]) -> bool {
-    id != root_id && root_sublayers.iter().any(|s| s == id)
+    /// What this layer **is**, in words (PROTOCOL v1.5.9). Two sources, one field:
+    /// an `op` layer takes its generator node's own `description = "..."`, and any
+    /// other layer takes a document **layer annotation**
+    /// (`[doc.prototypes] layer = "prototypes.usda" description = "..."`). Absent
+    /// when neither says anything, and reported as `null`.
+    description: Option<String>,
 }
 
 /// The cook output layers of `stage` in **cook order** (oldest first), which is
@@ -124,6 +120,14 @@ pub fn cook_output_layers(stage: &Stage) -> Vec<String> {
     }
     ids.reverse();
     ids
+}
+
+/// The file name of a layer identifier, which is how a document's layer
+/// annotation (`layer = "prototypes.usda"`) names a layer the stage spells as an
+/// absolute resolved path. An anonymous identifier (`anon:7:rusd_instances.usda`)
+/// has no separator in it, so its whole spelling is its name.
+fn layer_basename(id: &str) -> &str {
+    id.rsplit(['/', '\\']).next().unwrap_or(id)
 }
 
 struct ArcEntry {
@@ -167,10 +171,28 @@ impl CompositionTree {
     /// latest pass's list, in cook order; a layer no row names keeps the `null`
     /// fallback rather than being left out.
     ///
+    /// **`ops` is also what says which layers are ops** (v1.5.8). The previous rule
+    /// — "every sublayer of the root layer is a cook output" — held only while a
+    /// document could author no layers of its own; a `reference` to a material
+    /// layer opens a layer no cook wrote, and it must not be labelled an op. So the
+    /// question is answered by the cook's own list, and a layer it never wrote is
+    /// an ordinary layer whatever its position in the stack.
+    ///
+    /// `descriptions` are the document's **layer annotations** (v1.5.9):
+    /// `(layer name as the document spells it, text)`. A layer matches one when its
+    /// identifier's **file name** is that name — the identifier itself is a
+    /// resolved absolute path, and a document names `prototypes.usda`, not
+    /// `C:/art/prototypes.usda`. `root` and `session` name those two layers
+    /// outright.
+    ///
     /// An empty `ops` is the join-fell-through case: a stage assembled by hand,
     /// whose layers the cook never wrote, reports `null` generator and input on
     /// every op row instead of being labelled with someone else's node.
-    pub fn build_with_ops(stage: &Stage, ops: &[CookOp]) -> Self {
+    pub fn build_with_ops(
+        stage: &Stage,
+        ops: &[CookOp],
+        descriptions: &[(String, String)],
+    ) -> Self {
         let _ = stage.traverse(PrimPredicate::ALL, |_| {});
         let root_id = stage.root_layer().identifier().to_owned();
         let session_id = stage.session_layer().map(|l| l.identifier().to_owned());
@@ -198,7 +220,6 @@ impl CompositionTree {
             })
             .collect();
 
-        let root_sublayers = stage.sub_layers(&root_id);
         let arcs = scan_arcs(stage, &scans);
 
         // A layer outside the root layer stack is there because an arc reached
@@ -226,15 +247,28 @@ impl CompositionTree {
                 } else {
                     "sublayer"
                 };
-                let op = cook_output_layer(&scan.id, &root_id, &root_sublayers);
                 // The join: the cook names its output layers, and this layer's
-                // identifier is the key. A layer the cook did not write (or a
-                // tree built without the cook's list) matches nothing.
-                let joined = if op {
-                    ops.iter().find(|o| o.layer_id == scan.id)
-                } else {
-                    None
-                };
+                // identifier is the key. That join is also the op test (v1.5.8): a
+                // layer the cook wrote is an op, and nothing else is — a
+                // `reference` to a material layer is not a generator's output just
+                // because it sits in the stage.
+                let joined = ops.iter().find(|o| o.layer_id == scan.id);
+                let op = joined.is_some();
+                // A description comes from the generator node for an op, and from a
+                // document annotation for every other layer. An op's own node is the
+                // authority; an annotation is what is left.
+                let description = joined.and_then(|o| o.description.clone()).or_else(|| {
+                    let name = layer_basename(&scan.id);
+                    descriptions
+                        .iter()
+                        .find(|(layer, _)| {
+                            kind == "root" && layer == "root"
+                                || kind == "session" && layer == "session"
+                                || layer == name
+                                || *layer == scan.id
+                        })
+                        .map(|(_, text)| text.clone())
+                });
                 LayerEntry {
                     id: scan.id.clone(),
                     kind,
@@ -242,6 +276,7 @@ impl CompositionTree {
                     op,
                     op_name: joined.map(|o| o.generator.clone()),
                     op_input: joined.and_then(|o| o.input.clone()),
+                    description,
                 }
             })
             .collect();
@@ -299,6 +334,7 @@ impl CompositionTree {
         Some(json!({
             "id": layer.id,
             "kind": layer.kind,
+            "description": layer.description,
             "specs": layer_spec_rows(stage, &layer.id, &scans),
         }))
     }
@@ -312,6 +348,10 @@ impl CompositionTree {
                     "kind": l.kind,
                     "strength": l.strength,
                     "op": l.op,
+                    // PROTOCOL v1.5.9: every layer row says what it is, in words —
+                    // an op from its generator node's `description`, any other layer
+                    // from a document layer annotation. `null` when neither says.
+                    "description": l.description,
                 });
                 // PROTOCOL v1.5.1: only an op row carries the generator's name
                 // and its input; the three fields are additive, so a client that

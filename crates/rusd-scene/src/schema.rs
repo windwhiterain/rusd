@@ -137,7 +137,9 @@ static POINT_LIGHT: &[PropDef] = &[p("intensity", F64), p("color", Color3f), p("
 static SCATTER: &[PropDef] = &[
     p("count", U64),
     p("seed", U64),
-    req("prototype", Path),
+    // Same two spellings as `RusdInstances`' (v1.5.8): a prim path in this stack,
+    // or `asset:prim` naming a prototype in another layer.
+    req("prototype", String),
     // D14 geometry-in: the prim whose `points` become one instance each. Optional —
     // without it the scatter is parametric, exactly as before.
     p("input_points", Path),
@@ -157,9 +159,18 @@ static SAMPLE_POINTS: &[PropDef] = &[req("input_points", Path), p("count", U64),
 // are, and `max_prims` is what bounds the result (truncated in order + W_BUDGET).
 static INSTANCES: &[PropDef] = &[
     req("input_points", Path),
-    req("prototype", Path),
+    // v1.5.8: `prototype` also accepts an **asset** spelling,
+    // `"prototypes.usda:/World/Prototypes/Box"`, which is not a prim path — the
+    // instances then carry a reference across the asset boundary instead of a
+    // same-stack one. The registry types the parameter as `string` and lets the
+    // generator decide which of the two spellings it got (one diagnostic, naming
+    // the value and, for an asset, the path it looked for): a `Path` type would
+    // refuse the asset form at validation time, before the cook could say which
+    // layer was missing.
+    req("prototype", String),
     p("scale", Distribution),
     p("max_prims", U64),
+    // v1.5.8: the same asset-or-path spelling on `RusdScatter`'s own prototype.
     // v1.5.1 补正 (parent ruling): `seed` is the repository-wide generator parameter
     // — every instance samples `scale` from a stream keyed by
     // `(stage.seed, prim path, local seed)` (SPEC §5), so the local seed has to be

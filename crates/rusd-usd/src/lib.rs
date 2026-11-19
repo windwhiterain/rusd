@@ -24,14 +24,23 @@ pub struct ExportInfo {
 }
 
 /// Export a `.rusd` document (source text) to `out` (`.usda`/`.usdc`/`.usdz`).
-pub fn export_text(text: &str, out: &str, bake: bool) -> Result<ExportInfo, Vec<Diagnostic>> {
+///
+/// `doc_dir` is the directory the text came from (v1.5.8): a relative asset path in
+/// a generator parameter resolves against it. `None` for text with no file behind
+/// it. The export between files passes the document's own directory.
+pub fn export_text(
+    text: &str,
+    doc_dir: Option<&str>,
+    out: &str,
+    bake: bool,
+) -> Result<ExportInfo, Vec<Diagnostic>> {
     let doc = rusd_core::syntax::parse(text)?;
     let vdiags = rusd_scene::validate(&doc);
     if vdiags.iter().any(|d| d.severity == Severity::Error) {
         return Err(vdiags);
     }
     let stage = if bake {
-        rusd_proc::expand_doc(&doc)?.stage
+        rusd_proc::expand_doc(&doc, doc_dir)?.stage
     } else {
         rusd_scene::lower(&doc)?
     };
@@ -58,5 +67,8 @@ pub fn export_text(text: &str, out: &str, bake: bool) -> Result<ExportInfo, Vec<
 pub fn export_file(path: &str, out: &str, bake: bool) -> Result<ExportInfo, Vec<Diagnostic>> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| vec![Diagnostic::error("E_READ", format!("{path}: {e}"))])?;
-    export_text(&text, out, bake)
+    let dir = std::path::Path::new(path)
+        .parent()
+        .map(|d| d.to_string_lossy().into_owned());
+    export_text(&text, dir.as_deref(), out, bake)
 }

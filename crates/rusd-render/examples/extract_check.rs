@@ -5,7 +5,7 @@ use rusd_scene::geometry;
 
 fn check(name: &str, src: &str) {
     let doc = rusd_core::syntax::parse(src).expect("parse");
-    let out = rusd_proc::expand_doc(&doc).expect("expand");
+    let out = rusd_proc::expand_doc(&doc, None).expect("expand");
     let geo = geometry::extract(&out.stage);
     println!("== {name} ==");
     println!("composed prims: {}", out.prim_count);

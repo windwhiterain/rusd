@@ -6,7 +6,7 @@ use rusd_scene::geometry;
 
 fn run(name: &str, src: &str) {
     let doc = rusd_core::syntax::parse(src).unwrap();
-    let out = rusd_proc::expand_doc(&doc).unwrap();
+    let out = rusd_proc::expand_doc(&doc, None).unwrap();
     let geo = geometry::extract(&out.stage);
     let r = rusd_render::render(&geo, 800, 600).expect("render");
     rusd_render::capture::write_png(

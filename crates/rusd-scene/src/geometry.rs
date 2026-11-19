@@ -426,6 +426,87 @@ pub fn world_xform_of(stage: &Stage, path: &str) -> Option<Mat> {
     Some(world_xform(&prim, &mut cache))
 }
 
+/// A prim's **box volume**, in world space: the `Cube` at `path` as the region a
+/// volume sample draws from (v1.5.8).
+///
+/// USD's `Cube` is centred on its origin with edge length `size` (default 2), so
+/// the local box is `[-size/2, +size/2]` on each axis. Only an **axis-aligned**
+/// world transform is honoured — translation and positive scale, which is what a
+/// `Cube` in a scene actually carries. A rotated cube is refused rather than
+/// sampled as its bounding box: a sample “inside the box” that a rotation could
+/// put outside the real volume would be a silent lie about the scene.
+///
+/// `None` when the prim is not a `Cube`, has no world transform, or its transform
+/// rotates/shears. The caller turns that into a diagnostic.
+pub fn cube_volume(stage: &Stage, path: &str) -> Option<WorldBox> {
+    let spath = sdf::path(path).ok()?;
+    let prim = stage.prim(spath).ok()?;
+    let type_name = prim.type_name().ok().flatten()?;
+    if type_name.as_str() != "Cube" {
+        return None;
+    }
+    let size = read_f64(&prim, "size").unwrap_or(2.0).abs();
+    let m = world_xform_of(stage, path)?;
+    // Upper 3x3, column-major: columns are the local axes in world space.
+    let col = |j: usize| [m[4 * j], m[4 * j + 1], m[4 * j + 2]];
+    let (x, y, z) = (col(0), col(1), col(2));
+    let off = |a: [f64; 3]| (a[0].abs() + a[1].abs() + a[2].abs()) < 1e-9;
+    let identity_axes = off([x[0] - 1.0, x[1], x[2]])
+        && off([y[0], y[1] - 1.0, y[2]])
+        && off([z[0], z[1], z[2] - 1.0]);
+    if !identity_axes {
+        return None;
+    }
+    // With an axis-aligned linear part the box is the scaled local box shifted by
+    // the translation: scale is the leading diagonal, which may be negative (a
+    // mirror), and a mirrored box is the same region.
+    let mut half = [0.0f64; 3];
+    for (k, h) in half.iter_mut().enumerate() {
+        *h = (m[4 * k + k] * size / 2.0).abs();
+    }
+    let centre = [m[12], m[13], m[14]];
+    Some(WorldBox {
+        min: [
+            centre[0] - half[0],
+            centre[1] - half[1],
+            centre[2] - half[2],
+        ],
+        max: [
+            centre[0] + half[0],
+            centre[1] + half[1],
+            centre[2] + half[2],
+        ],
+    })
+}
+
+/// An axis-aligned world-space box: what [`cube_volume`] reads and what a
+/// volume sampler draws points from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WorldBox {
+    pub min: [f64; 3],
+    pub max: [f64; 3],
+}
+
+impl WorldBox {
+    /// A point uniform over the box's volume: `u` is one uniform number per axis,
+    /// each in `[0, 1)`, and every axis is stretched into its own interval — which
+    /// is what uniform over a box is. The caller owns the stream (this crate has no
+    /// business picking a seed).
+    pub fn sample(&self, u: [f64; 3]) -> [f64; 3] {
+        let mut p = [0.0; 3];
+        for (k, out) in p.iter_mut().enumerate() {
+            *out = self.min[k] + (self.max[k] - self.min[k]) * u[k];
+        }
+        p
+    }
+
+    /// Whether `p` lies in the box (inclusive; a sampler's own round-off lands on
+    /// a face and belongs in it).
+    pub fn contains(&self, p: [f64; 3]) -> bool {
+        (0..3).all(|k| p[k] >= self.min[k] - 1e-9 && p[k] <= self.max[k] + 1e-9)
+    }
+}
+
 /// The inverse of an **affine** column-major matrix, `None` when its linear part
 /// is singular.
 ///

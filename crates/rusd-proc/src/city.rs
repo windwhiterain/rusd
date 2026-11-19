@@ -372,15 +372,24 @@ impl Generator for RusdScatter {
     }
 }
 
-/// A prototype instance: a **same-stack reference** to the prototype prim plus the
+/// A prototype instance: a **reference** to the prototype prim plus the
 /// instance's own transform.
 ///
-/// The reference's asset path is the stage's root layer identifier and its prim
-/// path is the prototype's — what a same-stack reference is in USD. That is the
-/// spelling `Stage::flatten` → `usdc` → `Layer::from_bytes` also survives: the Tier
-/// A snapshot a viewer receives still composes the instance's prototype, so
-/// geometry out is real USD instancing on both ends, not a copy of the prototype's
-/// numbers.
+/// The reference reaches the prototype two ways (v1.5.8), and which one is the
+/// honest description of the scene is the document's choice:
+///
+/// - **same-stack** — `asset` is the stage's root layer identifier and
+///   `prototype` is a prim of this stage;
+/// - **asset** — `asset` is another layer and the arcs cross the asset boundary,
+///   which is what instancing *material* looks like: the layer is opened by the
+///   reference and is never on this stage's own stack. A sublayer would say the
+///   other thing — that the material is part of this document's authoring — and
+///   that claim is what makes it wrong for a library layer.
+///
+/// Either spelling is what `Stage::flatten` → `usdc` → `Layer::from_bytes` also
+/// survives: the Tier A snapshot a viewer receives still composes the instance's
+/// prototype, so geometry out is real USD instancing on both ends, not a copy of
+/// the prototype's numbers.
 ///
 /// The instance carries **no type name of its own**. A `def` with a local typeName
 /// is the strongest opinion about the prim's type and would win over the arc,
@@ -393,13 +402,13 @@ impl Generator for RusdScatter {
 pub(crate) fn author_reference(
     d: &mut dyn sdf::AbstractData,
     prim: &sdf::Path,
-    root_id: &str,
+    asset: &str,
     prototype: &sdf::Path,
     local_translate: [f64; 3],
     scale: f64,
 ) -> AuthResult {
     let op = sdf::ReferenceListOp::explicit([sdf::Reference {
-        asset_path: root_id.to_owned(),
+        asset_path: asset.to_owned(),
         prim_path: prototype.clone(),
         ..Default::default()
     }]);
@@ -446,7 +455,9 @@ struct GeometryInput {
     /// at all (it is not in the stage yet), which reads as identity.
     inv_anchor: Option<rusd_scene::Mat>,
     proto_path: sdf::Path,
-    root_id: String,
+    /// The layer the `prototype` reference names: this stage's root layer for a
+    /// same-stack prototype, or the asset the document pointed at (v1.5.8).
+    proto_asset: String,
 }
 
 impl GeometryInput {
@@ -503,15 +514,20 @@ fn read_input_geometry(
                     .at_prim(base),
             ]
         })?;
-    let proto_path = sdf::path(&prototype).map_err(|e| {
+    // v1.5.8: the parameter accepts a prim path in this stack or `asset:prim`
+    // naming a prototype in another layer. Which one it is decides whether the
+    // instances' arcs stay inside the stack or cross the asset boundary.
+    let proto = crate::generator::parse_prototype(&prototype, ctx.doc_dir).map_err(|e| {
         vec![
-            Diagnostic::error(
-                "E_INPUT_GEOMETRY",
-                format!("prototype {prototype:?} is not a prim path: {e}"),
-            )
-            .at_prim(base),
+            Diagnostic::error(e.code, e.message)
+                .at_prim(base)
+                .at_property("prototype"),
         ]
     })?;
+    let proto_path = proto.path.clone();
+    let proto_asset = proto
+        .asset
+        .unwrap_or_else(|| ctx.stage().root_layer().identifier().to_owned());
     // The anchor's own transform: what a world position is undone by. Read as a
     // dependency, so moving the anchor (or a parent of it) re-cooks this node.
     let anchor_world = ctx.read_world_xform(base);
@@ -529,7 +545,7 @@ fn read_input_geometry(
         geometry,
         inv_anchor,
         proto_path,
-        root_id: ctx.stage().root_layer().identifier().to_owned(),
+        proto_asset,
     })
 }
 
@@ -612,7 +628,7 @@ fn scatter_from_geometry(
                 author_reference(
                     d,
                     &pp,
-                    &read.root_id,
+                    &read.proto_asset,
                     &read.proto_path,
                     read.to_local(*world),
                     s,

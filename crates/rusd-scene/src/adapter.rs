@@ -40,6 +40,13 @@ fn author_base(stage: &Stage, doc: &ParsedDocument) -> Result<(), Vec<Diagnostic
                 .unwrap_or(true);
             PrimSpec::new(d, prim.path.as_str(), Specifier::Def, prim.schema.clone())?;
             for (name, val) in &prim.props {
+                // v1.5.9: a generator node's `description` is metadata about the
+                // node, not geometry — the tree reports it beside the layer, and the
+                // layer itself must not gain an attribute nobody asked for.
+                if name == "description" && schema.is_some_and(|s| s.kind == SchemaKind::Generator)
+                {
+                    continue;
+                }
                 let ty = schema
                     .and_then(|s| s.props.iter().find(|p| p.name == name))
                     .map(|p| p.ty);

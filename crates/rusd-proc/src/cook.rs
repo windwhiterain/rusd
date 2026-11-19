@@ -29,6 +29,14 @@ pub struct CookNode {
     pub reads: Vec<(String, String)>,
     /// Declared outputs: prim paths this node's output layer authors.
     pub writes: Vec<String>,
+    /// The node's own `description` (v1.5.9), when the document authors one. It is
+    /// **metadata about the node**, not a generator parameter: it never reaches the
+    /// geometry layer, and the composition tree reports it beside the layer the
+    /// node wrote (PROTOCOL v1.5.9).
+    pub description: Option<String>,
+    /// The directory of the document that named this node, which a relative asset
+    /// parameter resolves against (v1.5.8). `None` for a document opened from text.
+    pub doc_dir: Option<String>,
 }
 
 /// Per-pass counters proving incrementality.
@@ -50,6 +58,10 @@ pub struct CookOp {
     pub input: Option<String>,
     /// The node's current output layer identifier (changes on every rebuild).
     pub layer_id: String,
+    /// The node's `description`, when the document gives it one (v1.5.9). Node
+    /// metadata: the tree carries it on the op row, and it is never authored into
+    /// the layer.
+    pub description: Option<String>,
 }
 
 /// Result of a cook pass: counters plus diagnostics (warnings/errors).
@@ -110,8 +122,14 @@ impl CookEngine {
                 );
                 continue;
             };
-            let mut ctx =
-                GenContext::new(stage, &node.path, &node.params, node.seed, node.stage_seed);
+            let mut ctx = GenContext::new(
+                stage,
+                &node.path,
+                &node.params,
+                node.seed,
+                node.stage_seed,
+                node.doc_dir.as_deref(),
+            );
             match g.eval(&mut ctx) {
                 Ok(layer) => {
                     diags.extend(ctx.take_warnings());
@@ -146,6 +164,7 @@ impl CookEngine {
                         _ => None,
                     }),
                     layer_id: entry.layer_id.clone(),
+                    description: node.description.clone(),
                 })
             })
             .collect();
@@ -226,7 +245,14 @@ fn memo_key(stage: &Stage, node: &CookNode) -> u64 {
 
 /// Extract generator nodes from a parsed document. M2: writes = anchor path,
 /// reads empty; per-generator read/write derivation is refined in M3.
-pub fn nodes_from_doc(doc: &rusd_core::syntax::ParsedDocument) -> Vec<CookNode> {
+///
+/// `doc_dir` is the directory of the document the text came from (v1.5.8): a
+/// relative asset path in a parameter resolves against it, and `None` (a document
+/// opened from text) makes such a path a diagnostic instead.
+pub fn nodes_from_doc(
+    doc: &rusd_core::syntax::ParsedDocument,
+    doc_dir: Option<&str>,
+) -> Vec<CookNode> {
     let mut nodes = Vec::new();
     for prim in &doc.prims {
         let Some(schema) = rusd_scene::schema::lookup(&prim.schema) else {
@@ -250,18 +276,22 @@ pub fn nodes_from_doc(doc: &rusd_core::syntax::ParsedDocument) -> Vec<CookNode> 
                     Value::String(s) => Some(s.clone()),
                     _ => None,
                 }) {
-                    reads.push((p, "radius".to_owned()));
+                    // `prototype` may be `asset:prim` (v1.5.8); the read names the
+                    // prim either way.
+                    reads.push((crate::deps::prototype_prim(&p), "radius".to_owned()));
                 }
                 if let Some(p) = prim.props.get("input_points").and_then(|v| match v {
                     Value::String(s) => Some(s.clone()),
                     _ => None,
                 }) {
-                    // The input's geometry in **either** form (D14.1): the surface
-                    // read covers a `Mesh`'s triangles, the points read covers a
-                    // cloud. Both are recorded, because which one a path answers
-                    // with depends on the scene, not on this list — and the memo
-                    // value of each is the geometry itself.
+                    // The input's geometry in **every** form a scatter knows (D14.1,
+                    // extended by v1.5.8): the surface read covers a `Mesh`'s
+                    // triangles, the volume read a `Cube`'s box, the points read a
+                    // cloud. All are recorded, because which one a path answers with
+                    // depends on the scene, not on this list — and the memo value of
+                    // each is the geometry itself.
                     reads.push((p.clone(), crate::generator::SURFACE_READ.to_owned()));
+                    reads.push((p.clone(), crate::generator::VOLUME_READ.to_owned()));
                     reads.push((p, rusd_scene::geometry::POINTS_ATTR.to_owned()));
                     reads.push((
                         prim.path.as_str().to_owned(),
@@ -291,6 +321,11 @@ pub fn nodes_from_doc(doc: &rusd_core::syntax::ParsedDocument) -> Vec<CookNode> 
             stage_seed,
             reads,
             writes: crate::deps::writes_for(prim.schema.as_str(), prim.path.as_str()),
+            description: prim.props.get("description").and_then(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            }),
+            doc_dir: doc_dir.map(str::to_owned),
         });
     }
     nodes
