@@ -867,6 +867,26 @@ impl Shell {
         if let Some(diags) = self.render.take_error() {
             self.status = join_diags(&diags);
         }
+        if let Some(diags) = self.render.take_errors() {
+            let said: Vec<String> = diags
+                .iter()
+                .map(|d| d.to_json().to_string())
+                .collect();
+            let line = format!("render: {}", said.join(" | "));
+            // A failure leaves a record: stderr is not always watched, so the
+            // same line goes to viewer.log beside the binary (v1.8: no silent
+            // render failures -- "the picture did not change" must be able to
+            // name itself).
+            let mut sink = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open("viewer.log");
+            if let Ok(f) = sink.as_mut() {
+                use std::io::Write as _;
+                let _ = writeln!(f, "{line}");
+            }
+            self.status = line;
+        }
         let Some(frame) = self.render.take_frame() else {
             return;
         };

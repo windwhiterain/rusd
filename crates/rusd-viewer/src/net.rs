@@ -1009,6 +1009,14 @@ impl RenderWorker {
         self.frames.take()
     }
 
+    /// A render failure the loop has not handed to anyone yet (a `set_scene` the
+    /// GPU rejected, a frame that could not be drawn). Silent until read, and
+    /// until v1.8 nothing read it at all -- which is what "the picture did not
+    /// change and nothing said why" was.
+    pub fn take_errors(&self) -> Option<Vec<Diagnostic>> {
+        self.errors.take()
+    }
+
     /// The sequence number of the newest frame the thread has **produced**, taken
     /// or not. `take_frame` hides a frame nobody took; this does not, which is
     /// what lets the overlay say "14 produced / 13 shown" instead of "13/13 fresh"
