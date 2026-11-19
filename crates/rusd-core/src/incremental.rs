@@ -16,7 +16,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use crate::diag::Diagnostic;
 use crate::path::PrimPath;
-use crate::syntax::{self, ParsedDocument, PrimBlock};
+use crate::syntax::{self, Annotation, ParsedDocument, PrimBlock};
 
 /// Counters proving incrementality: how many blocks were (re)parsed vs reused.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -53,6 +53,7 @@ impl IncrementalParser {
         let blocks = split_blocks(text);
         let mut stage = BTreeMap::new();
         let mut prims: BTreeMap<PrimPath, PrimBlock> = BTreeMap::new();
+        let mut annotations: BTreeMap<String, Annotation> = BTreeMap::new();
         let mut diags = Vec::new();
         let mut seen: BTreeSet<String> = BTreeSet::new();
 
@@ -88,6 +89,9 @@ impl IncrementalParser {
             for p in partial.prims {
                 merge_prim(&mut prims, p);
             }
+            for a in partial.annotations {
+                annotations.insert(a.node.clone(), a);
+            }
         }
 
         // Forget blocks that disappeared from the document.
@@ -98,7 +102,11 @@ impl IncrementalParser {
         }
         let mut prims: Vec<PrimBlock> = prims.into_values().collect();
         prims.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(ParsedDocument { stage, prims })
+        Ok(ParsedDocument {
+            stage,
+            prims,
+            annotations: annotations.into_values().collect(),
+        })
     }
 }
 

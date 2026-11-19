@@ -33,6 +33,10 @@ pub mod transport;
 /// A live editing session: the current document source + undo history + renders.
 pub struct Agent {
     doc: Option<String>,
+    /// The directory the open document was read from (v1.5.8), which a relative
+    /// asset path in a generator parameter resolves against. `None` for a document
+    /// opened as `content`: it has no directory to be relative to.
+    doc_dir: Option<String>,
     baseline: Option<String>,
     history: Vec<String>,
     redo_stack: Vec<String>,
@@ -58,6 +62,7 @@ impl Agent {
         let _ = std::fs::create_dir_all(&out_dir);
         Self {
             doc: None,
+            doc_dir: None,
             baseline: None,
             history: Vec::new(),
             redo_stack: Vec::new(),
@@ -71,6 +76,12 @@ impl Agent {
     /// The current document source, or `None` before `open`.
     pub(crate) fn doc_text(&self) -> Option<&str> {
         self.doc.as_deref()
+    }
+
+    /// The directory the open document came from, which a relative asset path in a
+    /// parameter resolves against (`open{path}` sets it; `open{content}` does not).
+    pub(crate) fn doc_dir(&self) -> Option<&str> {
+        self.doc_dir.as_deref()
     }
 
     /// Replace the document without touching the history stacks: the
@@ -139,16 +150,22 @@ impl Agent {
     // --- tools ------------------------------------------------------------
 
     fn open(&mut self, p: &Value) -> Result<Value, String> {
-        let text = if let Some(content) = p.get("content").and_then(Value::as_str) {
-            content.to_owned()
+        let (text, dir) = if let Some(content) = p.get("content").and_then(Value::as_str) {
+            (content.to_owned(), None)
         } else if let Some(path) = p.get("path").and_then(Value::as_str) {
-            std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?
+            let text =
+                std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+            let dir = std::path::Path::new(path)
+                .parent()
+                .map(|d| d.to_string_lossy().into_owned());
+            (text, dir)
         } else {
             return Err("open: provide `path` or `content`".into());
         };
         let doc = rusd_core::syntax::parse(&text).map_err(diags_msg)?;
         let diags = rusd_scene::validate(&doc);
         self.doc = Some(text.clone());
+        self.doc_dir = dir;
         self.baseline = Some(text);
         self.history.clear();
         self.redo_stack.clear();
@@ -176,7 +193,7 @@ impl Agent {
         if vdiags.iter().any(|d| d.severity == Severity::Error) {
             return Err(diags_msg(vdiags));
         }
-        let out = rusd_proc::expand_doc(&doc).map_err(diags_msg)?;
+        let out = rusd_proc::expand_doc(&doc, self.doc_dir.as_deref()).map_err(diags_msg)?;
         let geo = geometry::extract(&out.stage);
         Ok(Scene { out, geo })
     }
@@ -301,7 +318,8 @@ impl Agent {
             .ok_or("export: `out` path required")?;
         let bake = p.get("bake").and_then(Value::as_bool).unwrap_or(true);
         let text = self.doc.as_ref().ok_or("no scene open; call open first")?;
-        let info = rusd_usd::export_text(text, out, bake).map_err(diags_msg)?;
+        let info =
+            rusd_usd::export_text(text, self.doc_dir.as_deref(), out, bake).map_err(diags_msg)?;
         Ok(
             json!({"path": info.path, "format": info.format, "prim_count": info.prim_count, "baked": info.baked}),
         )

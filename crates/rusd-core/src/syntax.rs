@@ -22,11 +22,44 @@ pub struct PrimBlock {
     pub props: BTreeMap<String, Value>,
 }
 
-/// A parsed `.rusd` document: the `[stage]` table and all prim blocks.
+/// A **layer annotation**: a document node that says something about a layer
+/// rather than about geometry.
+///
+/// The v1.5.7 surface spells it as a table with **no `schema`** and a `layer`
+/// key, which is what tells it apart from a prim block:
+///
+/// ```toml
+/// [doc.prototypes]
+/// layer = "prototypes.usda"
+/// description = "the tuft prototype asset"
+/// ```
+///
+/// It is metadata: it authors no prim, contributes no geometry, and never enters
+/// the composed stage. `layer` names the layer it is about — a file name as the
+/// composition tree reports it (`prototypes.usda`, or its tail of a longer
+/// identifier), or the words `root` / `session` for the two layers a stage
+/// always has. `description` is the text the tree carries for that layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Annotation {
+    /// The document path the annotation is spelled at (`doc.prototypes`), which is
+    /// what a diagnostic names and what tells two annotations apart.
+    pub node: String,
+    /// The layer this note is about: a file name, `root`, or `session`.
+    pub layer: String,
+    /// The text `composition_tree` and `layer{id}` carry for that layer.
+    pub description: String,
+}
+
+/// A parsed `.rusd` document: the `[stage]` table, all prim blocks, and the
+/// layer annotations.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParsedDocument {
     pub stage: BTreeMap<String, Value>,
     pub prims: Vec<PrimBlock>,
+    /// Layer annotations (`[doc.<name>]` with `layer` + `description`), sorted by
+    /// node path so the surface stays deterministic. Two may name one layer; that
+    /// is `E_ANNOTATION` at validation, not something this parser resolves.
+    pub annotations: Vec<Annotation>,
 }
 
 /// Parse a `.rusd` document. Returns all error diagnostics on failure.
@@ -41,6 +74,7 @@ pub fn parse(text: &str) -> Result<ParsedDocument, Vec<Diagnostic>> {
     let mut diags = Vec::new();
     let mut stage = BTreeMap::new();
     let mut prims = Vec::new();
+    let mut annotations = Vec::new();
 
     for (key, item) in doc.as_table().iter() {
         if key == "stage" {
@@ -51,6 +85,18 @@ pub fn parse(text: &str) -> Result<ParsedDocument, Vec<Diagnostic>> {
                     Diagnostic::error("E_STAGE", "[stage] must be a table").at_prim("/stage"),
                 );
             }
+            continue;
+        }
+        // An annotation container is a table whose content is **only** annotations:
+        // a leaf (`layer` and no `schema`) or a namespace of them (
+        // `[doc.prototypes]` makes an implicit `doc` holding `prototypes`). It
+        // describes layers instead of defining geometry, so none of it reaches the
+        // stage and none of its ancestors become prims.
+        if let Item::Table(t) = item
+            && !t.is_dotted()
+            && is_annotation_container(t)
+        {
+            collect_annotations(t, &format!("/{key}"), &mut annotations, &mut diags);
             continue;
         }
         match item {
@@ -88,7 +134,112 @@ pub fn parse(text: &str) -> Result<ParsedDocument, Vec<Diagnostic>> {
         return Err(diags);
     }
     prims.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(ParsedDocument { stage, prims })
+    annotations.sort_by(|a, b| a.node.cmp(&b.node));
+    Ok(ParsedDocument {
+        stage,
+        prims,
+        annotations,
+    })
+}
+
+/// An annotation leaf: a `layer` and no `schema`. The `schema` test is what tells
+/// an annotation apart from a prim that happens to author a `layer` property.
+fn annotation_leaf(t: &Table) -> bool {
+    t.get("schema").is_none() && t.get("layer").is_some()
+}
+
+/// Whether `t` holds nothing but annotations: a leaf, or a namespace of them.
+fn is_annotation_container(t: &Table) -> bool {
+    if annotation_leaf(t) {
+        return true;
+    }
+    let mut any = false;
+    for (_, item) in t.iter() {
+        match item {
+            Item::Table(child) if !child.is_dotted() && is_annotation_container(child) => {
+                any = true;
+            }
+            _ => return false,
+        }
+    }
+    any
+}
+
+/// Collect every annotation below an annotation container, labelling each with
+/// the path the document spells it at (`/doc/prototypes`), which is what a
+/// diagnostic names.
+fn collect_annotations(
+    table: &Table,
+    prim: &str,
+    out: &mut Vec<Annotation>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    if annotation_leaf(table) {
+        collect_annotation(table, prim.to_owned(), out, diags);
+        return;
+    }
+    for (key, item) in table.iter() {
+        if let Item::Table(child) = item {
+            collect_annotations(child, &format!("{prim}/{key}"), out, diags);
+        }
+    }
+}
+
+/// Read one layer annotation: `layer` (required, a string) and `description`
+/// (optional, a string). Any other key is refused rather than silently ignored —
+/// an annotation is metadata, and a typo in it would otherwise never show.
+fn collect_annotation(
+    table: &Table,
+    prim: String,
+    out: &mut Vec<Annotation>,
+    diags: &mut Vec<Diagnostic>,
+) {
+    let mut layer: Option<String> = None;
+    let mut description: Option<String> = None;
+    for (key, item) in table.iter() {
+        match (key, item) {
+            ("layer", Item::Value(v)) => match v.as_str() {
+                Some(s) => layer = Some(s.to_owned()),
+                None => diags.push(
+                    Diagnostic::error("E_ANNOTATION", "layer must be a string")
+                        .at_prim(&prim)
+                        .at_property("layer"),
+                ),
+            },
+            ("description", Item::Value(v)) => match v.as_str() {
+                Some(s) => description = Some(s.to_owned()),
+                None => diags.push(
+                    Diagnostic::error("E_ANNOTATION", "description must be a string")
+                        .at_prim(&prim)
+                        .at_property("description"),
+                ),
+            },
+            ("layer" | "description", _) => diags.push(
+                Diagnostic::error("E_ANNOTATION", format!("{key} must be a string"))
+                    .at_prim(&prim)
+                    .at_property(key),
+            ),
+            (other, _) => diags.push(
+                Diagnostic::error(
+                    "E_ANNOTATION",
+                    format!("unexpected key '{other}' in a layer annotation"),
+                )
+                .at_prim(&prim)
+                .at_property(other),
+            ),
+        }
+    }
+    let Some(layer) = layer else {
+        diags.push(
+            Diagnostic::error("E_ANNOTATION", "layer annotation needs `layer`").at_prim(&prim),
+        );
+        return;
+    };
+    out.push(Annotation {
+        node: prim.trim_start_matches('/').replace('/', "."),
+        layer,
+        description: description.unwrap_or_default(),
+    });
 }
 
 /// Recursively walk a prim table: `schema` is special, dotted keys become

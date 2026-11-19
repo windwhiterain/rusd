@@ -10,6 +10,26 @@ use crate::schema::{self, PropType};
 /// Validate every prim. Returns all diagnostics (errors and warnings).
 pub fn validate(doc: &ParsedDocument) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
+    // v1.5.9: two layer annotations naming one layer is a contradiction, not a
+    // choice — the tree carries one `description` per layer, so which one wins
+    // would depend on document order. Refused as an error, naming both nodes.
+    for (i, a) in doc.annotations.iter().enumerate() {
+        for other in &doc.annotations[i + 1..] {
+            if other.layer == a.layer {
+                diags.push(
+                    Diagnostic::error(
+                        "E_ANNOTATION",
+                        format!(
+                            "layer {:?} is described twice (also by [{}])",
+                            a.layer, other.node
+                        ),
+                    )
+                    .at_prim(format!("/{}", a.node.replace('.', "/")))
+                    .at_property("layer"),
+                );
+            }
+        }
+    }
     for prim in &doc.prims {
         let Some(schema) = schema::lookup(&prim.schema) else {
             diags.push(
@@ -36,6 +56,22 @@ pub fn validate(doc: &ParsedDocument) -> Vec<Diagnostic> {
         }
 
         for (name, val) in &prim.props {
+            // v1.5.9: `description` on a generator node is node **metadata**, not a
+            // generator parameter — it is what the composition tree says about the
+            // layer that node writes, so it must not be a `W_UNKNOWN_PROP`.
+            if name == "description" && schema.kind == schema::SchemaKind::Generator {
+                if !matches!(val, Value::String(_)) {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_TYPE",
+                            format!("expected string, got {}", val.type_name()),
+                        )
+                        .at_prim(prim.path.as_str())
+                        .at_property(name),
+                    );
+                }
+                continue;
+            }
             match schema.props.iter().find(|d| d.name == name) {
                 Some(def) => {
                     if !type_ok(val, def.ty) {

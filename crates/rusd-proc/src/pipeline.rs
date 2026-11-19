@@ -132,17 +132,24 @@ fn author_hide(d: &mut dyn sdf::AbstractData, prim: &str) -> AuthResult {
     Ok(())
 }
 
-/// `RusdSamplePoints` (v1.5): a **mesh surface** becomes a point cloud.
+/// `RusdSamplePoints` (v1.5, extended v1.5.8): input geometry becomes a point cloud.
 ///
-/// Parameters (v1.5.1): `input_points` (a `Mesh` prim), `count`, `seed`.
+/// Parameters (v1.5.1): `input_points` (a `Mesh` or a `Cube`), `count`, `seed`.
 ///
-/// It samples **only** a surface: a `Mesh`'s bare `points` are a readable cloud, and
-/// taking that path would place points on the *vertices* rather than on the surface —
-/// a different geometry, silently. So an input with no mesh topology is
-/// `E_INPUT_GEOMETRY`, not a fallback. (A cloud input is `RusdInstances`' business.)
+/// Two input **forms**, and the op says which one it found rather than guessing:
+///
+/// - a `Mesh` is **sampled on its surface**, area-weighted: a bare `points` array
+///   is a readable cloud, and taking that path would place points on the *vertices*
+///   rather than on the surface — different geometry, silently;
+/// - a `Cube` is sampled **through its volume** (v1.5.8), uniformly in the box the
+///   cube names (local `[−size/2, size/2]^3` through its world transform). A cube
+///   has no mesh topology at all, so the surface rule cannot apply: a box is a
+///   region, and “sample the box” means inside it.
+///
+/// Anything else is `E_INPUT_GEOMETRY` — there is no third form.
 ///
 /// Output: `<node>/points`, a `Points` prim whose `points` are the samples in the
-/// anchor's local space, plus a `visibility = "invisible"` over on the input mesh.
+/// anchor's local space, plus a `visibility = "invisible"` over on the input.
 pub struct RusdSamplePoints;
 
 impl Generator for RusdSamplePoints {
@@ -153,28 +160,37 @@ impl Generator for RusdSamplePoints {
     fn eval(&self, ctx: &mut GenContext) -> Result<sdf::Layer, Vec<Diagnostic>> {
         let base = ctx.path.as_str().to_owned();
         let input = require_input(ctx, "RusdSamplePoints", &base)?;
-        let tris = match ctx.read_triangles(&input) {
-            Some(t) if !t.is_empty() => t,
-            _ => {
-                return Err(vec![
-                    Diagnostic::error(
-                        "E_INPUT_GEOMETRY",
-                        format!(
-                            "input_points {input} has no readable mesh surface (it needs \
-                             `points` plus `faceVertexCounts`/`faceVertexIndices`); \
-                             RusdSamplePoints samples a surface and does not fall back to \
-                             the vertices"
-                        ),
-                    )
-                    .at_prim(&base),
-                ]);
-            }
-        };
         let count = ctx.param_u64("count", 100) as usize;
         let mut rng = Rng::seeded(ctx.stage_seed, &base, ctx.seed);
-        let sampled = surface_samples(&tris, count, &mut rng);
-        let inv = inverse_anchor(ctx, &base)?;
-        let local: Vec<[f64; 3]> = sampled.iter().map(|w| to_local(inv, *w)).collect();
+        let local: Vec<[f64; 3]> = if let Some(volume) = ctx.read_volume(&input) {
+            // v1.5.8: a `Cube` is a **volume**: `count` points uniform inside the
+            // box, each in the box's own world frame, then into the anchor's local
+            // space like every other placement this pipeline makes.
+            let inv = inverse_anchor(ctx, &base)?;
+            (0..count)
+                .map(|_| {
+                    let u = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
+                    to_local(inv, volume.sample(u))
+                })
+                .collect()
+        } else if let Some(tris) = ctx.read_triangles(&input).filter(|t| !t.is_empty()) {
+            let sampled = surface_samples(&tris, count, &mut rng);
+            let inv = inverse_anchor(ctx, &base)?;
+            sampled.iter().map(|w| to_local(inv, *w)).collect()
+        } else {
+            return Err(vec![
+                Diagnostic::error(
+                    "E_INPUT_GEOMETRY",
+                    format!(
+                        "input_points {input} is neither a box volume nor a readable mesh \
+                         surface; RusdSamplePoints samples a Cube's volume or a Mesh's \
+                         triangles, and does not fall back to bare vertices"
+                    ),
+                )
+                .at_prim(&base)
+                .at_property("input_points"),
+            ]);
+        };
         let cloud = points_path(&base);
 
         let mut layer = sdf::Layer::new_anonymous("rusd_sample_points.usda");
@@ -248,22 +264,27 @@ impl Generator for RusdInstances {
                         .at_prim(&base),
                 ]
             })?;
-        let proto_path = sdf::path(&prototype).map_err(|e| {
+        // v1.5.8: a prim path in this stack, or `asset:prim` naming material in
+        // another layer. The instances' references cross the asset boundary in the
+        // second case — the layer is opened by the arc, never placed on the stack.
+        let proto = crate::generator::parse_prototype(&prototype, ctx.doc_dir).map_err(|e| {
             vec![
-                Diagnostic::error(
-                    "E_INPUT_GEOMETRY",
-                    format!("prototype {prototype:?} is not a prim path: {e}"),
-                )
-                .at_prim(&base),
+                Diagnostic::error(e.code, e.message)
+                    .at_prim(&base)
+                    .at_property("prototype"),
             ]
         })?;
+        let proto_path = proto.path.clone();
+        let proto_asset = proto
+            .asset
+            .clone()
+            .unwrap_or_else(|| ctx.stage().root_layer().identifier().to_owned());
         // The prototype's own values are what the arc composes; reading its radius
         // records the dependency that a change there reaches these instances.
-        let _ = ctx.read_f64(&prototype, "radius");
+        let _ = ctx.read_f64(proto_path.as_str(), "radius");
         let limit = ctx.param_u64("max_prims", 20000).max(1) as usize;
         let inv = inverse_anchor(ctx, &base)?;
         let scale_dist = ctx.params.get("scale").cloned();
-        let root_id = ctx.stage().root_layer().identifier().to_owned();
 
         let mut warns: Vec<Diagnostic> = Vec::new();
         if cloud.len() > limit {
@@ -294,7 +315,7 @@ impl Generator for RusdInstances {
                     // prototype, leaving an empty `Xform` in every instance's place.
                     PrimSpec::new(d, p.as_str(), Specifier::Def, "")?;
                     let s = sample_dist(&mut rng, scale_dist.as_ref(), 1.0);
-                    author_reference(d, &pp, &root_id, &proto_path, to_local(inv, *world), s)?;
+                    author_reference(d, &pp, &proto_asset, &proto_path, to_local(inv, *world), s)?;
                 }
                 author_hide(d, &input)?;
                 Ok(())

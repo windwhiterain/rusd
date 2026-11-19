@@ -37,6 +37,126 @@ pub fn read_world_points(stage: &Stage, prim: &str) -> Option<Vec<[f64; 3]>> {
     rusd_scene::geometry::world_points(stage, prim)
 }
 
+/// How a generator names its prototype (v1.5.8).
+///
+/// Two spellings, both allowed on `prototype`:
+///
+/// - **same-stack**, `"/World/Prototypes/Tuft"` — the prototype is a prim of
+///   this stage and the instances refer to it in place;
+/// - **asset**, `"prototypes.usda:/World/Prototypes/Tuft"` — the prototype lives
+///   in *another layer*, and the instances carry a reference **across the asset
+///   boundary**. That layer is opened by the reference arc, never by being
+///   placed on this stage's stack: material being instantiated is a reference,
+///   not a sublayer (a sublayer would make it part of this document's own
+///   authoring, which is a different claim).
+///
+/// A relative asset path is resolved against `doc_dir` — the directory of the
+/// document that named it — because the cook layer that authors the reference is
+/// anonymous and anchors nothing. `doc_dir` is `None` for a document handed in as
+/// text (`open{content}`), which has no directory to be relative to; the answer
+/// is then a diagnostic, never a guess against the process's cwd.
+#[derive(Clone, Debug)]
+pub struct PrototypeRef {
+    /// The external layer, as the reference authors it; `None` for a same-stack
+    /// reference.
+    pub asset: Option<String>,
+    /// The prototype prim's path.
+    pub path: sdf::Path,
+}
+
+/// Why a `prototype` parameter did not name a prototype.
+#[derive(Clone, Debug)]
+pub struct PrototypeError {
+    /// Stable diagnostic code: `E_INPUT_GEOMETRY` (the prim path is unreadable)
+    /// or `E_PROTOTYPE_ASSET` (the asset path is not there).
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl PrototypeError {
+    fn path(raw: &str, why: impl std::fmt::Display) -> Self {
+        Self {
+            code: "E_INPUT_GEOMETRY",
+            message: format!("prototype {raw:?} is not a prim path: {why}"),
+        }
+    }
+
+    fn asset(raw: &str, why: impl std::fmt::Display) -> Self {
+        Self {
+            code: "E_PROTOTYPE_ASSET",
+            message: format!("prototype asset {raw:?}: {why}"),
+        }
+    }
+}
+
+/// Split a `prototype` value into its asset (when it names a layer) and its prim
+/// path, resolving the asset against `doc_dir`.
+///
+/// The split is at a `:` whose right-hand side starts with `/` and reads as a
+/// prim path, taken from the right: a Windows drive letter (`C:/art/box.usda`)
+/// and a package path (`pkg.usdz[inner]`) both contain colons that are not the
+/// separator.
+///
+/// The asset must exist: a reference to a missing layer would compose into an
+/// unresolved arc, and an agent is better served by a diagnostic that names the
+/// path it looked for.
+pub fn parse_prototype(raw: &str, doc_dir: Option<&str>) -> Result<PrototypeRef, PrototypeError> {
+    let plus = raw.rfind(':').filter(|i| {
+        let rest = &raw[i + 1..];
+        rest.starts_with('/') && sdf::path(rest).is_ok() && !raw[..*i].is_empty()
+    });
+    let Some(split) = plus else {
+        let path = sdf::path(raw).map_err(|e| PrototypeError::path(raw, e))?;
+        return Ok(PrototypeRef { asset: None, path });
+    };
+    let authored = &raw[..split];
+    let prim = &raw[split + 1..];
+    let path = sdf::path(prim).map_err(|e| PrototypeError::path(raw, e))?;
+    let resolved = resolve_asset(authored, doc_dir)?;
+    Ok(PrototypeRef {
+        asset: Some(resolved),
+        path,
+    })
+}
+
+/// An asset path as the reference authors it: absolute, `/`-spelled, so a layer
+/// identifier means the same thing from any layer that reads it (the cook layer
+/// that authors the reference is anonymous and anchors nothing).
+fn resolve_asset(authored: &str, doc_dir: Option<&str>) -> Result<String, PrototypeError> {
+    let as_path = std::path::Path::new(authored);
+    let full = if as_path.is_absolute() {
+        as_path.to_path_buf()
+    } else {
+        let Some(dir) = doc_dir else {
+            return Err(PrototypeError::asset(
+                authored,
+                "the document was opened from its text, so it has no directory to \
+                 resolve a relative layer against; open it by `path`, or spell the \
+                 prototype's layer as an absolute path",
+            ));
+        };
+        std::path::Path::new(dir).join(as_path)
+    };
+    let full = std::path::absolute(&full)
+        .map_err(|e| PrototypeError::asset(authored, format!("cannot resolve: {e}")))?;
+    if !full.is_file() {
+        return Err(PrototypeError::asset(
+            authored,
+            format!("no such layer: {}", full.display()),
+        ));
+    }
+    // A USD asset path is `/`-spelled on every host: the resolver reads `\` as a
+    // separator too, but the identifier it mints is the spelling the reference
+    // authored, and one spelling keeps the tree and the arc agreeing.
+    Ok(full.to_string_lossy().replace('\\', "/"))
+}
+
+/// The declared-read name for **a prim's box volume** (v1.5.8): the `WorldBox` a
+/// `Cube` names in world space. Like [`SURFACE_READ`] it is not an authored
+/// attribute — it is the dependency a volume sample really has, after topology and
+/// every ancestor transform.
+pub const VOLUME_READ: &str = "volume";
+
 /// The declared-read name for **a prim's composed world transform** (D14
 /// geometry-in). It is not an authored attribute; it is what a generator records
 /// when its output depends on where an input prim *is* rather than only on its
@@ -77,6 +197,15 @@ pub fn read_value_for_memo(stage: &Stage, prim: &str, attr: &str) -> String {
             None => "none".to_owned(),
         };
     }
+    if attr == VOLUME_READ {
+        return match rusd_scene::geometry::cube_volume(stage, prim) {
+            Some(b) => format!(
+                "{:.6},{:.6},{:.6}/{:.6},{:.6},{:.6}",
+                b.min[0], b.min[1], b.min[2], b.max[0], b.max[1], b.max[2]
+            ),
+            None => "none".to_owned(),
+        };
+    }
     if attr == rusd_scene::geometry::POINTS_ATTR {
         return match read_world_points(stage, prim) {
             Some(pts) => pts
@@ -105,6 +234,11 @@ pub struct GenContext<'a> {
     pub seed: u64,
     /// The stage-wide seed (for path-keyed RNG streams).
     pub stage_seed: u64,
+    /// The **directory of the document** that named this node (v1.5.8), which is
+    /// what a relative asset path in a parameter resolves against. `None` when the
+    /// document was handed in as text (`open{content}`): it has no directory, so a
+    /// relative asset is a diagnostic rather than a guess at the process's cwd.
+    pub doc_dir: Option<&'a str>,
     reads: Vec<(String, String)>,
     warnings: Vec<Diagnostic>,
 }
@@ -116,6 +250,7 @@ impl<'a> GenContext<'a> {
         params: &'a BTreeMap<String, Value>,
         seed: u64,
         stage_seed: u64,
+        doc_dir: Option<&'a str>,
     ) -> Self {
         Self {
             stage,
@@ -123,6 +258,7 @@ impl<'a> GenContext<'a> {
             params,
             seed,
             stage_seed,
+            doc_dir,
             reads: Vec::new(),
             warnings: Vec::new(),
         }
@@ -153,6 +289,15 @@ impl<'a> GenContext<'a> {
     pub fn read_triangles(&mut self, prim: &str) -> Option<Vec<rusd_scene::geometry::Triangle>> {
         self.reads.push((prim.to_owned(), SURFACE_READ.to_owned()));
         rusd_scene::geometry::world_triangles(self.stage, prim)
+    }
+
+    /// A prim's **box volume** in world space (v1.5.8): what a `Cube` names, which
+    /// is the region a volume sample draws from. Recorded as [`VOLUME_READ`], whose
+    /// memo value is the box — so resizing the cube, or moving it or any ancestor,
+    /// re-cooks the sampler that drew from it.
+    pub fn read_volume(&mut self, prim: &str) -> Option<rusd_scene::geometry::WorldBox> {
+        self.reads.push((prim.to_owned(), VOLUME_READ.to_owned()));
+        rusd_scene::geometry::cube_volume(self.stage, prim)
     }
 
     /// A prim's composed world transform as an **input** (D14): recorded as

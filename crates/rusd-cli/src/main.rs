@@ -131,7 +131,7 @@ fn main() {
             if has_error {
                 std::process::exit(1);
             }
-            match rusd_proc::expand_doc(&doc) {
+            match rusd_proc::expand_doc(&doc, dir_of(path)) {
                 Ok(out) => {
                     for d in &out.diags {
                         println!("{}", d.to_json());
@@ -326,6 +326,14 @@ fn main() {
     }
 }
 
+/// The directory of `path`, which a relative asset path in a generator parameter
+/// resolves against (v1.5.8). The CLI always reads a file, so this is always `Some`;
+/// `None` only if the path has no parent at all (a bare file name), which then
+/// means the current directory.
+fn dir_of(path: &str) -> Option<&str> {
+    std::path::Path::new(path).parent().and_then(|d| d.to_str())
+}
+
 /// Parse → validate → expand → extract, printing diagnostics and exiting on error.
 fn load_scene(path: &str) -> rusd_scene::geometry::SceneGeometry {
     let text = read(path);
@@ -344,7 +352,7 @@ fn load_scene(path: &str) -> rusd_scene::geometry::SceneGeometry {
     if has_error {
         std::process::exit(1);
     }
-    let out = match rusd_proc::expand_doc(&doc) {
+    let out = match rusd_proc::expand_doc(&doc, dir_of(path)) {
         Ok(o) => o,
         Err(diags) => print_diags(&diags),
     };

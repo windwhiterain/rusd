@@ -1,0 +1,81 @@
+# rusd 0.1 — v1.5.8 演示：box 体积采样 → 实例化**另一个层**里的 box 原型
+#
+# 与 mesh_scatter.rusd 同一条两段 op 管线，但输入是**体积**、原型是**素材文件**：
+#
+#   /World/Volume        —— 作者的 Cube（10×10×10 的输入域；不属于任何 op）
+#   /World/Samples       —— RusdSamplePoints：在 Volume 盒**内**均匀采样 240 个点
+#                           （局部 [−size/2, size/2]^3 均匀 + 应用世界变换），在
+#                           **自己的输出层**写 /World/Samples/points
+#   /World/Boxes         —— RusdInstances：读那个点云，逐点写原型实例
+#                           /World/Boxes/i000000…，每个实例是对
+#                           prototypes.usda:/World/Prototypes/Box 的 **reference**
+#
+# 原型的那个 layer 是**素材层**：它由 reference 弧打开，**不在**本文件的 root 层栈里，
+# 所以它在 composition_tree 里是一个独立的层（kind = reference，op = false），
+# 点它就能单独预览它自己。sublayer 表达的是另一件事（同栈作者拆分），不是这里要的。
+#
+# 替换语义逐 op 成立（PROTOCOL v1.5.1）：每段 op 在自己的输出层对**它消费掉的
+# 那个 prim** 写 `visibility = "invisible"` 的 over —— sample 盖住 Volume，
+# instances 盖住点云。三档前缀互斥可见：
+#
+#   upto = null（root）      → 只见 Volume 盒
+#   upto = /World/Samples    → 只见点云
+#   upto = /World/Boxes      → 只见盒群
+#
+# 确定性：采样流按 (stage.seed, 节点路径, 该节点 seed) 键控，改别的节点不 reshuffle。
+# 相对素材路径按**本文档所在目录**解析（open{path} 有目录；open{content} 没有目录，
+# 相对路径会报 E_PROTOTYPE_ASSET）。
+
+[stage]
+default_prim = "/World"
+meters_per_unit = 1.0
+seed = 20261118
+up_axis = "Z"
+
+[World]
+schema = "Xform"
+
+[World.Camera]
+fov = 50.0
+look_at = [0.0, 0.0, 0.0]
+position = [14.0, -18.0, 12.0]
+schema = "Camera"
+
+# --- 输入：一块 10 单位的立方体域 ------------------------------------------
+# USD 的 Cube 以自身原点为中心、边长 size（默认 2）。
+[World.Volume]
+schema = "Cube"
+size = 10.0
+
+# --- 第一段：盒体积 → 点云 --------------------------------------------------
+# Cube 输入走**体积**模式（v1.5.8）：count 个点在盒内均匀采样；Mesh 输入仍走
+# 曲面面积加权采样。别的输入形态是 E_INPUT_GEOMETRY，不会退化成"每个顶点一个点"。
+# 输出 /World/Samples/points；同一层对 /World/Volume 写 visibility=invisible。
+[World.Samples]
+count = 240
+description = "在 Volume 盒内均匀采 240 个点"
+input_points = "/World/Volume"
+schema = "RusdSamplePoints"
+seed = 11
+
+# --- 第二段：点云 → 盒原型实例 ----------------------------------------------
+# prototype 是 **asset:prim** 形式：素材在另一个 layer，实例的 reference 跨资产边界。
+# 没有 count 参数：点云里有几个点就几个实例，max_prims 只做预算截断（W_BUDGET）。
+[World.Boxes]
+description = "每个采样点放一个 box（原型来自素材层）"
+input_points = "/World/Samples/points"
+max_prims = 5000
+prototype = "prototypes.usda:/World/Prototypes/Box"
+schema = "RusdInstances"
+seed = 11
+
+# --- 层的说明（v1.5.9 注记节点）---------------------------------------------
+# 这种表**没有 schema**、带一个 `layer` 键：它是层的元数据，不产生 prim，也不进几何层。
+# composition_tree 的 layers 行与 layer{id} 的顶层都会带上这段文字。
+[doc.material]
+description = "可实例化的 box 素材（由 reference 弧打开，不在本文件的层栈里）"
+layer = "prototypes.usda"
+
+[doc.root]
+description = "box_scatter.rusd：输入域与两段 op 节点的作者层"
+layer = "root"

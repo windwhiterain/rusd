@@ -22,7 +22,7 @@
 
 use rusd_core::Value;
 
-use crate::generator::{SURFACE_READ, WORLD_XFORM_READ};
+use crate::generator::{SURFACE_READ, VOLUME_READ, WORLD_XFORM_READ};
 use crate::pipeline::points_path;
 
 /// One `path`-typed parameter as a string (the surface spells paths as strings).
@@ -48,7 +48,13 @@ pub(crate) fn reads_for(
         // them would place points on vertices, which is different geometry).
         "RusdSamplePoints" => {
             if let Some(p) = input {
-                reads.push((p, SURFACE_READ.to_owned()));
+                // v1.5.8: the input is a **surface** (a `Mesh`: its triangles) or a
+                // **volume** (a `Cube`: the box it names). Both are declared, for the
+                // reason `RusdScatter` declares both forms — which one a path answers
+                // with is the scene's business, not this list's, and the memo value of
+                // each is the geometry itself.
+                reads.push((p.clone(), SURFACE_READ.to_owned()));
+                reads.push((p, VOLUME_READ.to_owned()));
                 reads.push((anchor.to_owned(), WORLD_XFORM_READ.to_owned()));
             }
         }
@@ -60,12 +66,25 @@ pub(crate) fn reads_for(
                 reads.push((anchor.to_owned(), WORLD_XFORM_READ.to_owned()));
             }
             if let Some(p) = path_param(props, "prototype") {
-                reads.push((p, "radius".to_owned()));
+                // The `prototype` may be `asset:prim` (v1.5.8); the dependency is
+                // the prototype prim's `radius` either way, and the path half is
+                // what names it in the composed stage — the asset half opens a layer
+                // whose prim path is the same.
+                reads.push((prototype_prim(&p), "radius".to_owned()));
             }
         }
         _ => {}
     }
     reads
+}
+
+/// The prim half of a `prototype` value: the part after an `asset:` split, or the
+/// whole value for a same-stack path.
+pub(crate) fn prototype_prim(raw: &str) -> String {
+    match raw.rfind(':') {
+        Some(i) if raw[i + 1..].starts_with('/') => raw[i + 1..].to_owned(),
+        _ => raw.to_owned(),
+    }
 }
 
 /// The prim paths a generator node's output layer authors, by schema name.

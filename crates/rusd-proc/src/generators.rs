@@ -108,10 +108,18 @@ pub struct ExpandOutput {
 
 /// Lower a document to a Stage, then cook its generator nodes (D8/D9).
 /// Validation is the caller's responsibility (run `rusd_scene::validate` first).
-pub fn expand_doc(doc: &ParsedDocument) -> Result<ExpandOutput, Vec<Diagnostic>> {
+///
+/// `doc_dir` is the directory of the file the document came from (v1.5.8): a
+/// relative asset path in a generator parameter resolves against it. `None` is a
+/// document handed in as text, which has no directory — such a path is then a
+/// diagnostic, not a guess at the process's cwd.
+pub fn expand_doc(
+    doc: &ParsedDocument,
+    doc_dir: Option<&str>,
+) -> Result<ExpandOutput, Vec<Diagnostic>> {
     let stage = rusd_scene::lower(doc)?;
     let root_id = stage.root_layer().identifier().to_owned();
-    let nodes = nodes_from_doc(doc);
+    let nodes = nodes_from_doc(doc, doc_dir);
     let mut engine = default_registry();
     let result = engine.cook(&stage, &root_id, &nodes);
     let prim_count = rusd_scene::prim_count(&stage);
