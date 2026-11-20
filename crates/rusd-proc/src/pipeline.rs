@@ -144,10 +144,12 @@ impl Generator for RusdSamplePoints {
     fn eval(&self, ctx: &mut GenContext) -> Result<sdf::Layer, Vec<Diagnostic>> {
         let base = ctx.path.as_str().to_owned();
         let input = require_input(ctx, "RusdSamplePoints", &base)?;
-        // The operator's schema says `domain` is the geometry it samples — a box volume or
-        // a mesh surface — and that is a claim about the input, so it is checked against
-        // what is actually wired.
-        ctx.expect_schema(&input, "domain", &["Cube", "Mesh"], &base);
+        // **The slot's contract, then the geometry's.** The operator declares `domain`
+        // as a `Gprim` — the class that covers a `Cube` and a `Mesh` — and the wire is
+        // checked against it here. Which of them it can actually draw from is settled by
+        // the read below: a `Points` is a `Gprim` too, and has neither a volume nor a
+        // surface, so it passes this check and fails `E_INPUT_GEOMETRY`.
+        ctx.expect_slot(&input, "RusdSamplePoints", "domain", &base);
         let count = ctx.param_u64("count", 100) as usize;
         let mut rng = Rng::seeded(ctx.stage_seed, &base, ctx.seed);
         let local: Vec<[f64; 3]> = if let Some(volume) = ctx.read_volume(&input) {
@@ -222,7 +224,7 @@ impl Generator for RusdInstances {
         let input = require_input(ctx, "RusdInstances", &base)?;
         // …and an `instances` node's `points` is a point cloud; anything else is a
         // mismatch between the operator's schema and the wire.
-        ctx.expect_schema(&input, "points", &["Points"], &base);
+        ctx.expect_slot(&input, "RusdInstances", "points", &base);
         let prototype = ctx
             .param_str("prototype")
             .map(str::to_owned)
@@ -246,7 +248,7 @@ impl Generator for RusdInstances {
         // at every point, so the slot's schema is "a prim USD can place" — an
         // `Xformable` — and USD is what answers it: a `Mesh`, a `Cube`, a `Points` or an
         // `Xform` prototype passes through `IsA`, a `Material` does not.
-        ctx.expect_schema(&prototype, "prototype", &["Xformable"], &base);
+        ctx.expect_slot(&prototype, "RusdInstances", "prototype", &base);
         // **Both schema questions are asked before any geometry is read**: a wire that
         // breaks the operator's contract is reported even when the geometry would have
         // failed first, so one cook names every mismatch it can see instead of only the

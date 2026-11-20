@@ -113,6 +113,19 @@ def "PointLight"
     uniform token[] bases = ["Xformable"]
 }
 
+# --- usdShade: an API schema, which is an interface rather than a type ---------
+#
+# A prim's type is its `typeName` **and** the API schemas applied to it: the class and
+# the interfaces. `MaterialBindingAPI` is the one this project's documents can apply,
+# so the registry must know it for `IsA`/`HasAPI` answers to be about the same graph.
+# An API schema derives from `APISchemaBase`, which the core family owns.
+
+def "MaterialBindingAPI"
+{
+    uniform token schemaKind = "singleApplyAPI"
+    uniform token[] bases = ["APISchemaBase"]
+}
+
 # --- usdShade: a material is neither geometry nor a transform ----------------
 
 def "NodeBase"

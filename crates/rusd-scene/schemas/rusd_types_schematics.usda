@@ -71,6 +71,10 @@ class "NodeBase"
 {
 }
 
+class "MaterialBindingAPI"
+{
+}
+
 class Material "Material"
 {
 }

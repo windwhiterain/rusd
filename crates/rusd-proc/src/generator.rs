@@ -9,6 +9,8 @@ use openusd::tf;
 use openusd::usd::Stage;
 use rusd_core::{Diagnostic, PrimPath, Value};
 
+use rusd_scene::operator::Miss;
+
 /// Read a composed `double` attribute, returning 0.0 when absent.
 pub fn read_attr_f64(stage: &Stage, prim: &str, attr: &str) -> f64 {
     let Ok(p) = sdf::path(prim) else { return 0.0 };
@@ -328,57 +330,64 @@ impl<'a> GenContext<'a> {
         self.warnings.push(diag);
     }
 
-    /// **The operator's declared schema is checked where its input is read** (the user:
-    /// operator 定义的输入输出 schema 要自动校验). The panel prints what is *actually* wired
-    /// — `points : Points`, `domain : Cube` — so the contract cannot live in the panel; it
-    /// lives here, next to the read: `expected` is what this operator accepts for `slot`,
-    /// and anything else is a diagnostic that names both sides.
+    /// **The operator's declared slot is checked where its input is read** (the user:
+    /// operator 定义的输入输出 schema 要自动校验). The panel prints what is *actually*
+    /// wired — `points : Points`, `domain : Cube` — so the contract cannot live in the
+    /// panel; it lives with the operator, and is applied here, next to the read.
     ///
-    /// **The question is asked of USD, not of a string** (the user: 就用 USD 本身的 subtype
-    /// 机制判断). `expected` names schemas the way a schema library does — `Points` is a
-    /// concrete type, `Xformable` a class — and a wired prim satisfies a slot when USD says
-    /// it **is** one of them: [`SchemaRegistry::is_a`], which walks the `bases` each schema
-    /// declares, transitively. So a `Mesh` wired where an `Xformable` was declared passes,
-    /// a `Material` does not, and a declaration can name the relation the operator actually
-    /// needs instead of enumerating every type that happens to satisfy it today.
-    pub fn expect_schema(&mut self, raw: &str, slot: &str, expected: &[&str], base: &str) {
-        let actual = self.with_input(raw, |stage, path| {
-            sdf::path(path)
+    /// **The question is asked of USD, not of a string.** A prim's type is its `typeName`
+    /// **and** the API schemas applied to it — a class and its interfaces — so a slot
+    /// declares both ([`SlotSchema`]) and the answer is [`SchemaRegistry::is_a`] for the
+    /// class and the prim's own applied-schema list for the interfaces. A `Mesh` wired
+    /// where an `Xformable` was declared passes; a `Material` does not; a prim that is an
+    /// `Xformable` without `MaterialBindingAPI` passes a slot that asks only for the class
+    /// and fails one that asks for both.
+    pub fn expect_slot(&mut self, raw: &str, operator: &str, slot: &str, base: &str) {
+        let Some(declared) = rusd_scene::operator::slot(operator, slot) else {
+            // A slot the operator does not declare asks nothing; the read that wanted it
+            // is the one that reports.
+            return;
+        };
+        let wire = self.with_input(raw, |stage, path| {
+            let prim = sdf::path(path).ok().and_then(|p| stage.prim(p).ok())?;
+            let ty = prim
+                .type_name()
                 .ok()
-                .and_then(|p| stage.prim(p).ok())
-                .and_then(|p| p.type_name().ok().flatten())
+                .flatten()
                 .map(|t| t.as_str().to_owned())
-                .filter(|t| !t.is_empty())
+                .filter(|t| !t.is_empty())?;
+            // `GetAppliedSchemas`: what the prim has, including the API schemas its type
+            // builds in — the same list `UsdPrim::HasAPI` answers from.
+            let apis = prim.api_schemas().ok()?;
+            Some((ty, apis))
         });
-        let Some(Some(actual)) = actual else {
+        let Some(Some((actual, applied))) = wire else {
             // An input this build cannot type is not a mismatch: the reader already
             // reports what it could not read, and guessing a type would report twice.
             return;
         };
+        let applied: Vec<&str> = applied.iter().map(|api| api.as_str()).collect();
         let registry = rusd_scene::schema::usd_registry();
-        let actual = tf::Token::from(actual.as_str());
-        if registry.schema_info(&actual).is_none() {
-            // Same rule one step further in: a `typeName` the schema data does not
-            // hold is a type nothing said anything about — USD answers `IsA` false for
-            // it too, which is a statement about the registry, not about the wire.
+        if registry.schema_info(&tf::Token::from(actual.as_str())).is_none() {
+            // Same rule one step further in: a `typeName` the schema data does not hold
+            // is a type nothing said anything about — USD answers `IsA` false for it too,
+            // which is a statement about the registry, not about the wire.
             return;
         }
-        if !expected
-            .iter()
-            .any(|base| registry.is_a(&actual, &tf::Token::from(*base)))
-        {
-            let mut diag = Diagnostic::error(
-                "E_SCHEMA",
-                format!(
-                    "operator declares `{slot}` as {{{}}} but {raw} is a `{actual}`",
-                    expected.join(", ")
-                ),
-            )
-            .at_prim(base)
-            .at_property("input_points");
-            diag = diag; // the slot is named in the message; the property anchor is the read
-            self.warn(diag);
-        }
+        let Some(miss) = rusd_scene::operator::unmet(&declared.schema, &actual, &applied, registry)
+        else {
+            return;
+        };
+        let message = match miss {
+            Miss::Type { declared, actual } => {
+                format!("operator declares `{slot}` as a `{declared}` but {raw} is a `{actual}`")
+            }
+            Miss::Api { missing } => format!(
+                "operator declares `{slot}` with `{missing}` but {raw} (`{actual}`) has it applied \
+                 neither by itself nor through its type"
+            ),
+        };
+        self.warn(Diagnostic::error("E_SCHEMA", message).at_prim(base));
     }
 
     /// Drain accumulated warnings (called by the engine after eval).

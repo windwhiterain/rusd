@@ -189,19 +189,18 @@ fn a_product_is_a_layer_file() {
     }
 }
 
-/// **The operator's declared schema is checked, not assumed** (the user: operator 定义的
-/// 输入输出 schema 要自动校验). A sampler declares `domain` to be the geometry it samples —
-/// a box volume or a mesh surface — so a `Points` prim wired there is a mismatch, reported
-/// as `E_SCHEMA` against the node that declared it.
+/// **The operator's declared slot is checked, not assumed** (the user: operator 定义的
+/// 输入输出 schema 要自动校验). A sampler declares its `domain` to be a `Gprim` — the
+/// class that covers the `Cube` and the `Mesh` it can read — so an `Xform` wired there
+/// is a mismatch, reported as `E_SCHEMA` against the node that declared it.
 #[test]
 fn an_input_of_the_wrong_schema_is_reported() {
-    // The example's own cloud, so this test does not depend on cook order.
-    let _ = cook_example("box_scatter.ops.toml");
-    let points = examples().join("out/samples.rusd");
-    let points = points.to_string_lossy().replace('\\', "/");
+    // An `Xform` is a transform, not geometry: nothing a sampler can draw from.
+    let volume = examples().join("volume.rusd");
+    let volume = volume.to_string_lossy().replace('\\', "/");
     let text = format!(
         "[operator.Bad]\noperator = \"sample_points\"\ndescription = \"bad\"\n\
-         output = \"bad.rusd:/World/Bad\"\ninput = \"{points}:/World/Samples/points\"\n\
+         output = \"bad.rusd:/World/Bad\"\ninput = \"{volume}:/World\"\n\
          count = 4\nseed = 1\n"
     );
     let dir = std::env::temp_dir().join("rusd-schema-check");
