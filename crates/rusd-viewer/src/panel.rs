@@ -166,6 +166,10 @@ pub struct TreePanel {
     pub asking: bool,
     /// A re-read was asked for while one was outstanding (`TreePanel::take_reread`).
     pub reread_pending: bool,
+    /// Read the layers as Rust-script pseudocode (a `let` per operator and material)
+    /// instead of the composition tree. A click still solos the layer, so a variable
+    /// renders the USD it names. Off by default — the tree is the usual view.
+    pub script_mode: bool,
 }
 
 impl TreePanel {
@@ -416,6 +420,15 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
             {
                 final_clicked = true;
             }
+            // The pseudocode view: the same layers read as the script that wrote them.
+            let script_label = if panel.script_mode { "树" } else { "脚本" };
+            if ui
+                .small_button(script_label)
+                .on_hover_text("在合成树与 Rust 脚本伪代码之间切换；点击变量渲染它对应的 USD")
+                .clicked()
+            {
+                panel.script_mode = !panel.script_mode;
+            }
         });
     });
     if refresh {
@@ -432,7 +445,7 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
         );
         return TreeAction::None;
     }
-    let roots = panel.model.roots();
+    let roots = panel.roots();
     if roots.is_empty() {
         ui.label("（尚无合成树）");
         return TreeAction::None;
@@ -463,6 +476,7 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
                     root_index,
                     panel.selection.as_ref(),
                     panel.preview.as_deref(),
+                    panel.script_mode,
                 ) {
                     action.get_or_insert(a);
                 }
@@ -526,6 +540,7 @@ fn row(
     root: usize,
     selected: Option<&TreeSelection>,
     preview: Option<&str>,
+    code: bool,
 ) -> Option<TreeAction> {
     DRAWN.with(|c| c.set(c.get() + 1));
     // **One click, one lit row.** Rows share ids on purpose — a layer's own row, the leaf
@@ -556,6 +571,7 @@ fn row(
         TreeNodeKind::Arc => RichText::new(&node.label).italics(),
         TreeNodeKind::Prim | TreeNodeKind::VariantSet => RichText::new(&node.label),
     };
+    let text = if code { text.monospace() } else { text };
     let text = if is_current_preview {
         text.color(Color32::from_rgb(140, 230, 170))
     } else if is_selected {
@@ -604,7 +620,7 @@ fn row(
             subtitle(ui, node);
         });
         for child in &node.children {
-            if let Some(a) = row(ui, child, depth + 1, root, selected, preview) {
+            if let Some(a) = row(ui, child, depth + 1, root, selected, preview, code) {
                 clicked = Some(a);
             }
         }
@@ -700,7 +716,7 @@ fn row(
         });
         if open {
             for child in &node.children {
-                if let Some(a) = row(ui, child, depth + 1, root, selected, preview) {
+                if let Some(a) = row(ui, child, depth + 1, root, selected, preview, code) {
                     clicked = Some(a);
                 }
             }
@@ -978,6 +994,9 @@ pub fn rows(panel: &TreePanel) -> Vec<(usize, TreeNode)> {
 impl TreePanel {
     /// The rows, from the model.
     pub fn roots(&self) -> Vec<TreeNode> {
+        if self.script_mode {
+            return self.model.tree().map(crate::script::rows).unwrap_or_default();
+        }
         self.model.roots()
     }
 }

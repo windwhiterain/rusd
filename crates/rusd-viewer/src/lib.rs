@@ -22,6 +22,9 @@
 //! - [`tree`]: the composition tree (`docs/PROTOCOL.md` v1.2) as data — the layer
 //!   stack, its arcs, its prim nodes and its variant sets, the panel's row model,
 //!   and the four `comp_node` details.
+//! - [`script`]: the composition tree read as Rust-script pseudocode — a `let` per
+//!   operator and material (the tree panel's 「脚本」 view). A click solos the layer,
+//!   so a variable renders the USD it names; [`script::rows`] is the pure mapping.
 //! - [`capture`]: a visual-reference capture (v1.1) built on this side: the drag's
 //!   rectangle, the mask at the frame's own size, the PNG encoding, the camera the
 //!   frame was drawn with, and the clipboard payloads.
@@ -74,6 +77,7 @@ pub mod panel;
 pub mod platform_metrics;
 pub mod protocol;
 pub mod scene;
+pub mod script;
 pub mod session;
 pub mod startup;
 pub mod tree;
