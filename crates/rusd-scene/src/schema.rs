@@ -188,7 +188,9 @@ static SAMPLE_POINTS: &[PropDef] = &[req("input_points", Path), p("count", U64),
 // point, in the cloud's own order. No `count`: the cloud decides how many there
 // are, and `max_prims` is what bounds the result (truncated in order + W_BUDGET).
 static INSTANCES: &[PropDef] = &[
-    req("input_points", Path),
+    // v1.13: **not required** — an operator has one USD input (`input`), and the cloud an
+    // instances node consumes is the graph's data flow (the earlier node's `points`).
+    p("input_points", Path),
     // v1.5.8: `prototype` also accepts an **asset** spelling,
     // `"prototypes.usda:/World/Prototypes/Box"`, which is not a prim path — the
     // instances then carry a reference across the asset boundary instead of a

@@ -1,7 +1,7 @@
 # rusd 0.1 — **文档就是这张算子图**：第一段（Cube 体积 → 采样 → 一簇 box）
 #
-# 词汇是本工具自己的：`operator` / `outputs` / `inputs`；USD 层是**输入**（`domain = "…rusd:/World/…"`），
-# 产物写成 `.rusd`。
+# 词汇是本工具自己的：`operator` / `outputs` / `input`；USD 层是**输入**（`input = "…rusd:/World/…"`），
+# 产物写成 `.rusd`。**每个算子一个 USD 输入、一个 USD 输出**——输入不是表。
 
 [stage]
 default_prim = "/World"
@@ -13,20 +13,15 @@ up_axis = "Z"
 [operator.Samples]
 operator    = "sample_points"
 description = "在 Volume 盒内均匀采 60 个点（第一阶段）"
-outputs     = ["/World/Samples", "/World/Samples/points"]
+output      = "/World/Samples"
+input       = "volume.rusd:/World/Volume"
 count = 60
 seed  = 11
-
-[operator.Samples.inputs]
-domain = "volume.rusd:/World/Volume"
 
 [operator.Boxes]
 operator    = "instances"
 description = "每个点放一个 box，得到一簇 box（原型来自素材层）"
-outputs     = ["/World/Boxes"]
+output      = "/World/Boxes"
+input       = "box.rusd:/World/Prototypes/Box"
 max_prims = 5000
 seed      = 11
-
-[operator.Boxes.inputs]
-points    = "/World/Samples/points"
-prototype = "box.rusd:/World/Prototypes/Box"

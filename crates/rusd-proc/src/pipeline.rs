@@ -173,20 +173,6 @@ fn author_inputs(
     Ok(())
 }
 
-fn author_hide(d: &mut dyn sdf::AbstractData, prim: &str) -> AuthResult {
-    if let Ok(target) = sdf::path(prim) {
-        PrimSpec::over(d, target)?;
-        let mut vis = AttributeSpec::new(
-            d,
-            format!("{prim}.visibility").as_str(),
-            "token",
-            Variability::Varying,
-            false,
-        )?;
-        vis.set_default(SdfValue::Token("invisible".into()))?;
-    }
-    Ok(())
-}
 
 /// `RusdSamplePoints` (v1.5, extended v1.5.8): input geometry becomes a point cloud.
 ///
@@ -257,7 +243,6 @@ impl Generator for RusdSamplePoints {
                 let d = l.data_mut();
                 PrimSpec::new(d, base.as_str(), Specifier::Def, "Xform")?;
                 author_cloud(d, &cloud, &local)?;
-                author_hide(d, &input)?;
                 author_inputs(d, &base, &ctx_inputs, ctx_doc_dir)?;
                 Ok(())
             })
@@ -397,7 +382,6 @@ impl Generator for RusdInstances {
                     let s = sample_dist(&mut rng, scale_dist.as_ref(), 1.0);
                     author_reference(d, &pp, &proto_asset, &proto_path, to_local(inv, *world), s)?;
                 }
-                author_hide(d, &input)?;
                 author_inputs(d, &base, &ctx_inputs, ctx_doc_dir)?;
                 Ok(())
             })
@@ -408,3 +392,4 @@ impl Generator for RusdInstances {
         Ok(layer)
     }
 }
+

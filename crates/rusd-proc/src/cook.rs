@@ -568,7 +568,18 @@ pub fn nodes_from_doc(
     doc_dir: Option<&str>,
 ) -> Vec<CookNode> {
     let mut nodes = Vec::new();
+    // **An operator has one USD input** (v1.13), so an `instances` node no longer declares
+    // the cloud it instances: the cloud is whatever the most recent earlier node wrote
+    // under a prim named `points`. That is the data flow of the graph (`谁读谁`), and it is
+    // the only thing the single-input form has to reconstruct.
+    let mut upstream_points: Option<String> = None;
     for prim in &doc.prims {
+        if let Some(points) = crate::deps::writes_for(prim.schema.as_str(), prim.path.as_str())
+            .into_iter()
+            .find(|p| p == "points" || p.ends_with("/points"))
+        {
+            upstream_points = Some(points);
+        }
         let Some(schema) = rusd_scene::schema::lookup(&prim.schema) else {
             continue;
         };
@@ -579,6 +590,16 @@ pub fn nodes_from_doc(
             Some(Value::Int(i)) if *i >= 0 => *i as u64,
             _ => 0,
         };
+        let mut props = prim.props.clone();
+        // The one USD input fills `prototype` on an instances node; the cloud it consumes
+        // comes from the graph's data flow.
+        if matches!(prim.schema.as_str(), "RusdInstances" | "RusdScatter")
+            && !props.contains_key("input_points")
+            && let Some(points) = &upstream_points
+        {
+            props.insert("input_points".to_owned(), Value::String(points.clone()));
+        }
+        let read_props = props.clone();
         let reads = match prim.schema.as_str() {
             // D14 geometry-in: a scatter that reads a point cloud depends on that
             // prim's `points` (hashing their world-space values, see
@@ -630,7 +651,7 @@ pub fn nodes_from_doc(
             id: prim.path.as_str().to_owned(),
             generator: prim.schema.clone(),
             path: prim.path.clone(),
-            params: prim.props.clone(),
+            params: read_props.clone(),
             inputs: prim.inputs.clone(),
             seed,
             stage_seed,

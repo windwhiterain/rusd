@@ -111,15 +111,10 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
             ));
             continue;
         };
-        let Some(output) = t
-            .get("outputs")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.get(0))
-            .and_then(|v| v.as_str())
-        else {
+        let Some(output) = t.get("output").and_then(|v| v.as_str()) else {
             diags.push(Diagnostic::error(
                 "E_GRAPH",
-                format!("operator `{name}` has no `outputs`"),
+                format!("operator `{name}` has no `output`"),
             ));
             continue;
         };
@@ -128,40 +123,38 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
             continue;
         };
         let mut props: BTreeMap<String, Value> = BTreeMap::new();
-        // **The declaration as written** (v1.12): every slot the document named, by its own
-        // name, whatever the operator's mapping to engine parameters is — an operator with
-        // three inputs or n inputs needs no change here.
+        // **One USD input, one USD output** (v1.13): `input = "<file>.rusd:/World/…"` is the
+        // single USD this operator references. It is not a table: a node has one input.
         let mut declared: Vec<(String, String)> = Vec::new();
-        // The operator's own parameters: every plain value that is not one of the graph's
-        // own words. `operator`, `outputs`, `inputs` and `description` are the graph's.
         for (key, item) in t.iter() {
             match key {
-                "operator" | "outputs" => {}
-                "inputs" => {
-                    let Some(inputs) = item.as_table() else { continue };
-                    for (slot, value) in inputs.iter() {
-                        if let Some(v) = value.as_value().and_then(value_of) {
-                            if let Value::String(text) = &v {
-                                declared.push((slot.to_owned(), text.clone()));
-                            }
-                        }
-                        let Some(parameter) = slot_parameter(kind, slot) else {
-                            diags.push(Diagnostic::warning(
-                                "W_GRAPH_SLOT",
-                                format!("operator `{name}` ignores input `{slot}`"),
-                            ));
-                            continue;
-                        };
-                        if let Some(v) = value.as_value().and_then(value_of) {
-                            props.insert(parameter.to_owned(), v);
-                        }
-                    }
-                }
+                // The graph's own words — the kind, what it writes, and its one USD input,
+                // which is read below.
+                "operator" | "output" | "input" => {}
                 _ => {
                     if let Some(v) = item.as_value().and_then(value_of) {
                         props.insert(key.to_owned(), v);
                     }
                 }
+            }
+        }
+        if let Some(input) = t.get("input").and_then(|v| v.as_str()) {
+            // Which engine parameter the one USD fills is the operator's own business:
+            // a sampler reads geometry from it, an instances node instances its prototype.
+            let parameter = match kind {
+                "sample_points" => Some("input_points"),
+                "instances" | "scatter" => Some("prototype"),
+                _ => None,
+            };
+            match parameter {
+                Some(parameter) => {
+                    props.insert(parameter.to_owned(), Value::String(input.to_owned()));
+                    declared.push(("input".to_owned(), input.to_owned()));
+                }
+                None => diags.push(Diagnostic::warning(
+                    "W_GRAPH_INPUT",
+                    format!("operator `{name}` takes no USD input; `input` was ignored"),
+                )),
             }
         }
         prims.push(PrimBlock {
