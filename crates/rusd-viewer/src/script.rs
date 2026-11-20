@@ -280,7 +280,7 @@ pub fn rows(tree: &CompositionTree) -> Vec<TreeNode> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::panel::{ask_for, LayerAsk};
+    use crate::panel::{action_for, ask_for, LayerAsk, TreeAction};
 
     /// Two materials and two operators, shaped exactly like the wire's answer for
     /// `box_scatter.ops.toml` — including the duplicate `prototype` slot.
@@ -340,6 +340,13 @@ mod tests {
         for r in &rows {
             assert_eq!(r.kind, TreeNodeKind::Layer);
             assert!(matches!(ask_for(r), Some(LayerAsk::Solo)));
+            // The click itself must solo the layer, not render-alone a prim path: a
+            // pseudocode row names a prim but IS a layer row, so v1.16's prim-first rule
+            // must not hijack it. Regression for Volume/Box/Terrain drawing nothing.
+            assert!(matches!(
+                action_for(r),
+                TreeAction::Layer { ask: Some(LayerAsk::Solo), .. }
+            ));
             assert!(tree.layers.iter().any(|l| l.id == r.id));
         }
         assert_eq!(

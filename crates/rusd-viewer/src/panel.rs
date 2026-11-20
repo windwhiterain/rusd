@@ -247,18 +247,21 @@ impl TreePanel {
 /// ask for the composition [`ask_for`] names. Every other row is a plain selection.
 pub fn action_for(node: &TreeNode) -> TreeAction {
     let selection = TreeSelection::of(node);
-    // **A row that stands for a prim renders that path alone** (v1.16): the operator's
-    // declared hierarchy entries (and its `input` row) carry the prim they name, so the
-    // `secondary` slot is free to say what the entry *is* — its schema — instead of
-    // doubling as a click marker.
-    if node.prim.is_some() {
-        return TreeAction::Render(selection);
-    }
     match node.kind {
+        // A **layer row** is one kind of click whatever drew it — including a pseudocode
+        // `material(..)` binding, which names a prim but is still a layer row: its click
+        // solos the USD the variable stands for (`ask_for`), never isolates a path in the
+        // current preview. (Regression: Volume/Box/Terrain drew nothing because the v1.16
+        // prim-first rule hijacked these layer rows into `Render`.)
         TreeNodeKind::Layer => TreeAction::Layer {
             selection,
             ask: ask_for(node),
         },
+        // **A row that stands for a prim renders that path alone** (v1.16): the operator's
+        // declared hierarchy entries (and its `input` row) are *prim* rows carrying the
+        // prim they name, so the `secondary` slot is free to say what the entry *is* — its
+        // schema — instead of doubling as a click marker.
+        _ if node.prim.is_some() => TreeAction::Render(selection),
         // **An edge class whose edges point into a layer** (v1.9): the row is drawn as
         // `reference → box.rusd:… ×60`, it stands for no prim on screen (`prim: None`), and
         // its id is the target **layer** (`crate::tree`). Clicking it is therefore clicking
