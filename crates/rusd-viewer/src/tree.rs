@@ -719,6 +719,53 @@ fn hierarchy_rows(paths: &[String]) -> Vec<TreeNode> {
 /// One layer's branch: its arcs and the prims it authors.
 fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     let mut children: Vec<TreeNode> = Vec::new();
+    // **An operator's children are exactly the structures it declares** (v1.13): its
+    // inputs and its outputs, each as its own branch. Nothing else — the arcs the product
+    // happens to author are composition detail (and the prototype one merely repeats the
+    // declared input), so an op row that has declarations draws declarations.
+    if !layer.inputs.is_empty() || !layer.outputs.is_empty() {
+        for input in &layer.inputs {
+            match (&input.asset, &input.prim) {
+                (Some(asset), Some(prim)) => children.push(TreeNode {
+                    id: asset.clone(),
+                    kind: TreeNodeKind::Arc,
+                    label: format!(
+                        "reference \u{2192} {}",
+                        strip_anon_prefix(asset).rsplit(['/', '\\']).next().unwrap_or(asset)
+                    ),
+                    prim: None,
+                    op: false,
+                    root: false,
+                    session: false,
+                    // Open on arrival: a collapsed branch says nothing about what the
+                    // operator reads, and these rows are what a reader came for.
+                    secondary: Some("open".to_owned()),
+                    hover: Some(input.value.clone()),
+                    children: hierarchy_rows(&[prim.clone()]),
+                }),
+                (None, Some(prim)) => children.extend(hierarchy_rows(&[prim.clone()])),
+                _ => {}
+            }
+        }
+        // The output half, as **one** branch: the document may name an output and a prim
+        // under it (`/World/Samples`, `/World/Samples/points`), and drawing each as its
+        // own branch would repeat the parent.
+        children.extend(hierarchy_rows(&layer.outputs));
+        return TreeNode {            id: layer.id.clone(),
+            kind: TreeNodeKind::Layer,
+            label: layer_row_label(tree, layer),
+            prim: None,
+            op: layer.op,
+            root: is_root_layer(layer),
+            session: is_session_layer(layer),
+            secondary: layer_row_secondary(tree, layer),
+            hover: Some(format!("层 {}", layer.id)),
+            children,
+        };
+    }
+
+
+
 
     for group in arc_groups(tree, &layer.id) {
         // A leaf naming the target layer (see `roots`): the edge is visible, and
@@ -824,36 +871,6 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         });
     }
 
-    // **The USD hierarchy the operator declares — that *is* its inputs and outputs**
-    // (v1.13): there is no separate slot name, because a slot's name is the document's
-    // bookkeeping and the structure is the name. An input that names another layer is a
-    // branch rooted at that `reference`, its prim path underneath; every other input and
-    // output is a branch of this stack's own paths, merged so a shared prefix is one branch.
-    let mut named: Vec<String> = layer.outputs.clone();
-    for input in &layer.inputs {
-        match (&input.asset, &input.prim) {
-            (Some(asset), Some(prim)) => children.push(TreeNode {
-                id: asset.clone(),
-                kind: TreeNodeKind::Arc,
-                label: format!(
-                    "reference \u{2192} {}",
-                    strip_anon_prefix(asset).rsplit(['/', '\\']).next().unwrap_or(asset)
-                ),
-                prim: None,
-                op: false,
-                root: false,
-                session: false,
-                // Open on arrival, like the hierarchy under it: the branch is the input,
-                // and a collapsed one says nothing about what the operator reads.
-                secondary: Some("open".to_owned()),
-                hover: Some(input.value.clone()),
-                children: hierarchy_rows(&[prim.clone()]),
-            }),
-            (None, Some(prim)) => named.push(prim.clone()),
-            _ => {}
-        }
-    }
-    children.extend(hierarchy_rows(&named));
 
 
     // **No prim rows.** v1.3 (user ruling, `docs/PROTOCOL.md`): a city stack has
@@ -1874,4 +1891,6 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
+
 
