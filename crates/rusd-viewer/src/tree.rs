@@ -803,13 +803,23 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
             // USD says the thing is (`Points`, `Cube`, `Mesh`). The path levels themselves
             // are the row's detail (hover, `comp_node`), so an operator with two inputs has
             // two rows.
-            let schema = input
-                .structure
-                .last()
-                .and_then(|(_, schema)| schema.clone())
-                .filter(|s| !s.is_empty());
-            let label = match schema {
-                Some(schema) => format!("{} : {schema}", input.slot),
+            // **The row is the USD hierarchy the input names**, spelled as the path it is:
+            // `/World/Samples/points`, `box.rusd:/World/Prototypes/Box`. One row per input,
+            // because the hierarchy is the identity: a slot name is the document's word and
+            // the path levels are what a reader can click into (hover, `comp_node`).
+            let path = match (&input.asset, &input.prim) {
+                (Some(asset), Some(prim)) => Some(format!(
+                    "{}:{prim}",
+                    strip_anon_prefix(asset)
+                        .rsplit(['/', '\\'])
+                        .next()
+                        .unwrap_or(asset)
+                )),
+                (None, Some(prim)) => Some(prim.clone()),
+                _ => None,
+            };
+            let label = match path {
+                Some(path) => path,
                 None => input.slot.clone(),
             };
             children.push(TreeNode {
