@@ -742,7 +742,12 @@ fn row(
 /// A row titled by its **description** (the user's ruling for every described layer) is a
 /// control row like any other: the marker is still about the click, not about the text.
 pub fn control_row_title(node: &TreeNode, is_current_preview: bool) -> String {
-    if is_current_preview && !node.op {
+    // **`≤` says the composition stops here** (v1.5.3), so it belongs to a cook stop — an
+    // operator's row or the root layer's — and not to a material: `preview{solo}` shows
+    // one USD and stops nowhere in the cook order, which is why a clicked path used to
+    // wear the mark for no reason. The op rows carry it too: their label is the
+    // description alone now, so nothing else says they are the prefix in force.
+    if is_current_preview && (node.op || node.root) {
         format!("≤ {}", node.label)
     } else {
         node.label.clone()

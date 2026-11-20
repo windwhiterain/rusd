@@ -23,7 +23,7 @@ bytemuck = { version = "1.25.2", features = ["derive"] }
 # crate `rusd-render` writes PNGs with, so one version of the encoder.
 png = "0.18.1"
 wgpu = "30.0.2"
-egui = { version = "0.37", features = ["default_fonts"] }
+egui = { version = "0.37", default-features = false }
 egui-wgpu = { version = "0.37", features = ["winit"] }
 egui-winit = { version = "0.37", default-features = false, features = ["clipboard"] }
 winit = "0.30"
