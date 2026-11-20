@@ -977,6 +977,23 @@ impl Session {
     /// opened (`input = "terrain.rusd:/World/Terrain"`, v1.12). Its detail is the file's own
     /// text, read fresh: nothing composes it, so there is no stack to describe.
     fn declared_asset_node(&self, id: &str) -> Option<Value> {
+        // **A product is a file, not a layer of the stage** (v1.13): its detail is the file's
+        // own text, read fresh — the stage holds one USD and these never entered it.
+        for op in &self.cook_ops {
+            if same_identifier(&op.layer_id, id) || same_identifier(&op.layer_path, id) {
+                let text = std::fs::read_to_string(&op.layer_path).ok()?;
+                return Some(json!({
+                    "kind_type": "layer",
+                    "id": op.layer_id,
+                    "identifier": op.layer_id,
+                    "kind": "op",
+                    "strength": 0,
+                    "usda_text": text,
+                    "spec_count": op.writes.len(),
+                    "description": op.description,
+                }));
+            }
+        }
         for op in &self.cook_ops {
             let Some(doc_dir) = std::path::Path::new(&op.layer_path)
                 .parent()
