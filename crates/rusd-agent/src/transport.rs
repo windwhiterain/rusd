@@ -1004,6 +1004,33 @@ impl Session {
             let Some(input) = op.input.as_deref() else {
                 continue;
             };
+            // The one USD an input declares is a node too (`box.rusd`, `terrain.rusd`, …):
+            // its detail is the file's own text.
+            for declared in op.inputs.iter().map(|(_, value)| value.as_str()).chain(std::iter::once(input)) {
+                let Ok(parsed) = rusd_scene::reference::parse(
+                    declared,
+                    Some(doc_dir.to_string_lossy().as_ref()),
+                ) else {
+                    continue;
+                };
+                let Some(asset) = parsed.asset else {
+                    continue;
+                };
+                if !same_identifier(&asset, id) {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&asset).ok()?;
+                return Some(json!({
+                    "kind_type": "layer",
+                    "id": asset,
+                    "identifier": asset,
+                    "kind": "reference",
+                    "strength": 0,
+                    "usda_text": text,
+                    "spec_count": 0,
+                    "description": format!("算子声明的输入：{declared}"),
+                }));
+            }
             let Ok(parsed) = rusd_scene::reference::parse(
                 input,
                 Some(doc_dir.to_string_lossy().as_ref()),
