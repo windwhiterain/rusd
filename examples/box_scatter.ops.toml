@@ -1,18 +1,8 @@
-# rusd 0.1 — **文档就是这张算子图**：两段实例化在同一张图里
+# rusd 0.1 — **文档就是这张算子图**
 #
-# 词汇是本工具自己的：`operator` / `outputs` / `input`，没有 USD 词（没有 `schema`、
-# 没有 `reference`、没有 `typeName`）。图说的只有一件事：跑什么算子、它引用哪一个 USD。
-# **每个算子一个 USD 输入、一个 USD 输出**——输入不再是一张表。
-# 算子之间的数据（点云）沿 cook 顺序从上一步的产物里取，不另写声明。
+# 词汇是本工具自己的：`operator` / `output` / `input`。没有 USD 词，也没有 `stage`：
+# 这里只有一个一个的算子。**每个算子一个 USD 输入、一个 USD 输出**。
 
-[stage]
-default_prim = "/World"
-meters_per_unit = 1.0
-seed = 20261118
-up_axis = "Z"
-
-
-# --- 第一段：volume 采样 → 每个点一个 box ------------------------------------
 [operator.Samples]
 operator    = "sample_points"
 description = "在 Volume 盒内均匀采 60 个点（第一阶段）"
@@ -29,7 +19,6 @@ input       = "box.rusd:/World/Prototypes/Box"
 max_prims = 5000
 seed      = 11
 
-# --- 第二段：mesh 表面采样 → 每点一簇 ----------------------------------------
 [operator.SurfaceSamples]
 operator    = "sample_points"
 description = "在 Terrain 表面面积加权采 40 个点（第二阶段）"

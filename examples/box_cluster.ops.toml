@@ -1,14 +1,6 @@
-# rusd 0.1 — **文档就是这张算子图**：第一段（Cube 体积 → 采样 → 一簇 box）
+# rusd 0.1 — **文档就是这张算子图**
 #
-# 词汇是本工具自己的：`operator` / `outputs` / `input`；USD 层是**输入**（`input = "…rusd:/World/…"`），
-# 产物写成 `.rusd`。**每个算子一个 USD 输入、一个 USD 输出**——输入不是表。
-
-[stage]
-default_prim = "/World"
-meters_per_unit = 1.0
-seed = 20261118
-up_axis = "Z"
-
+# 词汇是本工具自己的：`operator` / `output` / `input`。没有 USD 词，也没有 `stage`。
 
 [operator.Samples]
 operator    = "sample_points"
