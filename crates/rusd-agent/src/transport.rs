@@ -1213,22 +1213,21 @@ impl Session {
             else {
                 continue;
             };
-            let Some(input) = op.input.as_deref() else {
-                continue;
-            };
-            let Ok(parsed) = rusd_scene::reference::parse(
-                input,
-                Some(doc_dir.to_string_lossy().as_ref()),
-            ) else {
-                continue;
-            };
-            let Some(asset) = parsed.asset else {
-                continue;
-            };
-            if out.iter().any(|e: &Value| e["id"] == json!(asset)) {
-                continue;
+            for (_slot, input) in &op.inputs {
+                let Ok(parsed) = rusd_scene::reference::parse(
+                    input,
+                    Some(doc_dir.to_string_lossy().as_ref()),
+                ) else {
+                    continue;
+                };
+                let Some(asset) = parsed.asset else {
+                    continue;
+                };
+                if out.iter().any(|e: &Value| e["id"] == json!(asset)) {
+                    continue;
+                }
+                out.push(json!({ "id": asset, "file": asset }));
             }
-            out.push(json!({ "id": asset, "file": asset }));
         }
         Ok(json!({ "layers": out }))
     }
