@@ -16,7 +16,7 @@
 //!   tell which ones it already has.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// One entry of a layer's block manifest, as the server reports it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,15 +176,6 @@ impl LayerCache {
     pub fn is_current(&self, remote: &str, manifest: &[BlockRef]) -> bool {
         self.local_path(remote).is_file() && self.missing(remote, manifest).is_empty()
     }
-}
-
-/// A short, stable key for a remote path: the same string always lands in the same local
-/// file, and two paths that differ land in two.
-fn key_of(remote: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    remote.replace('\\', "/").to_lowercase().hash(&mut h);
-    format!("{:016x}", h.finish())
 }
 
 /// The header line a block's key implies, for matching a cached block to a manifest entry

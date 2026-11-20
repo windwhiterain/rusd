@@ -25,7 +25,6 @@ use std::thread;
 use std::time::Duration;
 
 use rusd_core::Diagnostic;
-use rusd_render::annotate::{self, SelectMode, Selection, Style};
 use rusd_scene::geometry::Camera;
 
 use crate::camera::Orbit;
@@ -861,8 +860,6 @@ impl Drop for NetWorker {
     }
 }
 
-use rusd_render::render::RenderOutput;
-
 /// What the UI asks the render thread to do.
 pub enum RenderCommand {
     /// A new scene: bake and upload (the camera is not part of it).
@@ -944,6 +941,11 @@ pub struct Frame {
     pub slabs: usize,
     /// How many draw runs those slabs left (contiguous slabs merge).
     pub draws: usize,
+    /// **How many bytes the last scene update wrote into the per-prim matrix buffer**
+    /// (v1.11). A moved prim is 64 bytes of model matrix and nothing else, so a one-prim
+    /// drag reads `matrix_bytes: 64, rewritten: 0` — the observation behind 「拖动一个 prim
+    /// 只能写 64 字节」.
+    pub matrix_bytes: usize,
     /// How long this frame took to draw and read back.
     pub millis: f64,
     /// The camera this frame was **drawn with**. Carried because it is the only
@@ -981,7 +983,6 @@ impl RenderWorker {
         queue: wgpu::Queue,
         width: u32,
         height: u32,
-        style: Style,
         wake: Wake,
     ) -> Self {
         let (cmd_tx, cmd_rx) = channel::<RenderCommand>();
@@ -1099,8 +1100,16 @@ impl RenderWorker {
                                 // drag under 「只看选中」 re-bakes the same subtree, and
                                 // the prim being dragged is in it (it is the
                                 // selection).
-                                let shown = crate::scene::isolate(geo, isolated.as_deref());
-                                viewport.set_scene_with_translates(&shown, &overrides);
+                                //
+                                // With no filter there is nothing to compose: the scene
+                                // on the GPU already says what is shown, and cloning it
+                                // per drag event would be the drag's most expensive
+                                // work (v1.11 — a drag is one matrix record).
+                                let filtered = isolated
+                                    .as_deref()
+                                    .map(|filter| crate::scene::isolate(geo, Some(filter)));
+                                let shown = filtered.as_ref().unwrap_or(geo);
+                                viewport.set_scene_with_translates(shown, &overrides);
                                 selection = sel;
                                 dirty = true;
                             }
@@ -1164,6 +1173,7 @@ impl RenderWorker {
                             rewritten: viewport.rewritten,
                             slabs: viewport.slots_live,
                             draws: viewport.draws_count(),
+                            matrix_bytes: viewport.matrix_bytes,
                             millis: started.elapsed().as_secs_f64() * 1000.0,
                             camera,
                         });

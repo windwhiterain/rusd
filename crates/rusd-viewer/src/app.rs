@@ -29,7 +29,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use egui_wgpu::ScreenDescriptor;
-use rusd_render::annotate::Style;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
@@ -376,16 +375,6 @@ struct Waiting {
 }
 
 impl Waiting {
-    /// A waiter holding `reply`, owing nothing: the caller fills in what it sent.
-    fn new(reply: crate::control::Replier, shape: Shape) -> Self {
-        Self {
-            reply,
-            awaiting: Vec::new(),
-            results: BTreeMap::new(),
-            shape,
-        }
-    }
-
     /// A waiter that will be answered when the tags in `owed` have all come back.
     ///
     /// `owed` is what the click this waiter stands for is about to send — one tag for a
@@ -541,7 +530,6 @@ impl Shell {
             max_side,
         );
 
-        let style = Style::default();
         // `Window::inner_size` is in **physical pixels**, which is exactly what the
         // render thread's viewport must be: the frame is later painted into a
         // point-space rect, and one frame texel must land on one device pixel
@@ -553,7 +541,6 @@ impl Shell {
             render_state.queue.clone(),
             size.width.max(1),
             size.height.max(1),
-            style,
             {
                 let proxy = proxy.clone();
                 Box::new(move || {
@@ -1618,6 +1605,7 @@ impl Shell {
             "select" => self.control_select(&args, reply.clone()),
             "state" => Some(Ok(self.control_state())),
             "isolate" => self.control_isolate(&args),
+            "translate" => self.control_translate(&args),
             "fit" => self.control_fit(),
             "orbit" => self.control_orbit(&args),
             "capture" | "shot" => self.control_capture(&args),
@@ -1668,7 +1656,8 @@ impl Shell {
             "orbit": self.orbit.map(orbit_json),
             "frame": self.frame.as_ref().map(|(f, _)| {
                 json!({ "seq": f.seq, "width": f.width, "height": f.height, "millis": f.millis,
-                        "rewritten": f.rewritten, "slabs": f.slabs, "draws": f.draws })
+                        "rewritten": f.rewritten, "slabs": f.slabs, "draws": f.draws,
+                        "matrix_bytes": f.matrix_bytes })
             }),
             "status": self.status,
         })
@@ -2002,6 +1991,44 @@ impl Shell {
             "isolate": self.only_selected,
             "selection": self.model.selection,
         })))
+    }
+
+    /// `translate{path, to:[x,y,z]}`: **one gizmo-drag tick, without the gesture**
+    /// (v1.11).
+    ///
+    /// It is the call `drag_gizmo` makes while the pointer moves: the prim is drawn at a
+    /// **local** translate, locally, and the server is told nothing (a drag that ends
+    /// sends the opinion; this method does not, so a script can move a prim without
+    /// authoring anything). What it costs is what a drag costs, and `state.frame` says
+    /// so: `matrix_bytes: 64` (one model matrix) and `rewritten: 0` (no vertex touched).
+    fn control_translate(
+        &mut self,
+        args: &crate::control::Args<'_>,
+    ) -> Option<Result<serde_json::Value, (i64, String)>> {
+        let path = match args.text("path") {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        let to = match args.opt_vec3("to") {
+            Ok(Some(v)) => v,
+            Ok(None) => return Some(Err(args.bad("`to` ([x, y, z]) required"))),
+            Err(e) => return Some(Err(e)),
+        };
+        if !self.model.centers.contains_key(&path) {
+            return Some(Err(args.bad(format!(
+                "no prim at {path:?}: the scene on screen has {} prims and none by that path",
+                self.model.item_count
+            ))));
+        }
+        let mut overrides = BTreeMap::new();
+        overrides.insert(path.clone(), to);
+        // The selection is the shell's own: a move must not change what is picked.
+        self.render.send(RenderCommand::Preview {
+            overrides,
+            selection: self.model.selection.clone(),
+        });
+        self.request_repaint();
+        Some(Ok(json!({ "path": path, "to": to })))
     }
 
     /// `fit`: the Fit button.
@@ -2492,20 +2519,6 @@ impl Shell {
 
     /// Every prim path the composition report lists, in the wire's own order.
     ///
-    /// `composition_tree`'s `prim_nodes` is what says which prims the scene has
-    /// (`docs/PROTOCOL.md` v1.5.7 keeps the field precisely so a client can resolve a path to
-    /// a node, even though v1.3 stopped drawing it). The scene tree is the one reader that
-    /// wants all of them at once — every other reader asks for one by path or id — so this is
-    /// the only place the whole list is taken.
-    ///
-    /// Empty before a report arrives: a scene tree drawn then is empty, which is the truth.
-    fn prim_paths(&self) -> Vec<String> {
-        match self.tree.model.tree() {
-            Some(tree) => tree.prims.iter().map(|p| p.path.clone()).collect(),
-            None => Vec::new(),
-        }
-    }
-
     /// Which composition the layer the viewport is showing names, as the **tree** says:
     /// a cook prefix for an op or root layer, a solo for any other document layer, and
     /// `None` when the tree cannot tell (not arrived yet, or the id is not one of its
@@ -2739,16 +2752,25 @@ impl Shell {
     }
 
     /// Whether a viewport point lands on the current selection's pixels.
+    ///
+    /// It asks the GPU for **one texel** (v1.11): a frame carries no id buffer any more
+    /// (v1.10 stopped copying it back), so this used to index an empty `Vec` — a press on
+    /// a selected prim, which is exactly the press that starts a drag, panicked the
+    /// window. The `Pick` round trip is the same one a click makes, so both agree about
+    /// what is under the pointer.
     fn pixel_is_selected(&self, pos: egui::Pos2, rect: egui::Rect) -> bool {
-        let (Some(sel), Some((x, y))) =
-            (self.model.selection.clone(), self.frame_pixels(rect, pos))
-        else {
+        let Some(sel) = self.model.selection.clone() else {
+            return false;
+        };
+        let Some((x, y)) = self.frame_pixels(rect, pos) else {
             return false;
         };
         let Some((frame, _)) = &self.frame else {
             return false;
         };
-        let id = frame.ids[(y * frame.width + x) as usize];
+        let Some(id) = self.render.pick(x, y) else {
+            return false;
+        };
         id != 0 && frame.paths.get((id - 1) as usize) == Some(&sel)
     }
 

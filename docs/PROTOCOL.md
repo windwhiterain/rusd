@@ -594,6 +594,7 @@ prim**（视口描边高亮 + `comp_node` 详情，与视口 pick 同一条路�
 | `tree` | `{id}` | 点树上该 id 的行（按行类型：层行=选中+详情+预览，弧=详情，最终与 GUI 同一 `action_for`） |
 | `select` | `{path}` | 等同视口 pick：选中该 prim（描边+详情） |
 | `isolate` | `{on: bool}` | 「只看选中」开关（= 键 `i` / 底栏按钮） |
+| `translate` | `{path, to: [x,y,z]}` | 拖动一个 prim 的一次 tick（v1.11：只改本地预览，不写文档、不问 server） |
 | `fit` | — | Fit 按钮 |
 | `orbit` | `{yaw, pitch, dist, target:[x,y,z]?}` | 轨道相机（等同鼠标拖/滚） |
 | `capture` | `{path}` | 把当前帧写成 PNG（等同「选区截图」去掉选区：整帧） |
@@ -680,3 +681,23 @@ prim**（视口描边高亮 + `comp_node` 详情，与视口 pick 同一条路�
 - 每个层行点开都有图（ink > 0）：root/Clusters 16.02%、Boxes 6.56%、两段采样 10.67%/3.62%、
   prototypes 30.16%、编译出的产物层 16.02%、root 子层 12.00%、terrain 5.05%、volume 45.09%。
 - `cargo test -p rusd-proc --test compose_products` 把上面的数字钉成回归测试。
+
+## v1.11 增补（渲染是增量的；拖动一个 prim = 64 字节；2026-11-20 用户裁定）
+
+**口径**：USD delta → GPU buffer delta。server 只给层表 + 变化块，viewer 只把变化的部分
+写进 GPU；不许靠 release / dev profile 的 `opt-level` 去掩盖 slow path。
+
+- **每个 prim 一块 slab**（顶点/索引 arena 里的一段），prim id 稳定；几何签名没变的 prim
+  一个字节都不重写。arena 满了或废料过半时**压实走 `copy_buffer_to_buffer`**（显存内搬，
+  不回到 CPU）。
+- **每个 prim 一条 128 B 矩阵记录**（`model` @ `id*128`，法线矩阵 @ `+64`），顶点只烘**本地
+  坐标**；模型矩阵在 vertex shader 里应用。所以**拖动一个 prim = 一次 64 B 写**（只有模型
+  矩阵变了，法线矩阵不动），顶点 buffer 一个字节都不动。
+- **观测**：`state.frame` 给 `rewritten`（被重烘的 prim 数）、`slabs`、`draws`（相邻 slab 合并
+  的绘制段数）、`matrix_bytes`（上次场景更新写进矩阵 buffer 的字节数）。
+  实测（`examples/box_scatter.ops.toml` 的 2400 prim 那一档）：首次上传
+  `rewritten 2400 / matrix_bytes 307200 / slabs 2400 / draws 1`；再点同一行
+  `rewritten 0 / matrix_bytes 0`；`translate` 一个 prim `matrix_bytes 64 / rewritten 0`。
+- **控制 RPC 新增 `translate{path, to}`**：拖动的一次 tick（本地预览，不写文档、不问 server），
+  这样「拖动只写 64 字节」这一条不需要 computer use 也能复现——和 `state.frame.matrix_bytes`
+  一起就是它的验收。
