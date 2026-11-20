@@ -223,6 +223,34 @@ impl Generator for RusdInstances {
         // …and an `instances` node's `points` is a point cloud; anything else is a
         // mismatch between the operator's schema and the wire.
         ctx.expect_schema(&input, "points", &["Points"], &base);
+        let prototype = ctx
+            .param_str("prototype")
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                vec![
+                    Diagnostic::error("E_MISSING_PROTOTYPE", "RusdInstances needs `prototype`")
+                        .at_prim(&base),
+                ]
+            })?;
+        // v1.5.8: a prim path in this stack, or `asset:prim` naming material in
+        // another layer. The instances' references cross the asset boundary in the
+        // second case — the layer is opened by the arc, never placed on the stack.
+        let proto = crate::generator::parse_prototype(&prototype, ctx.doc_dir).map_err(|e| {
+            vec![
+                Diagnostic::error(e.code, e.message)
+                    .at_prim(&base)
+                    .at_property("prototype"),
+            ]
+        })?;
+        // **The prototype is a declared slot too.** An instances node puts a copy of it
+        // at every point, so the slot's schema is "a prim USD can place" — an
+        // `Xformable` — and USD is what answers it: a `Mesh`, a `Cube`, a `Points` or an
+        // `Xform` prototype passes through `IsA`, a `Material` does not.
+        ctx.expect_schema(&prototype, "prototype", &["Xformable"], &base);
+        // **Both schema questions are asked before any geometry is read**: a wire that
+        // breaks the operator's contract is reported even when the geometry would have
+        // failed first, so one cook names every mismatch it can see instead of only the
+        // one it tripped over.
         let cloud = match ctx.read_points(&input) {
             Some(pts) if !pts.is_empty() => pts,
             Some(_) => {
@@ -247,25 +275,6 @@ impl Generator for RusdInstances {
                 ]);
             }
         };
-        let prototype = ctx
-            .param_str("prototype")
-            .map(str::to_owned)
-            .ok_or_else(|| {
-                vec![
-                    Diagnostic::error("E_MISSING_PROTOTYPE", "RusdInstances needs `prototype`")
-                        .at_prim(&base),
-                ]
-            })?;
-        // v1.5.8: a prim path in this stack, or `asset:prim` naming material in
-        // another layer. The instances' references cross the asset boundary in the
-        // second case — the layer is opened by the arc, never placed on the stack.
-        let proto = crate::generator::parse_prototype(&prototype, ctx.doc_dir).map_err(|e| {
-            vec![
-                Diagnostic::error(e.code, e.message)
-                    .at_prim(&base)
-                    .at_property("prototype"),
-            ]
-        })?;
         let proto_path = proto.path.clone();
         // **The asset as the document wrote it** (v1.9): `box.rusd` stays `box.rusd` in the
         // product, so the arc resolves from wherever the product is read. Resolution to an

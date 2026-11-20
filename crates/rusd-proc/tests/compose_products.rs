@@ -223,3 +223,50 @@ fn an_input_of_the_wrong_schema_is_reported() {
         "an input of the wrong schema is E_SCHEMA: {seen:?}"
     );
 }
+
+/// **A prototype USD cannot place is reported — and a subtype is not a mismatch** (the
+/// user: 就用 USD 本身的 subtype 机制判断). An instances node copies its prototype at every
+/// point, so the slot is declared `Xformable`: a class, not a type. The accepting half is
+/// the example itself — `box_cluster.ops.toml` instances a `Cube`, which is not an `Xform`
+/// but *is* an `Xformable`, and that cook is asserted clean above. This is the other half:
+/// a `Material` is neither geometry nor a transform, so `IsA` says no where a comparison
+/// against any fixed list of type names could only ever say "not in the list".
+#[test]
+fn a_prototype_of_the_wrong_schema_is_reported() {
+    let _ = cook_example("box_cluster.ops.toml");
+    // A prototype of its own, because its type is the whole subject of the test.
+    let dir = std::env::temp_dir().join("rusd-prototype-check");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("mat.rusd"),
+        "[stage]\ndefault_prim = \"/World\"\n\n[World]\nschema = \"Xform\"\n\n\
+         [World.Mat]\nschema = \"Material\"\n",
+    )
+    .unwrap();
+    let mat = dir.join("mat.rusd").to_string_lossy().replace('\\', "/");
+    // **The example's own graph with one string changed**: the prototype's file. Same
+    // operators, same cloud, same order — so what differs in the answer is the type.
+    let text = std::fs::read_to_string(examples().join("box_cluster.ops.toml"))
+        .unwrap()
+        .replace(
+            "box.rusd:/World/Prototypes/Box",
+            &format!("{mat}:/World/Mat"),
+        );
+    let dir_text = doc_dir();
+    let doc = rusd_core::syntax::parse_in(&text, Some(&dir_text)).unwrap();
+    let stage = rusd_scene::lower(&doc).unwrap();
+    let nodes = rusd_proc::nodes_from_doc(&doc, Some(&dir_text));
+    let mut engine = rusd_proc::default_registry();
+    engine.set_out_dir(Some(dir.join("out")));
+    let result = engine.cook(&stage, &nodes);
+    let seen: Vec<(String, String)> = result
+        .diags
+        .iter()
+        .map(|d| (d.code.clone(), d.message.clone()))
+        .collect();
+    assert!(
+        seen.iter()
+            .any(|(code, msg)| code == "E_SCHEMA" && msg.contains("prototype")),
+        "a prototype that is not an Xformable is E_SCHEMA: {seen:?}"
+    );
+}

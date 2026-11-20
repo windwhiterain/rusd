@@ -5,6 +5,7 @@
 use std::collections::BTreeMap;
 
 use openusd::sdf::{self, Value as SdfValue};
+use openusd::tf;
 use openusd::usd::Stage;
 use rusd_core::{Diagnostic, PrimPath, Value};
 
@@ -332,6 +333,14 @@ impl<'a> GenContext<'a> {
     /// — `points : Points`, `domain : Cube` — so the contract cannot live in the panel; it
     /// lives here, next to the read: `expected` is what this operator accepts for `slot`,
     /// and anything else is a diagnostic that names both sides.
+    ///
+    /// **The question is asked of USD, not of a string** (the user: 就用 USD 本身的 subtype
+    /// 机制判断). `expected` names schemas the way a schema library does — `Points` is a
+    /// concrete type, `Xformable` a class — and a wired prim satisfies a slot when USD says
+    /// it **is** one of them: [`SchemaRegistry::is_a`], which walks the `bases` each schema
+    /// declares, transitively. So a `Mesh` wired where an `Xformable` was declared passes,
+    /// a `Material` does not, and a declaration can name the relation the operator actually
+    /// needs instead of enumerating every type that happens to satisfy it today.
     pub fn expect_schema(&mut self, raw: &str, slot: &str, expected: &[&str], base: &str) {
         let actual = self.with_input(raw, |stage, path| {
             sdf::path(path)
@@ -346,7 +355,18 @@ impl<'a> GenContext<'a> {
             // reports what it could not read, and guessing a type would report twice.
             return;
         };
-        if !expected.iter().any(|e| *e == actual) {
+        let registry = rusd_scene::schema::usd_registry();
+        let actual = tf::Token::from(actual.as_str());
+        if registry.schema_info(&actual).is_none() {
+            // Same rule one step further in: a `typeName` the schema data does not
+            // hold is a type nothing said anything about — USD answers `IsA` false for
+            // it too, which is a statement about the registry, not about the wire.
+            return;
+        }
+        if !expected
+            .iter()
+            .any(|base| registry.is_a(&actual, &tf::Token::from(*base)))
+        {
             let mut diag = Diagnostic::error(
                 "E_SCHEMA",
                 format!(
