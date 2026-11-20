@@ -136,16 +136,16 @@ fn segment_one_cooks_a_usd_per_operator() {
 fn segment_two_cooks_four_usds() {
     let ops = cook_example("box_scatter.ops.toml");
     assert_eq!(ops.len(), 4, "both segments cook their own two nodes");
-    let clusters = ops.iter().find(|o| o.id == "/World/Clusters").unwrap();
-    assert!(clusters.layer_path.ends_with("clusters.rusd"));
-    let paths = prims_of(clusters);
+    let instances = ops.iter().find(|o| o.id == "/World/Instances").unwrap();
+    assert!(instances.layer_path.ends_with("instances.rusd"));
+    let paths = prims_of(instances);
     assert_eq!(
         paths
             .iter()
-            .filter(|p| is_instance(p, "/World/Clusters"))
+            .filter(|p| is_instance(p, "/World/Instances"))
             .count(),
         40,
-        "one cluster prim per surface sample"
+        "one instance prim per surface sample"
     );
 }
 

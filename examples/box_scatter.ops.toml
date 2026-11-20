@@ -38,10 +38,10 @@ input       = "terrain.rusd:/World/Terrain"
 count = 40
 seed  = 7
 
-[operator.Clusters]
+[operator.Instances]
 operator    = "instances"
 description = "把第一阶段的一簇 box 实例化到 quad 表面"
-output      = "clusters.rusd:/World/Clusters"
+output      = "instances.rusd:/World/Instances"
 input       = "/World/Boxes"
 max_prims = 5000
 seed      = 7
