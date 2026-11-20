@@ -144,6 +144,10 @@ impl Generator for RusdSamplePoints {
     fn eval(&self, ctx: &mut GenContext) -> Result<sdf::Layer, Vec<Diagnostic>> {
         let base = ctx.path.as_str().to_owned();
         let input = require_input(ctx, "RusdSamplePoints", &base)?;
+        // The operator's schema says `domain` is the geometry it samples — a box volume or
+        // a mesh surface — and that is a claim about the input, so it is checked against
+        // what is actually wired.
+        ctx.expect_schema(&input, "domain", &["Cube", "Mesh"], &base);
         let count = ctx.param_u64("count", 100) as usize;
         let mut rng = Rng::seeded(ctx.stage_seed, &base, ctx.seed);
         let local: Vec<[f64; 3]> = if let Some(volume) = ctx.read_volume(&input) {
@@ -216,6 +220,9 @@ impl Generator for RusdInstances {
     fn eval(&self, ctx: &mut GenContext) -> Result<sdf::Layer, Vec<Diagnostic>> {
         let base = ctx.path.as_str().to_owned();
         let input = require_input(ctx, "RusdInstances", &base)?;
+        // …and an `instances` node's `points` is a point cloud; anything else is a
+        // mismatch between the operator's schema and the wire.
+        ctx.expect_schema(&input, "points", &["Points"], &base);
         let cloud = match ctx.read_points(&input) {
             Some(pts) if !pts.is_empty() => pts,
             Some(_) => {

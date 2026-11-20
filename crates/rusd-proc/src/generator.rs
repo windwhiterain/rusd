@@ -327,10 +327,43 @@ impl<'a> GenContext<'a> {
         self.warnings.push(diag);
     }
 
+    /// **The operator's declared schema is checked where its input is read** (the user:
+    /// operator 定义的输入输出 schema 要自动校验). The panel prints what is *actually* wired
+    /// — `points : Points`, `domain : Cube` — so the contract cannot live in the panel; it
+    /// lives here, next to the read: `expected` is what this operator accepts for `slot`,
+    /// and anything else is a diagnostic that names both sides.
+    pub fn expect_schema(&mut self, raw: &str, slot: &str, expected: &[&str], base: &str) {
+        let actual = self.with_input(raw, |stage, path| {
+            sdf::path(path)
+                .ok()
+                .and_then(|p| stage.prim(p).ok())
+                .and_then(|p| p.type_name().ok().flatten())
+                .map(|t| t.as_str().to_owned())
+                .filter(|t| !t.is_empty())
+        });
+        let Some(Some(actual)) = actual else {
+            // An input this build cannot type is not a mismatch: the reader already
+            // reports what it could not read, and guessing a type would report twice.
+            return;
+        };
+        if !expected.iter().any(|e| *e == actual) {
+            let mut diag = Diagnostic::error(
+                "E_SCHEMA",
+                format!(
+                    "operator declares `{slot}` as {{{}}} but {raw} is a `{actual}`",
+                    expected.join(", ")
+                ),
+            )
+            .at_prim(base)
+            .at_property("input_points");
+            diag = diag; // the slot is named in the message; the property anchor is the read
+            self.warn(diag);
+        }
+    }
+
     /// Drain accumulated warnings (called by the engine after eval).
     pub fn take_warnings(&mut self) -> Vec<Diagnostic> {
-        std::mem::take(&mut self.warnings)
-    }
+        std::mem::take(&mut self.warnings)    }
 
     pub fn param_f64(&self, name: &str, default: f64) -> f64 {
         match self.params.get(name) {

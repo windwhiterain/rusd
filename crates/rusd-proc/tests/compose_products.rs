@@ -109,7 +109,7 @@ fn segment_one_cooks_a_usd_per_operator() {
     // The sampler's own USD: its output prim, the cloud it computed, and the one named
     // structure it declares — `domain`, the USD it reads.
     let paths = prims_of(samples);
-    for wanted in ["/World/Samples", "/World/Samples/points", "/World/Samples/domain"] {
+    for wanted in ["/World/Samples", "/World/Samples/points"] {
         assert!(paths.iter().any(|p| p == wanted), "{wanted} in {paths:?}");
     }
     // The instances' USD: its output prim, one prim per instance, and its one input.
@@ -122,12 +122,13 @@ fn segment_one_cooks_a_usd_per_operator() {
         60,
         "one instance prim per point"
     );
-    // An `instances` operator reads `{points, prototype}`, so both are named structures
-    // under the prim it wrote.
-    for wanted in ["/World/Boxes/points", "/World/Boxes/prototype"] {
+    // **An output holds what the operator computed, not what it read** (v1.14): the
+    // instances are the operator's work, and `points` / `prototype` are its inputs — they
+    // stay where they were authored, named by the document.
+    for unwanted in ["/World/Boxes/points", "/World/Boxes/prototype", "/World/Boxes/input"] {
         assert!(
-            paths.iter().any(|p| p == wanted),
-            "{wanted} in {paths:?}"
+            !paths.iter().any(|p| p == unwanted),
+            "an input is not authored into the product: {unwanted} in {paths:?}"
         );
     }
     assert!(
@@ -186,4 +187,39 @@ fn a_product_is_a_layer_file() {
             .unwrap();
         assert!(paths_of(&stack).iter().any(|p| p.starts_with(&op.id)));
     }
+}
+
+/// **The operator's declared schema is checked, not assumed** (the user: operator 定义的
+/// 输入输出 schema 要自动校验). A sampler declares `domain` to be the geometry it samples —
+/// a box volume or a mesh surface — so a `Points` prim wired there is a mismatch, reported
+/// as `E_SCHEMA` against the node that declared it.
+#[test]
+fn an_input_of_the_wrong_schema_is_reported() {
+    // The example's own cloud, so this test does not depend on cook order.
+    let _ = cook_example("box_scatter.ops.toml");
+    let points = examples().join("out/samples.rusd");
+    let points = points.to_string_lossy().replace('\\', "/");
+    let text = format!(
+        "[operator.Bad]\noperator = \"sample_points\"\ndescription = \"bad\"\n\
+         output = \"bad.rusd:/World/Bad\"\ninput = \"{points}:/World/Samples/points\"\n\
+         count = 4\nseed = 1\n"
+    );
+    let dir = std::env::temp_dir().join("rusd-schema-check");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_text = dir.to_string_lossy().replace('\\', "/");
+    let doc = rusd_core::syntax::parse_in(&text, Some(&dir_text)).unwrap();
+    let stage = rusd_scene::lower(&doc).unwrap();
+    let nodes = rusd_proc::nodes_from_doc(&doc, Some(&dir_text));
+    let mut engine = rusd_proc::default_registry();
+    engine.set_out_dir(Some(dir.join("out")));
+    let result = engine.cook(&stage, &nodes);
+    let seen: Vec<(String, String)> = result
+        .diags
+        .iter()
+        .map(|d| (d.code.clone(), d.message.clone()))
+        .collect();
+    assert!(
+        seen.iter().any(|(code, _)| code == "E_SCHEMA"),
+        "an input of the wrong schema is E_SCHEMA: {seen:?}"
+    );
 }

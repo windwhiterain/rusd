@@ -379,7 +379,13 @@ impl CookEngine {
                     produced.push(path);
                     stats.cooked += 1;
                 }
-                Err(d) => diags.extend(d),
+                // **What the generator said before it failed is still said** (v1.13): a
+                // node that reports a schema mismatch and then refuses the geometry reports
+                // both, or the first one is lost at exactly the moment it mattered.
+                Err(d) => {
+                    diags.extend(ctx.take_warnings());
+                    diags.extend(d);
+                }
             }
         }
         let ops = order
