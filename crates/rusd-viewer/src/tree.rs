@@ -745,13 +745,12 @@ fn structure_rows(structure: &[(String, Option<String>)]) -> Option<TreeNode> {
         let schema = structure
             .iter()
             .find(|(p, _)| p == path)
-            .and_then(|(_, s)| s.clone());
+            .and_then(|(_, s)| s.clone())
+            .filter(|s| !s.is_empty());
         let leaf = path.rsplit('/').next().unwrap_or(path);
-        let label = match schema.as_deref().filter(|s| !s.is_empty()) {
-            // The schema is the identity: `Terrain : Mesh` says what it is in USD's words.
-            Some(schema) => format!("{leaf} : {schema}"),
-            None => leaf.to_owned(),
-        };
+        // **The row is the schema that level composes to** — `Xform`, `Cube`, `Points` —
+        // because the hierarchy *is* the schema: a prim path is only where it is.
+        let label = schema.clone().unwrap_or_else(|| leaf.to_owned());
         let children = structure
             .iter()
             .filter(|(p, _)| p.rsplit_once('/').map(|(parent, _)| parent == path).unwrap_or(false))
@@ -773,7 +772,6 @@ fn structure_rows(structure: &[(String, Option<String>)]) -> Option<TreeNode> {
     let root = structure.first()?.0.clone();
     Some(make(structure, &root))
 }
-
 /// One layer's branch: its arcs and the prims it authors.
 fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     let mut children: Vec<TreeNode> = Vec::new();
@@ -785,59 +783,11 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     // inputs table has.
     if !layer.inputs.is_empty() {
         for input in &layer.inputs {
-            let (id, prim) = match (&input.asset, &input.prim) {
-                (Some(asset), _) => (asset.clone(), None),
-                (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
-                _ => continue,
-            };
-            let structure = input
-                .structure
-                .iter()
-                .map(|(path, schema)| match schema {
-                    Some(schema) => format!("{path} : {schema}"),
-                    None => path.clone(),
-                })
-                .collect::<Vec<_>>()
-                .join(" / ");
-            // **The row is `name : schema`** — what the document calls the input, and what
-            // USD says the thing is (`Points`, `Cube`, `Mesh`). The path levels themselves
-            // are the row's detail (hover, `comp_node`), so an operator with two inputs has
-            // two rows.
-            // **The row is `name → the USD path`** — the input's name, then the structure it
-            // names: `points → /World/Samples/points`, `prototype → box.rusd:/World/Prototypes/Box`,
-            // `prototype → /World/Boxes`. The path levels and their schemas stay in the row's
-            // hover and its `comp_node` detail.
-            let path = match (&input.asset, &input.prim) {
-                (Some(asset), Some(prim)) => Some(format!(
-                    "{}:{prim}",
-                    strip_anon_prefix(asset)
-                        .rsplit(['/', '\\'])
-                        .next()
-                        .unwrap_or(asset)
-                )),
-                (None, Some(prim)) => Some(prim.clone()),
-                _ => None,
-            };
-            let label = match path {
-                Some(path) => format!("{} \u{2192} {path}", input.slot),
-                None => input.slot.clone(),
-            };
-            children.push(TreeNode {
-                id,
-                kind: TreeNodeKind::Arc,
-                label,                prim: prim.clone(),
-                op: false,
-                root: false,
-                session: false,
-                secondary: Some(if prim.is_some() { "render" } else { "open" }.to_owned()),
-                hover: Some(if structure.is_empty() {
-                    input.value.clone()
-                } else {
-                    format!("{} = {structure}", input.value)
-                }),
-                children: Vec::new(),
-            });
+            if let Some(root) = structure_rows(&input.structure) {
+                children.push(root);
+            }
         }
+
         return TreeNode {
             id: layer.id.clone(),
             kind: TreeNodeKind::Layer,
@@ -1981,6 +1931,7 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
 
 
