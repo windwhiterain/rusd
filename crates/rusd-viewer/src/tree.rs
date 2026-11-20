@@ -740,9 +740,8 @@ fn hierarchy_rows(paths: &[String]) -> Vec<TreeNode> {
 /// A declared input's USD hierarchy, as rows: every level of the path, nested, each row
 /// labelled `name : schema` (`World : Xform`, `Terrain : Mesh`). Clicking a row renders
 /// that one path.
-fn structure_rows(structure: &[(String, Option<String>)]) -> Option<TreeNode> {
-    fn make(structure: &[(String, Option<String>)], path: &str) -> TreeNode {
-        let schema = structure
+fn structure_rows(structure: &[(String, Option<String>)], branch: &str) -> Option<TreeNode> {
+    fn make(structure: &[(String, Option<String>)], branch: &str, path: &str) -> TreeNode {        let schema = structure
             .iter()
             .find(|(p, _)| p == path)
             .and_then(|(_, s)| s.clone())
@@ -759,10 +758,13 @@ fn structure_rows(structure: &[(String, Option<String>)]) -> Option<TreeNode> {
         let children = structure
             .iter()
             .filter(|(p, _)| p.rsplit_once('/').map(|(parent, _)| parent == path).unwrap_or(false))
-            .map(|(child, _)| make(structure, child))
+            .map(|(child, _)| make(structure, branch, child))
             .collect();
         TreeNode {
-            id: format!("prim:{path}"),
+            // **The row's id carries its branch** (v1.13): two inputs of one operator can
+            // both start at `/World`, and a row id that spelled only the path would give the
+            // two branches one egui id — one set of expansion state, one hit area.
+            id: format!("{branch}:{path}"),
             kind: TreeNodeKind::Prim,
             label,
             prim: Some(path.to_owned()),
@@ -777,8 +779,7 @@ fn structure_rows(structure: &[(String, Option<String>)]) -> Option<TreeNode> {
             children,
         }    }
     let root = structure.first()?.0.clone();
-    Some(make(structure, &root))
-}
+    Some(make(structure, branch, &root))}
 /// One layer's branch: its arcs and the prims it authors.
 fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     let mut children: Vec<TreeNode> = Vec::new();
@@ -789,29 +790,14 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     // hierarchy the operator *declares* has exactly the number of entries its document's
     // inputs table has.
     if !layer.inputs.is_empty() {
+        // **The hierarchy is the schema** (v1.13, the user's ruling): an input is shown as
+        // the USD hierarchy it names — one row per level of the prim path, each carrying the
+        // schema that level composes to. No slot name of the document's appears: the
+        // hierarchy itself is the identity of the input.
         for input in &layer.inputs {
-            let (id, prim) = match (&input.asset, &input.prim) {
-                (Some(asset), _) => (asset.clone(), None),
-                (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
-                _ => continue,
-            };
-            // **The row is the input, and the hierarchy it names hangs under it** (v1.13):
-            // `points` / `prototype` / `domain` is what the document calls it — that is how
-            // a reader finds an input — and what it reads is the USD hierarchy, one row per
-            // level, each labelled by the schema that level composes to.
-            let structure = structure_rows(&input.structure).into_iter().collect();
-            children.push(TreeNode {
-                id,
-                kind: TreeNodeKind::Arc,
-                label: input.slot.clone(),
-                prim: prim.clone(),
-                op: false,
-                root: false,
-                session: false,
-                secondary: Some(if prim.is_some() { "render" } else { "open" }.to_owned()),
-                hover: Some(input.value.clone()),
-                children: structure,
-            });
+            if let Some(root) = structure_rows(&input.structure, &input.slot) {
+                children.push(root);
+            }
         }
 
         return TreeNode {
@@ -1957,6 +1943,7 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
 
 
