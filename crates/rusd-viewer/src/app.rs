@@ -1344,6 +1344,7 @@ impl Shell {
                 // leaves it entirely outside the frustum, which reads as "点了节点不显示".
                 // The server-snapshot path already re-arms the fit when the composition
                 // changes (`session.rs`); a local open never went through it.
+                self.model.rearm_first_fit();
                 self.adopt_scene(made);
                 self.model.preview = Some(id);
                 self.status = "本地打开完成".to_owned();
@@ -1399,6 +1400,7 @@ impl Shell {
                     diags: Vec::new(),
                     stage: Some(stage),
                 };
+                self.model.rearm_first_fit();
                 self.adopt_scene(made);
                 self.model.preview = Some(id.to_owned());
                 self.status = format!("本地打开 {}", local.display());

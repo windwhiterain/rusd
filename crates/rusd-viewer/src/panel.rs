@@ -437,12 +437,16 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
         ui.label("（尚无合成树）");
         return TreeAction::None;
     }
+    // The row to bring into view, taken so it is spent by this pass. Handed down as
+    // `&mut` and cleared by the row that uses it: the tree holds a layer twice (its own
+    // first-level row and every arc leaf that names it), and clearing is what keeps the
+    // second match from scrolling somewhere else afterwards.
     // **[v1.4] the whole body reads which rows are previews from the rows themselves.**
     // `row` returns a `TreeAction`, not a `TreeSelection`, so the click rule lives in
     // exactly one place: [`action_for`], over the flags `crate::tree::roots` set.
     let mut action = TreeAction::None;
     let out = egui::ScrollArea::vertical()
-        .id_salt("composition-tree-rows")
+        .id_salt("composition-tree")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for (root_index, root) in roots.iter().enumerate() {
@@ -460,19 +464,7 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
                 }
             }
         });
-    {
-        use std::sync::atomic::{AtomicI32, Ordering};
-        static LAST: AtomicI32 = AtomicI32::new(i32::MIN);
-        let y = out.state.offset().y.round() as i32;
-        let last = LAST.swap(y, Ordering::Relaxed);
-        if last != i32::MIN && last != y {
-            eprintln!(
-                "TREE-SCROLL {last} -> {y} rows={} content_h={}",
-                roots.len(),
-                out.content_size.y
-            );
-        }
-    }
+    note_scroll("tree", &out.state, out.content_size.y);
     action
 }
 
@@ -780,7 +772,7 @@ pub fn detail_panel(ui: &mut egui::Ui, panel: &TreePanel) {
         ui.label("（点选一个节点）");
         return;
     };
-    egui::ScrollArea::vertical()
+    let out = egui::ScrollArea::vertical()
         .id_salt("comp-node-detail")
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -794,6 +786,27 @@ pub fn detail_panel(ui: &mut egui::Ui, panel: &TreePanel) {
                 ui.label(RichText::new(line).monospace());
             }
         });
+    note_scroll("detail", &out.state, out.content_size.y);
+}
+
+/// Report a scroll offset that moved **by itself** — the class of bug behind 「我点东西的时候
+/// scroll 被跳来跳去」. `what` names the area, and the content height says which way it went:
+/// a changed offset with the same content is something code did; an unchanged offset with
+/// new content is the list being rebuilt under the reader.
+fn note_scroll(what: &'static str, state: &egui::scroll_area::State, content_h: f32) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<&'static str, i32>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return;
+    };
+    let now = state.offset().y.round() as i32;
+    if let Some(prev) = seen.insert(what, now)
+        && prev != now
+    {
+        eprintln!("SCROLL {what} {prev} -> {now} content_h={content_h:.0}");
+    }
 }
 
 /// One prim's detail, **by layer**: a header naming the prim, then a section per layer.
