@@ -780,27 +780,53 @@ fn input_entries(tree: &CompositionTree, layer: &LayerNode) -> Vec<TreeNode> {
         .inputs
         .iter()
         .map(|input| {
-            let value = completed(tree, &input.value);
+            // **The hierarchy is the schema, so the row is a name** (the user's ruling,
+            // restated): `points`, `prototype : Cube` — never a USD path. The `World/…`
+            // spelling is where the structure happens to live, which is the tooltip and
+            // what a click renders, not what the hierarchy is.
+            let schema = input
+                .structure
+                .first()
+                .and_then(|(_, schema)| schema.clone())
+                .filter(|schema| !schema.is_empty());
+            let label = match &schema {
+                Some(schema) => format!("{} : {schema}", input.slot),
+                None => input.slot.clone(),
+            };
             let mut row = match &input.asset {
-                Some(asset) => {
-                    field_row(&input.slot, value, asset.clone(), TreeNodeKind::Arc, None)
-                }
+                Some(asset) => TreeNode {
+                    id: asset.clone(),
+                    kind: TreeNodeKind::Arc,
+                    label,
+                    prim: None,
+                    op: false,
+                    root: false,
+                    session: false,
+                    secondary: None,
+                    hover: Some(completed(tree, &input.value)),
+                    children: Vec::new(),
+                },
                 None => {
                     let prim = input.prim.clone();
                     let id = match &prim {
                         Some(prim) => format!("prim:{prim}"),
                         None => layer.id.clone(),
                     };
-                    field_row(&input.slot, value, id, TreeNodeKind::Prim, prim)
+                    TreeNode {
+                        id,
+                        kind: TreeNodeKind::Prim,
+                        label,
+                        prim,
+                        op: false,
+                        root: false,
+                        session: false,
+                        secondary: None,
+                        hover: Some(completed(tree, &input.value)),
+                        children: Vec::new(),
+                    }
                 }
             };
-            // **The schema is what the entry is** (v1.13): `prototype : Cube` says the
-            // structure is a cube, which the name alone does not.
-            row.secondary = input
-                .structure
-                .first()
-                .and_then(|(_, schema)| schema.clone())
-                .filter(|schema| !schema.is_empty());
+            row.secondary = None;
             row
         })
         .collect()
@@ -2093,10 +2119,14 @@ mod rows_for_the_user {
             .collect();
         assert_eq!(
             entries,
-            vec![
-                ("points: /World/Samples/points", Some("Points")),
-                ("prototype: boxes.rusd:/World/Boxes", Some("Cube")),
-            ]
+            vec![("points : Points", None), ("prototype : Cube", None)]
+        );
+        // **The hierarchy is the schema**: a name and the typeName, never a USD path —
+        // `World/Boxes` is where the structure lives, which is the tooltip.
+        assert!(input.children.iter().all(|row| !row.label.contains('/')));
+        assert_eq!(
+            input.children[0].hover.as_deref(),
+            Some("/World/Samples/points")
         );
 
         // A single-anchor output has no structure below it to list.

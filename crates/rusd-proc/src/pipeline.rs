@@ -150,8 +150,10 @@ fn author_inputs(
 ) -> AuthResult {
     for (slot, value) in inputs {
         let child = format!("{base}/{slot}");
-        PrimSpec::new(d, child.as_str(), Specifier::Def, "")?;
-        // **The schema node names an input; it does not pull that USD in** (v1.13): 不同的东西
+        // A **named structure** is an `Xform`: a container that carries no geometry of its
+        // own (the entry names where the structure lives, the string attribute below says
+        // which). A typeless `def` would be `unknown schema ''` to the reader.
+        PrimSpec::new(d, child.as_str(), Specifier::Def, "Xform")?;        // **The schema node names an input; it does not pull that USD in** (v1.13): 不同的东西
         // 在各自的 USD。 It records the target as a string and draws nothing, so this file
         // holds only what this operator computed.
         let mut target = AttributeSpec::new(
@@ -361,6 +363,11 @@ impl Generator for RusdInstances {
         let mut layer = sdf::Layer::new_anonymous("rusd_instances.usda");
         let ctx_inputs = ctx.inputs.clone();
         let ctx_doc_dir = ctx.doc_dir;
+        // **The cloud is the other half of the schema** (v1.13): an `instances` node reads
+        // `{points, prototype}`. The document declares the prototype and the graph hands
+        // the node its cloud, so both are authored under the prim this node wrote, named the
+        // way the schema names them — the product's USD hierarchy *is* the schema.
+        let cloud_slot = vec![("points".to_owned(), input.clone())];
         layer
             .edit(|l| {
                 let d = l.data_mut();
@@ -373,10 +380,10 @@ impl Generator for RusdInstances {
                     // prototype, leaving an empty `Xform` in every instance's place.
                     PrimSpec::new(d, p.as_str(), Specifier::Def, "")?;
                     let s = sample_dist(&mut rng, scale_dist.as_ref(), 1.0);
-                    author_reference(d, &pp, &proto_asset, &proto_path, to_local(inv, *world), s)?;
+                author_reference(d, &pp, &proto_asset, &proto_path, to_local(inv, *world), s)?;
                 }
-                author_inputs(d, &base, &ctx_inputs)?;
-                Ok(())
+                author_inputs(d, &base, &cloud_slot)?;
+                author_inputs(d, &base, &ctx_inputs)?;                Ok(())
             })
             .map_err(|e| vec![Diagnostic::error("E_GEN", e.to_string()).at_prim(&base)])?;
         for w in warns {

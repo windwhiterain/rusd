@@ -158,7 +158,18 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
             match parameter {
                 Some(parameter) => {
                     props.insert(parameter.to_owned(), Value::String(input.to_owned()));
-                    declared.push(("input".to_owned(), input.to_owned()));
+                    // **The declared slot is the operator's own name for its USD input**
+                    // (v1.13, the user's ruling: 「USD 的 hierarchy 就是算子的 schema」):
+                    // an instances node reads its `prototype` from that USD and a sampler
+                    // its `domain`, so those are the names the product authors as child
+                    // prims — not the document's own table key, which is the graph's word
+                    // for "the one input" and not part of any schema.
+                    let slot = match kind {
+                        "sample_points" => "domain",
+                        "instances" | "scatter" => "prototype",
+                        _ => "input",
+                    };
+                    declared.push((slot.to_owned(), input.to_owned()));
                 }
                 None => diags.push(Diagnostic::warning(
                     "W_GRAPH_INPUT",

@@ -106,8 +106,16 @@ fn declared_inputs(op: &CookOp, stage: &Stage) -> Vec<DeclaredInput> {
     // points}` for an `instances` node — the prototype it instances and the cloud it
     // consumes — and `{points}` for a sampler, whose one input is the geometry it reads.
     let mut out: Vec<DeclaredInput> = Vec::new();
+    // **The slot is the operator's own name for that USD** (v1.13: USD 的 hierarchy 就是算子的
+    // schema): a sampler reads a `domain`, an instances node a `prototype`, and the cloud an
+    // `instances` node picks up from the op before it is its `points`.
+    let input_slot = if matches!(op.generator.as_str(), "RusdSamplePoints") {
+        "domain"
+    } else {
+        "points"
+    };
     if let Some(points) = op.input.as_deref() {
-        out.push(input_entry("points", points, doc_dir, stage));
+        out.push(input_entry(input_slot, points, doc_dir, stage));
     }
     if matches!(op.generator.as_str(), "RusdInstances" | "RusdScatter") {
         for (_slot, value) in &op.inputs {
