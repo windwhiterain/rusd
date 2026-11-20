@@ -744,38 +744,66 @@ fn operation_row(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
 /// The file in front is resolved through the layer that writes that prim, so the two halves
 /// are the same USD by construction.
 fn input_row(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
-    let mut value = layer.input.clone().unwrap_or_else(|| NONE.to_owned());
+    let value = completed(tree, layer.input.as_deref().unwrap_or(NONE));
     // The wire's entries carry the resolved asset and prim, which is what a click needs: a
     // row prints the document's spelling, a click takes a layer id.
-    let declared = layer.inputs.iter().find(|input| input.value == value);
+    let declared = layer.inputs.iter().find(|input| completed(tree, &input.value) == value);
     let (asset, prim) = match declared {
         Some(input) => (input.asset.clone(), input.prim.clone()),
         None => (None, None),
     };
-    if spelled_file(&value).is_none()
-        && value.starts_with('/')
-        && let Some(file) = owner_file(tree, &value)
-    {
-        value = format!("{file}:{value}");
-    }
-    match (asset, prim) {
+    let mut row = match (asset, prim) {
         // A USD of its own: the click opens that file, which is the click a material row
         // already has (v1.8).
         (Some(asset), _) => field_row("input", value, asset, TreeNodeKind::Arc, None),
         // A prim of the picture: the click renders that path alone (v1.13).
         (None, Some(prim)) => {
-            let mut row = field_row(
-                "input",
-                value,
-                format!("prim:{prim}"),
-                TreeNodeKind::Arc,
-                Some(prim),
-            );
-            row.secondary = Some("render".to_owned());
-            row
+            field_row("input", value, format!("prim:{prim}"), TreeNodeKind::Prim, Some(prim))
         }
         (None, None) => field_row("input", value, layer.id.clone(), TreeNodeKind::Prim, None),
-    }
+    };
+    // **The operator's input hierarchy** (v1.16): the named structures it declares it reads
+    // — `{points, prototype}` for an `instances` node, `{points}` for a sampler — one row
+    // each, with the schema of the prim each one names.
+    row.children = input_entries(tree, layer);
+    row
+}
+
+/// The named structures an operator declares under its **input**: one row per declared
+/// input, `<name>: <usd path:/hierarchy>`, dimmed by the schema of the prim it names.
+///
+/// This is the *operator's* hierarchy and not the USD's: the document declares which named
+/// structures the operator reads, and the cloud an `instances` node picks up from the op
+/// before it is declared by the graph's own data flow, not by the operator's table.
+fn input_entries(tree: &CompositionTree, layer: &LayerNode) -> Vec<TreeNode> {
+    layer
+        .inputs
+        .iter()
+        .map(|input| {
+            let value = completed(tree, &input.value);
+            let mut row = match &input.asset {
+                Some(asset) => {
+                    field_row(&input.slot, value, asset.clone(), TreeNodeKind::Arc, None)
+                }
+                None => {
+                    let prim = input.prim.clone();
+                    let id = match &prim {
+                        Some(prim) => format!("prim:{prim}"),
+                        None => layer.id.clone(),
+                    };
+                    field_row(&input.slot, value, id, TreeNodeKind::Prim, prim)
+                }
+            };
+            // **The schema is what the entry is** (v1.13): `prototype : Cube` says the
+            // structure is a cube, which the name alone does not.
+            row.secondary = input
+                .structure
+                .first()
+                .and_then(|(_, schema)| schema.clone())
+                .filter(|schema| !schema.is_empty());
+            row
+        })
+        .collect()
 }
 
 /// **The `output` row**: the USD this operator writes, `file:/hierarchy`, in the document's
@@ -789,7 +817,45 @@ fn output_row(layer: &LayerNode) -> TreeNode {
             None => file,
         }
     });
-    field_row("output", value, layer.id.clone(), TreeNodeKind::Arc, None)
+    let mut row = field_row("output", value, layer.id.clone(), TreeNodeKind::Arc, None);
+    // **The operator's output hierarchy** (v1.16): the named structures it declares below
+    // the prim the row already names — a sampler's `points` under `/World/Samples`. The
+    // anchor itself is not repeated: the row above is it.
+    let anchor = layer.outputs.first().map(String::as_str).unwrap_or_default();
+    row.children = layer
+        .outputs
+        .iter()
+        .filter(|path| path.as_str() != anchor)
+        .map(|path| TreeNode {
+            id: format!("prim:{path}"),
+            kind: TreeNodeKind::Prim,
+            label: path
+                .strip_prefix(&format!("{anchor}/"))
+                .unwrap_or(path)
+                .to_owned(),
+            prim: Some(path.clone()),
+            op: false,
+            root: false,
+            session: false,
+            secondary: None,
+            hover: Some(format!("{path} · 点击只渲染这个命名路径")),
+            children: Vec::new(),
+        })
+        .collect();
+    row
+}
+
+/// A declared value with the USD it lives in put in front of a bare prim:
+/// `/World/Boxes` → `boxes.rusd:/World/Boxes`. A value that already names a file —
+/// `volume.rusd:/World/Volume` — is returned as it is.
+fn completed(tree: &CompositionTree, value: &str) -> String {
+    if spelled_file(value).is_none()
+        && value.starts_with('/')
+        && let Some(file) = owner_file(tree, value)
+    {
+        return format!("{file}:{value}");
+    }
+    value.to_owned()
 }
 
 /// **A USD row**: the file's path (its title), then every `reference` and `sublayer` it
@@ -1954,8 +2020,12 @@ mod rows_for_the_user {
                     "op_name": "RusdInstances",
                     "input": "/World/Boxes",
                     "output": "instances.rusd:/World/Instances",
-                    "inputs": [{"slot": "prototype", "value": "/World/Boxes",
-                                "asset": null, "prim": "/World/Boxes", "structure": []}],
+                    "inputs": [{"slot": "points", "value": "/World/Samples/points",
+                                "asset": null, "prim": "/World/Samples/points",
+                                "structure": [{"path": "points", "schema": "Points"}]},
+                               {"slot": "prototype", "value": "/World/Boxes",
+                                "asset": null, "prim": "/World/Boxes",
+                                "structure": [{"path": "prototype", "schema": "Cube"}]}],
                     "outputs": ["/World/Instances"], "node": "/World/Instances"
                 },
                 {
@@ -2011,6 +2081,28 @@ mod rows_for_the_user {
                 "output: instances.rusd:/World/Instances",
             ]
         );
+
+        // **The operator's input hierarchy** (v1.16): one row per named structure it
+        // declares, with the schema of the prim each one names.
+        let input = &op.children[1];
+        assert_eq!(input.label, "input: boxes.rusd:/World/Boxes");
+        let entries: Vec<(&str, Option<&str>)> = input
+            .children
+            .iter()
+            .map(|row| (row.label.as_str(), row.secondary.as_deref()))
+            .collect();
+        assert_eq!(
+            entries,
+            vec![
+                ("points: /World/Samples/points", Some("Points")),
+                ("prototype: boxes.rusd:/World/Boxes", Some("Cube")),
+            ]
+        );
+
+        // A single-anchor output has no structure below it to list.
+        let output = &op.children[2];
+        assert_eq!(output.label, "output: instances.rusd:/World/Instances");
+        assert!(output.children.is_empty(), "{:?}", output.children);
 
         // A reference is one row per distinct target, counting the prims that carry it.
         let instances = find(&rows, "instances.rusd");

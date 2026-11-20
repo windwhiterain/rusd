@@ -264,10 +264,11 @@ impl TreePanel {
 /// ask for the composition [`ask_for`] names. Every other row is a plain selection.
 pub fn action_for(node: &TreeNode) -> TreeAction {
     let selection = TreeSelection::of(node);
-    // **A row of the operator's declared hierarchy renders its path alone** (v1.13):
-    // `secondary = render` is the row's own word for it, set where the row is built, so
-    // the panel needs no list of which rows those are.
-    if node.secondary.as_deref() == Some("render") && node.prim.is_some() {
+    // **A row that stands for a prim renders that path alone** (v1.16): the operator's
+    // declared hierarchy entries (and its `input` row) carry the prim they name, so the
+    // `secondary` slot is free to say what the entry *is* — its schema — instead of
+    // doubling as a click marker.
+    if node.prim.is_some() {
         return TreeAction::Render(selection);
     }
     match node.kind {
