@@ -132,6 +132,66 @@ fn author_hide(d: &mut dyn sdf::AbstractData, prim: &str) -> AuthResult {
     Ok(())
 }
 
+/// The asset name a product authors for a parameter that named `<file>:<prim>` (v1.9,
+/// reused by [`author_input`] in v1.12): **the string the document wrote**, one
+/// directory up — a product is written into `<doc_dir>/out/`, so a material named beside
+/// the document is `../<file>` from the product that reads it. Resolution to an absolute
+/// path stays the reading side's job, which is why this reads the raw parameter and not
+/// the resolved one `rusd_scene::reference::parse` returns.
+fn authored_asset(raw: &str) -> Option<String> {
+    let i = raw.rfind(':')?;
+    if i == 0 || !raw[i + 1..].starts_with('/') {
+        return None;
+    }
+    let authored = &raw[..i];
+    // Already a path this product can resolve: absolute (`/…`, `C:/…`) or relative.
+    let drive = authored.len() > 2
+        && authored.as_bytes()[1] == b':'
+        && (authored.as_bytes()[2] == b'/' || authored.as_bytes()[2] == b'\\');
+    if authored.starts_with('/') || authored.starts_with("../") || drive {
+        Some(authored.to_owned())
+    } else {
+        Some(format!("../{authored}"))
+    }
+}
+
+/// **An input is a node of the composition graph** (v1.12).
+///
+/// `RusdInstances` always crossed the asset boundary with a `reference`; a sampler wrote
+/// nothing at all about the material it read, so `terrain.rusd:/World/Terrain` left no
+/// trace in any layer: the composition had no such layer, the tree no such row, and the
+/// terrain mesh could not be looked at even though the op had just sampled it. The
+/// product now authors the input as a `def` that **references** the material and is
+/// hidden — the same replacement semantics [`author_hide`] uses, plus the arc that makes
+/// 「一个物体一个 USD 素材」 findable.
+fn author_input(d: &mut dyn sdf::AbstractData, raw: &str, doc_dir: Option<&str>) -> AuthResult {
+    let Ok(reference) = rusd_scene::reference::parse(raw, doc_dir) else {
+        return author_hide(d, raw);
+    };
+    let Some(asset) = authored_asset(raw) else {
+        // A prim path in this stack: hide it where it is, as before.
+        return author_hide(d, reference.path.as_str());
+    };
+    let path = reference.path.clone();
+    PrimSpec::new(d, path.as_str(), Specifier::Def, "")?;
+    let op = sdf::ReferenceListOp::explicit([sdf::Reference {
+        asset_path: asset,
+        prim_path: path.clone(),
+        ..Default::default()
+    }]);
+    d.set_field(
+        &path,
+        sdf::FieldKey::References.as_str(),
+        SdfValue::ReferenceListOp(op),
+    );
+    // Hidden by its consumer: an input is not something the picture shows, and a
+    // reference without this opinion would draw the material where it was sampled.
+    let vis = format!("{}.visibility", path.as_str());
+    let mut a = AttributeSpec::new(d, vis.as_str(), "token", Variability::Varying, false)?;
+    a.set_default(SdfValue::Token("invisible".into()))?;
+    Ok(())
+}
+
 /// `RusdSamplePoints` (v1.5, extended v1.5.8): input geometry becomes a point cloud.
 ///
 /// Parameters (v1.5.1): `input_points` (a `Mesh` or a `Cube`), `count`, `seed`.
@@ -149,7 +209,9 @@ fn author_hide(d: &mut dyn sdf::AbstractData, prim: &str) -> AuthResult {
 /// Anything else is `E_INPUT_GEOMETRY` — there is no third form.
 ///
 /// Output: `<node>/points`, a `Points` prim whose `points` are the samples in the
-/// anchor's local space, plus a `visibility = "invisible"` over on the input.
+/// anchor's local space, plus an arc to the material it read (v1.12: a `def` with a
+/// `references` to `../<file>`, hidden by `visibility = "invisible"`), or a
+/// `visibility` over on the input when the input is a prim in this stack.
 pub struct RusdSamplePoints;
 
 impl Generator for RusdSamplePoints {
@@ -192,6 +254,7 @@ impl Generator for RusdSamplePoints {
             ]);
         };
         let cloud = points_path(&base);
+        let doc_dir = ctx.doc_dir;
 
         let mut layer = sdf::Layer::new_anonymous("rusd_sample_points.usda");
         layer
@@ -199,7 +262,7 @@ impl Generator for RusdSamplePoints {
                 let d = l.data_mut();
                 PrimSpec::new(d, base.as_str(), Specifier::Def, "Xform")?;
                 author_cloud(d, &cloud, &local)?;
-                author_hide(d, &input)?;
+                author_input(d, &input, doc_dir)?;
                 Ok(())
             })
             .map_err(|e| vec![Diagnostic::error("E_GEN", e.to_string()).at_prim(&base)])?;

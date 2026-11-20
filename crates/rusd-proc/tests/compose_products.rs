@@ -4,11 +4,14 @@
 //! and who reads whom, the cook writes one `.rusd` layer per operator into `<examples>/out`,
 //! and the stack a picture is made from is the document root plus those files.
 //!
-//! The numbers are the documents' acceptance ones (v1.9): `box_cluster.ops.toml` is
-//! segment one (volume → 60 boxes, 64 prims) and `box_scatter.ops.toml` is both segments in
-//! one graph (60 boxes + 40 clusters of them, 2507 prims). Where the old `.rusd` examples
-//! counted a prim per container the document itself authored, an operator graph authors
-//! none: the counted prims are the operators' outputs alone.
+//! The numbers are the documents' acceptance ones (v1.9, revised by v1.12):
+//! `box_cluster.ops.toml` is segment one (volume → 60 boxes, 65 prims) and
+//! `box_scatter.ops.toml` is both segments in one graph (60 boxes + 40 clusters of them,
+//! 2509 prims). Where the old `.rusd` examples counted a prim per container the document
+//! itself authored, an operator graph authors none: the counted prims are the operators'
+//! outputs alone — **plus the material each op read**, which a product now references
+//! (v1.12: an input is a node of the composition graph, `/World/Volume` and
+//! `/World/Terrain`, hidden by its consumer).
 
 use std::path::{Path, PathBuf};
 
@@ -72,7 +75,19 @@ fn compose_example(name: &str) -> (Vec<String>, Vec<rusd_proc::CookOp>) {
 fn segment_one_composes_its_boxes() {
     let (paths, ops) = compose_example("box_cluster.ops.toml");
     assert_eq!(ops.len(), 2, "segment one is two operators");
-    assert_eq!(paths.len(), 64, "composed prims: {paths:?}");
+    assert_eq!(paths.len(), 65, "composed prims: {paths:?}");
+    // **The material the sampler read is a node of the composition** (v1.12): the product
+    // keeps an arc to `../volume.rusd`, so the volume composes (hidden) instead of leaving
+    // no trace for anything to show.
+    assert!(
+        paths.iter().any(|p| p == "/World/Volume"),
+        "the sampled volume is a node: {paths:?}"
+    );
+    assert_eq!(
+        stack_prim("box_cluster.ops.toml", "/World/Volume"),
+        Some("Cube".to_owned()),
+        "the input composes the material's own type"
+    );
     // 60 instances of `box.rusd`'s prototype, each one prim.
     let inst = stack_prim("box_cluster.ops.toml", "/World/Boxes/i000000");
     assert_eq!(inst, Some("Cube".to_owned()), "the box is its prototype's type");
@@ -82,7 +97,16 @@ fn segment_one_composes_its_boxes() {
 fn segment_two_composes_its_clusters() {
     let (paths, ops) = compose_example("box_scatter.ops.toml");
     assert_eq!(ops.len(), 4, "both segments cook their own two nodes");
-    assert_eq!(paths.len(), 2507, "composed prims: {}", paths.len());
+    assert_eq!(paths.len(), 2509, "composed prims: {}", paths.len());
+    // Both segments' inputs are nodes, not parameters that leave no trace: the volume the
+    // first sampler read and the terrain the second one did.
+    for input in ["/World/Volume", "/World/Terrain"] {
+        assert!(
+            paths.iter().any(|p| p == input),
+            "{input} is a node: {}",
+            paths.iter().filter(|p| p.starts_with("/World/") && p.matches('/').count() == 2).count()
+        );
+    }
     // One cluster is one box cluster: 60 boxes behind a same-stack reference to the
     // `/World/Boxes` layer the same graph cooked.
     let under_one_cluster = paths
@@ -113,7 +137,8 @@ fn stack_prim(name: &str, path: &str) -> Option<String> {
 /// The arcs a product authors are **relative** (v1.9): the material it names is
 /// `../box.rusd` — the file beside the `out/` it sits in — and a product another operator
 /// of the same graph wrote is a bare file name. An absolute path would pin the picture to
-/// one machine and one process's temp directory.
+/// one machine and one process's temp directory. v1.12: a sampler's input is such an arc
+/// too.
 #[test]
 fn a_product_names_its_inputs_relatively() {
     let (_paths, ops) = compose_example("box_cluster.ops.toml");
@@ -125,6 +150,19 @@ fn a_product_names_its_inputs_relatively() {
     assert!(
         text.contains("../box.rusd"),
         "the prototype arc is the relative ../box.rusd:\n{text}"
+    );
+    assert!(
+        !text.contains(&doc_dir()),
+        "no product names the document's absolute directory:\n{text}"
+    );
+    let samples = ops
+        .iter()
+        .find(|op| op.id == "/World/Samples")
+        .expect("the sampler cooked");
+    let text = std::fs::read_to_string(&samples.layer_path).unwrap();
+    assert!(
+        text.contains("../volume.rusd:/World/Volume"),
+        "the input the sampler read is a relative arc:\n{text}"
     );
     assert!(
         !text.contains(&doc_dir()),

@@ -708,3 +708,21 @@ prim**（视口描边高亮 + `comp_node` 详情，与视口 pick 同一条路�
 gamma 编码（“We expect "normal" textures that are NOT sRGB-aware”），之前给的是 sRGB 视图，
 硬件多解一次码，窗口显示的其实是 `linear(capture)`（PNG 里的 (196,218,237) 在屏幕上是
 (140,178,216)）。现在同一个 texture 再开一个 `Rgba8Unorm` 视图给 egui，屏幕与 PNG 同色。
+
+## v1.12 增补（算子的输入在合成图里是一个节点；2026-11-20 用户裁定）
+
+**算子读的素材不是一个字符串参数，而是合成图里的一个节点。**
+
+- 文档里照旧写 `domain = "terrain.rusd:/World/Terrain"`（`inputs` 槽位 → 引擎参数
+  `input_points`），cook 照旧按它读几何；
+- 但产物层现在把它 author 成 **`def` + `references = "../terrain.rusd:/World/Terrain"`**
+  **+ `visibility = "invisible"`**（`RusdInstances` 对 `prototype` 一直这么写）。于是
+  `terrain.rusd` / `volume.rusd` 真的以**层 + reference 弧**出现在 USD 合成图里：树上有
+  `reference → terrain.rusd:/World/Terrain` 与 `terrain.rusd [reference · 6/8]` 这样的行，能点开 solo 看；
+  因为被消费者写成了 invisible，画面一个像素不变。
+- 依据：树画的是 USD 合成图（节点是 USD：层 / arc / prim），而素材是「一个物体一个 USD 素材」，
+  那么它就必须能在图里找到一个节点——之前只在 cook 的输入字符串里，树上无行、无法点开。
+- 验收（`ctl.py tree`）：`box_scatter.ops.toml` 现在是 **8 层 · 102 arc · 2509 prim**
+  （原来 6 层 · 100 arc · 2507 prim），2400 个实例的墨量 **16.4547% 不变**；
+  `cargo test -p rusd-proc --test compose_products` 把 `/World/Volume`→`Cube`、`/World/Terrain`
+  和「产物里的引用是相对的 `../volume.rusd`」钉成回归。
