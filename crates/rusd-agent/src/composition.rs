@@ -91,9 +91,14 @@ struct DeclaredInput {
     value: String,
     asset: Option<String>,
     prim: Option<String>,
+    /// **The hierarchy that input names, level by level, each with its USD schema**
+    /// (`typeName`): `/World` is an `Xform`, `/World/Terrain` a `Mesh`. This *is* what the
+    /// operator reads — a slot name is the document's word for it, the schema is what USD
+    /// says it is.
+    structure: Vec<(String, Option<String>)>,
 }
 
-fn declared_inputs(op: &CookOp) -> Vec<DeclaredInput> {
+fn declared_inputs(op: &CookOp, stage: &Stage) -> Vec<DeclaredInput> {
     let doc_dir = std::path::Path::new(&op.layer_path)
         .parent()
         .and_then(|p| p.parent());
@@ -114,11 +119,55 @@ fn declared_inputs(op: &CookOp) -> Vec<DeclaredInput> {
             DeclaredInput {
                 slot: slot.clone(),
                 value: value.clone(),
-                asset: parsed.and_then(|p| p.asset),
-                prim,
+                asset: parsed.as_ref().and_then(|p| p.asset.clone()),
+                prim: prim.clone(),
+                structure: structure_of(
+                    parsed.as_ref().and_then(|p| p.asset.as_deref()),
+                    prim.as_deref(),
+                    stage,
+                ),
             }
         })
         .collect()
+}
+
+/// Every level of `prim` (its ancestors and itself) with the schema it composes to.
+///
+/// `asset` is the layer that authors it when the input names another file; without one the
+/// levels have no schema to report, and a level the layer does not define is `None`.
+fn structure_of(
+    asset: Option<&str>,
+    prim: Option<&str>,
+    stage: &Stage,
+) -> Vec<(String, Option<String>)> {
+    let Some(prim) = prim else {
+        return Vec::new();
+    };
+    // A material's own layer answers for it; a prim of this stack is answered by the stack.
+    let owned;
+    let stage = match asset {
+        Some(a) => {
+            owned = openusd::usd::Stage::open(a).ok();
+            match owned.as_ref() {
+                Some(s) => s,
+                None => stage,
+            }
+        }
+        None => stage,
+    };
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let mut acc = String::new();
+    for part in prim.split('/').filter(|p| !p.is_empty()) {
+        acc.push('/');
+        acc.push_str(part);
+        let schema = sdf::path(acc.as_str())
+            .ok()
+            .and_then(|p| stage.prim(p).ok())
+            .and_then(|p| p.type_name().ok().flatten())
+            .map(|t| t.as_str().to_owned());
+        out.push((acc.clone(), schema));
+    }
+    out
 }
 
 struct LayerEntry {
@@ -396,7 +445,9 @@ impl CompositionTree {
                     op_name: joined.map(|o| o.generator.clone()),
                     node: joined.map(|o| o.id.clone()),
                     op_input: joined.and_then(|o| o.input.clone()),
-                    inputs: joined.map(declared_inputs).unwrap_or_default(),
+                    inputs: joined
+                        .map(|o| declared_inputs(o, stage))
+                        .unwrap_or_default(),
                     outputs: joined.map(|o| o.writes.clone()).unwrap_or_default(),
                     description,
                 }
@@ -522,6 +573,11 @@ impl CompositionTree {
                             "value": i.value,
                             "asset": i.asset,
                             "prim": i.prim,
+                            "structure": i
+                                .structure
+                                .iter()
+                                .map(|(path, schema)| json!({"path": path, "schema": schema}))
+                                .collect::<Vec<_>>(),
                         }))
                         .collect::<Vec<_>>());
                     row["outputs"] = json!(l.outputs);

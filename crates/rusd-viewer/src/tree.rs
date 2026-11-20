@@ -51,8 +51,11 @@ pub struct DeclaredInput {
     pub asset: Option<String>,
     /// The prim the slot points at — in that layer, or in this stack.
     pub prim: Option<String>,
+    /// **The hierarchy the input names, level by level, each with its USD schema**
+    /// (`/World` an `Xform`, `/World/Terrain` a `Mesh`): what the operator reads, in USD's
+    /// own terms.
+    pub structure: Vec<(String, Option<String>)>,
 }
-
 /// One layer of the authority stack.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerNode {    /// The layer identifier, which is also this node's id.
@@ -332,6 +335,24 @@ impl CompositionTree {
                                         .to_owned(),
                                     asset: optional_string(i, "asset"),
                                     prim: optional_string(i, "prim"),
+                                    structure: i
+                                        .get("structure")
+                                        .and_then(Value::as_array)
+                                        .map(|a| {
+                                            a.iter()
+                                                .filter_map(|s| {
+                                                    Some((
+                                                        s.get("path")
+                                                            .and_then(Value::as_str)?
+                                                            .to_owned(),
+                                                        s.get("schema")
+                                                            .and_then(Value::as_str)
+                                                            .map(str::to_owned),
+                                                    ))
+                                                })
+                                                .collect()
+                                        })
+                                        .unwrap_or_default(),
                                 })
                                 .collect()
                         })
@@ -716,35 +737,57 @@ fn hierarchy_rows(paths: &[String]) -> Vec<TreeNode> {
         .collect()
 }
 
+/// A declared input's USD hierarchy, as rows: every level of the path, nested, each row
+/// labelled `name : schema` (`World : Xform`, `Terrain : Mesh`). Clicking a row renders
+/// that one path.
+fn structure_rows(structure: &[(String, Option<String>)]) -> Option<TreeNode> {
+    fn make(structure: &[(String, Option<String>)], path: &str) -> TreeNode {
+        let schema = structure
+            .iter()
+            .find(|(p, _)| p == path)
+            .and_then(|(_, s)| s.clone());
+        let leaf = path.rsplit('/').next().unwrap_or(path);
+        let label = match schema.as_deref().filter(|s| !s.is_empty()) {
+            // The schema is the identity: `Terrain : Mesh` says what it is in USD's words.
+            Some(schema) => format!("{leaf} : {schema}"),
+            None => leaf.to_owned(),
+        };
+        let children = structure
+            .iter()
+            .filter(|(p, _)| p.rsplit_once('/').map(|(parent, _)| parent == path).unwrap_or(false))
+            .map(|(child, _)| make(structure, child))
+            .collect();
+        TreeNode {
+            id: format!("prim:{path}"),
+            kind: TreeNodeKind::Prim,
+            label,
+            prim: Some(path.to_owned()),
+            op: false,
+            root: false,
+            session: false,
+            secondary: Some("render".to_owned()),
+            hover: Some(path.to_owned()),
+            children,
+        }
+    }
+    let root = structure.first()?.0.clone();
+    Some(make(structure, &root))
+}
+
 /// One layer's branch: its arcs and the prims it authors.
 fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     let mut children: Vec<TreeNode> = Vec::new();
-    // **An operator's children are exactly the inputs its document declares** (v1.13):
-    // `points` and `prototype` for an `instances` op, one `domain` for a sampler — one row
-    // each, `name → the USD structure it names`, and nothing else. The output is the row
-    // itself (the layer the operator wrote) and the arcs a product happens to author are
-    // composition detail, so neither is a child here.
+    // **An operator's children are the USD hierarchies its inputs name** (v1.13): every
+    // level of the path, labelled with the **schema** that level composes to — `/World`
+    // is an `Xform`, `/World/Terrain` a `Mesh` — because that hierarchy *is* what the
+    // operator reads. There is no separate slot name: `domain` is the document's word for
+    // it, and the document is not USD. The output is the row itself, and the arcs a
+    // product happens to author are composition detail, so neither is a child here.
     if !layer.inputs.is_empty() {
         for input in &layer.inputs {
-            let (id, prim) = match (&input.asset, &input.prim) {
-                (Some(asset), _) => (asset.clone(), None),
-                (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
-                _ => continue,
-            };
-            children.push(TreeNode {
-                id,
-                kind: TreeNodeKind::Arc,
-                // The name is what the document calls the input; the right-hand side is
-                // the USD structure it names, spelled as the document spells it.
-                label: format!("{} \u{2192} {}", input.slot, input.value),
-                prim: prim.clone(),
-                op: false,
-                root: false,
-                session: false,
-                secondary: Some(if prim.is_some() { "render" } else { "open" }.to_owned()),
-                hover: Some(input.value.clone()),
-                children: Vec::new(),
-            });
+            if let Some(root) = structure_rows(&input.structure) {
+                children.push(root);
+            }
         }
         return TreeNode {
             id: layer.id.clone(),
@@ -759,6 +802,8 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
             children,
         };
     }
+
+
 
 
 
@@ -1885,6 +1930,7 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
 
 
