@@ -368,6 +368,38 @@ impl CompositionTree {
             })
             .collect();
 
+        // **The USD an operator read is a node too** (v1.12): the tree is a view of all the
+        // USD this document involves — the products the ops wrote and the materials they
+        // read. A material a sampler read (`domain = "terrain.rusd:/World/Terrain"`) is
+        // opened by the cook and left behind, so no layer of the stage names it and no row
+        // could show it. The entry is a **row**, not a layer of the stack: it composes
+        // nothing and is labelled `reference`, and its detail is the file's own text.
+        let mut layers = layers;
+        let declared: Vec<(String, String)> = layers
+            .iter()
+            .filter_map(|l| Some((l.input_asset.clone()?, l.op_input.clone()?)))
+            .collect();
+        for (asset, input) in declared {
+            if layers.iter().any(|l| same_file(&l.id, &asset)) {
+                continue;
+            }
+            let strength = layers.len();
+            layers.push(LayerEntry {
+                id: asset,
+                kind: "reference",
+                strength,
+                op: false,
+                op_name: None,
+                node: None,
+                op_input: Some(input),
+                input_asset: None,
+                // No description: the row reads `<file> [reference · n]`, the same shape
+                // every other material row has. What the operator said about it is the
+                // file's detail (`comp_node`), not its row.
+                description: None,
+            });
+        }
+
         let (prims, vsets) = scan_namespace(stage, &scans, &layers);
         CompositionTree {
             layers,
@@ -376,7 +408,6 @@ impl CompositionTree {
             vsets,
         }
     }
-
     /// The ids of the opened layers, strongest first: what `layer{id}` accepts,
     /// and exactly what its refusal lists. Same rows, same order, as
     /// [`CompositionTree::to_json`]'s `layers`.

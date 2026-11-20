@@ -973,6 +973,47 @@ impl Session {
         Ok(value)
     }
 
+    /// A node the tree lists for a USD the **document** declared but no layer of the stage
+    /// opened (`input = "terrain.rusd:/World/Terrain"`, v1.12). Its detail is the file's own
+    /// text, read fresh: nothing composes it, so there is no stack to describe.
+    fn declared_asset_node(&self, id: &str) -> Option<Value> {
+        for op in &self.cook_ops {
+            let Some(doc_dir) = std::path::Path::new(&op.layer_path)
+                .parent()
+                .and_then(|p| p.parent())
+            else {
+                continue;
+            };
+            let Some(input) = op.input.as_deref() else {
+                continue;
+            };
+            let Ok(parsed) = rusd_scene::reference::parse(
+                input,
+                Some(doc_dir.to_string_lossy().as_ref()),
+            ) else {
+                continue;
+            };
+            let Some(asset) = parsed.asset else {
+                continue;
+            };
+            if !same_identifier(&asset, id) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&asset).ok()?;
+            return Some(json!({
+                "kind_type": "layer",
+                "id": asset,
+                "identifier": asset,
+                "kind": "reference",
+                "strength": 0,
+                "usda_text": text,
+                "spec_count": 0,
+                "description": format!("算子声明的输入：{input}"),
+            }));
+        }
+        None
+    }
+
     /// `comp_node{id}`: one node's detail, out of the tree last built. A stage
     /// that moved since is rebuilt first, so a node id the client is still
     /// holding cannot address the tree of a scene that no longer exists.
@@ -980,6 +1021,9 @@ impl Session {
         let Some(id) = p.get("id").and_then(Value::as_str) else {
             return Err((INVALID_PARAMS, "comp_node: `id` (string) required".into()));
         };
+        if let Some(answer) = self.declared_asset_node(id) {
+            return Ok(answer);
+        }
         let Some(stage) = self.stage.clone() else {
             return Err(server_error("no scene open; call open first".into()));
         };
