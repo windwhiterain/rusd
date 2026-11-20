@@ -803,25 +803,12 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
             // USD says the thing is (`Points`, `Cube`, `Mesh`). The path levels themselves
             // are the row's detail (hover, `comp_node`), so an operator with two inputs has
             // two rows.
-            // **The row is the USD hierarchy the input names**, spelled as the path it is:
-            // `/World/Samples/points`, `box.rusd:/World/Prototypes/Box`. One row per input,
-            // because the hierarchy is the identity: a slot name is the document's word and
-            // the path levels are what a reader can click into (hover, `comp_node`).
-            let path = match (&input.asset, &input.prim) {
-                (Some(asset), Some(prim)) => Some(format!(
-                    "{}:{prim}",
-                    strip_anon_prefix(asset)
-                        .rsplit(['/', '\\'])
-                        .next()
-                        .unwrap_or(asset)
-                )),
-                (None, Some(prim)) => Some(prim.clone()),
-                _ => None,
-            };
-            let label = match path {
-                Some(path) => path,
-                None => input.slot.clone(),
-            };
+            // **The row is the input's name** — `points`, `prototype`, `domain`, the words
+            // the document's inputs table uses — because that is what makes an input
+            // identifiable in the tree. What that name stands for is the USD hierarchy,
+            // which is the row's hover and its `comp_node` detail: `/World/Samples/points`,
+            // `box.rusd:/World/Prototypes/Box`, level by level with each level's schema.
+            let label = input.slot.clone();
             children.push(TreeNode {
                 id,
                 kind: TreeNodeKind::Arc,
