@@ -102,34 +102,50 @@ fn declared_inputs(op: &CookOp, stage: &Stage) -> Vec<DeclaredInput> {
     let doc_dir = std::path::Path::new(&op.layer_path)
         .parent()
         .and_then(|p| p.parent());
-    op.inputs
-        .iter()
-        .map(|(slot, value)| {
-            // `asset:prim` has **one** reader in this workspace — the same one a
-            // `references` value goes through — so the file a slot names is resolved the
-            // same way an arc's target is.
-            let parsed = doc_dir.and_then(|dir| {
-                rusd_scene::reference::parse(value, Some(dir.to_string_lossy().as_ref())).ok()
-            });
-            let prim = match &parsed {
-                Some(p) => Some(p.path.as_str().to_owned()),
-                None if value.starts_with('/') => Some(value.clone()),
-                None => None,
-            };
-            DeclaredInput {
-                slot: slot.clone(),
-                value: value.clone(),
-                asset: parsed.as_ref().and_then(|p| p.asset.clone()),
-                prim: prim.clone(),
-                // **The schema of the input** (v1.13): the `typeName` of the prim it names,
-                // read from the layer that authors it (or from the stage, for a prim of
-                // this one). The UI shows it beside the input's name.
-                structure: vec![(
-                    slot.clone(),
-                    schema_of(parsed.as_ref().and_then(|p| p.asset.as_deref()), prim.as_deref(), stage),
-                )],            }
-        })
-        .collect()
+    // **The operator schema is its inputs** (v1.13, the user's ruling): `{prototype,
+    // points}` for an `instances` node — the prototype it instances and the cloud it
+    // consumes — and `{points}` for a sampler, whose one input is the geometry it reads.
+    let mut out: Vec<DeclaredInput> = Vec::new();
+    if let Some(points) = op.input.as_deref() {
+        out.push(input_entry("points", points, doc_dir, stage));
+    }
+    if matches!(op.generator.as_str(), "RusdInstances" | "RusdScatter") {
+        for (_slot, value) in &op.inputs {
+            out.push(input_entry("prototype", value, doc_dir, stage));
+        }
+    }
+    out
+}
+
+/// One input of an operator schema: its name, the USD it names, and that prim's schema.
+fn input_entry(
+    name: &str,
+    value: &str,
+    doc_dir: Option<&std::path::Path>,
+    stage: &Stage,
+) -> DeclaredInput {
+    let parsed = doc_dir.and_then(|dir| {
+        rusd_scene::reference::parse(value, Some(dir.to_string_lossy().as_ref())).ok()
+    });
+    let prim = match &parsed {
+        Some(p) => Some(p.path.as_str().to_owned()),
+        None if value.starts_with('/') => Some(value.to_owned()),
+        None => None,
+    };
+    DeclaredInput {
+        slot: name.to_owned(),
+        value: value.to_owned(),
+        asset: parsed.as_ref().and_then(|p| p.asset.clone()),
+        prim: prim.clone(),
+        structure: vec![(
+            name.to_owned(),
+            schema_of(
+                parsed.as_ref().and_then(|p| p.asset.as_deref()),
+                prim.as_deref(),
+                stage,
+            ),
+        )],
+    }
 }
 
 /// The `typeName` of the prim an input names, when the layer (or the stage) knows it.
