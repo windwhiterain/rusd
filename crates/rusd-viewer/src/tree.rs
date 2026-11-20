@@ -73,6 +73,11 @@ pub struct LayerNode {
     /// The subtitle prints [`PARAMETRIC`] for `None`, which is the contract's word
     /// for exactly that.
     pub input: Option<String>,
+    /// The **USD file that input names** (v1.12), when the operator declared
+    /// `asset:prim` rather than a prim in this stack: `terrain.rusd:/World/Terrain`
+    /// is an operator parameter, not a USD arc, so nothing in the composition graph
+    /// carried it. The row this makes names the file; clicking it opens that USD.
+    pub input_asset: Option<String>,
     /// The op's **output layer** identifier, as the server joined it to this entry
     /// (`CookOp.layer_id == layers[].id`, v1.5.1).
     ///
@@ -294,6 +299,10 @@ impl CompositionTree {
                     // and nothing is guessed from its absence.
                     op_name: optional_string(l, "op_name"),
                     input: optional_string(l, "input"),
+                    // v1.12: the USD file the operator declared it reads. Optional: a
+                    // server that does not say so draws no such row, and nothing is
+                    // invented for it.
+                    input_asset: optional_string(l, "input_asset"),
                     output: optional_string(l, "output"),
                     // v1.8: the op's anchor prim. Optional like its two neighbours above,
                     // and nothing is guessed from its absence.
@@ -699,6 +708,35 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
             secondary: None,
             hover: None,
             children: kids,
+        });
+    }
+
+    // **The USD the operator declared is a node** (v1.12). The op row says what the
+    // document told it to read — `input = "terrain.rusd:/World/Terrain"` — and that
+    // declaration is what the composition graph was missing: a graph document is not
+    // USD, so its input reached no layer of the stage, and the material an op sampled had
+    // no row to click. The row here names **the file the operator declared** (its id is
+    // that file, so a click opens that USD), and it is a row, not an opinion: the stage is
+    // untouched.
+    if let (Some(asset), Some(input)) = (&layer.input_asset, &layer.input) {
+        let prim = input.rsplit_once(':').map(|(_, p)| p).unwrap_or(input.as_str());
+        children.push(TreeNode {
+            id: asset.clone(),
+            kind: TreeNodeKind::Arc,
+            label: format!(
+                "reference \u{2192} {}:{prim}",
+                crate::tree::strip_anon_prefix(asset)
+                    .rsplit(['/', '\\'])
+                    .next()
+                    .unwrap_or(asset.as_str())
+            ),
+            prim: None,
+            op: false,
+            root: false,
+            session: false,
+            secondary: None,
+            hover: Some(format!("文档声明的输入：{asset}（点开看这个 USD）")),
+            children: Vec::new(),
         });
     }
 

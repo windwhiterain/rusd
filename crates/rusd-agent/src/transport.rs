@@ -1133,6 +1133,33 @@ impl Session {
             }
             out.push(json!({ "id": id, "file": file }));
         }
+        // **The USD an operator declared is a file the client can open** (v1.12): the row
+        // for it names this path, so the bytes have to reach the client's cache the same
+        // way every other layer's do. It is not composed — it is delivered.
+        for op in &self.cook_ops {
+            let Some(doc_dir) = std::path::Path::new(&op.layer_path)
+                .parent()
+                .and_then(|p| p.parent())
+            else {
+                continue;
+            };
+            let Some(input) = op.input.as_deref() else {
+                continue;
+            };
+            let Ok(parsed) = rusd_scene::reference::parse(
+                input,
+                Some(doc_dir.to_string_lossy().as_ref()),
+            ) else {
+                continue;
+            };
+            let Some(asset) = parsed.asset else {
+                continue;
+            };
+            if out.iter().any(|e: &Value| e["id"] == json!(asset)) {
+                continue;
+            }
+            out.push(json!({ "id": asset, "file": asset }));
+        }
         Ok(json!({ "layers": out }))
     }
 

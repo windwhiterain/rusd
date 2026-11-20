@@ -1844,6 +1844,28 @@ impl Shell {
             ))));
         };
         let row = node.clone();
+        // **A row naming a USD the document declared is a link, not a node of the
+        // composition** (v1.12). The file opens locally, and the server never opened that
+        // layer, so the `comp_node` this click would owe can only be refused — every click
+        // on such a row answered an error right after the picture had already changed.
+        let is_link = match &self.tree.model {
+            crate::tree::TreeModel::Ready(t) => t.layer(&row.id).is_none(),
+            _ => true,
+        };
+        if is_link {
+            let action = crate::panel::action_for(&row);
+            let word = action_word(&action).to_owned();
+            if let crate::panel::TreeAction::Select(sel) = action {
+                self.on_tree_select(sel);
+            }
+            self.show_layer_local(&row.id);
+            self.request_repaint();
+            return Some(Ok(json!({
+                "action": word,
+                "id": row.id,
+                "detail": serde_json::Value::Null,
+            })));
+        }
         // What a click on this row means — the panel's own rule, not a copy of it.
         let action = crate::panel::action_for(&row);
         let shape = Shape::Row {

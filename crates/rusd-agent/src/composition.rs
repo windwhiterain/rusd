@@ -105,6 +105,11 @@ struct LayerEntry {
     /// for this layer; the wire tells those two apart by [`LayerEntry::op`] and
     /// reports both as `null`.
     op_input: Option<String>,
+    /// The **USD file the operator declared it reads** (v1.12), resolved to a path when
+    /// one exists: `input = "terrain.rusd:/World/Terrain"` is an operator parameter, not
+    /// a USD arc, so the composition graph had no node for the material an op read. This
+    /// names the file the row for it opens; nothing composes it.
+    input_asset: Option<String>,
     /// What this layer **is**, in words (PROTOCOL v1.5.9). Two sources, one field:
     /// an `op` layer takes its generator node's own `description = "..."`, and any
     /// other layer takes a document **layer annotation**
@@ -346,6 +351,18 @@ impl CompositionTree {
                     op_name: joined.map(|o| o.generator.clone()),
                     node: joined.map(|o| o.id.clone()),
                     op_input: joined.and_then(|o| o.input.clone()),
+                    input_asset: joined.and_then(|o| {
+                        // `asset:prim` has **one** reader in this workspace — the same one a
+                        // `references` value goes through — so the file the row names is the
+                        // one the operator declared, resolved the same way.
+                        let doc_dir = std::path::Path::new(&o.layer_path).parent()?.parent()?;
+                        let parsed = rusd_scene::reference::parse(
+                            o.input.as_deref()?,
+                            Some(doc_dir.to_string_lossy().as_ref()),
+                        )
+                        .ok()?;
+                        parsed.asset
+                    }),
                     description,
                 }
             })
@@ -426,6 +443,7 @@ impl CompositionTree {
                 if l.op {
                     row["op_name"] = json!(l.op_name);
                     row["input"] = json!(l.op_input);
+                    row["input_asset"] = json!(l.input_asset);
                     row["output"] = json!(l.id);
                     row["node"] = json!(l.node);
                 }
@@ -597,6 +615,7 @@ fn op_layer_json(stage: &Stage, layer: &LayerEntry, scans: &[LayerScan]) -> Valu
     if layer.op {
         answer["op_name"] = json!(layer.op_name);
         answer["input"] = json!(layer.op_input);
+        answer["input_asset"] = json!(layer.input_asset);
         answer["node"] = json!(layer.node);
     }
     answer
