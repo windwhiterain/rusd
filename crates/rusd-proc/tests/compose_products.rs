@@ -5,8 +5,8 @@
 //! and the stack a picture is made from is the document root plus those files.
 //!
 //! The numbers are the documents' acceptance ones (v1.9): `box_cluster.ops.toml` is
-//! segment one (volume → 60 boxes, 64 prims) and `box_scatter.ops.toml` is both segments in
-//! one graph (60 boxes + 40 clusters of them, 2507 prims). Where the old `.rusd` examples
+//! segment one (volume → 60 boxes, 67 prims) and `box_scatter.ops.toml` is both segments in
+//! one graph (60 boxes + 40 clusters of them, 2593 prims). Where the old `.rusd` examples
 //! counted a prim per container the document itself authored, an operator graph authors
 //! none: the counted prims are the operators' outputs alone.
 
@@ -72,7 +72,15 @@ fn compose_example(name: &str) -> (Vec<String>, Vec<rusd_proc::CookOp>) {
 fn segment_one_composes_its_boxes() {
     let (paths, ops) = compose_example("box_cluster.ops.toml");
     assert_eq!(ops.len(), 2, "segment one is two operators");
-    assert_eq!(paths.len(), 64, "composed prims: {paths:?}");
+    assert_eq!(paths.len(), 67, "composed prims: {paths:?}");
+    // **The operator's schema is the USD hierarchy under the prim it wrote** (v1.13): one
+    // child per declared input, named as the document names it.
+    for schema in ["/World/Samples/domain", "/World/Boxes/points", "/World/Boxes/prototype"] {
+        assert!(
+            paths.iter().any(|p| p == schema),
+            "{schema} is a prim: {paths:?}"
+        );
+    }
     // 60 instances of `box.rusd`'s prototype, each one prim.
     let inst = stack_prim("box_cluster.ops.toml", "/World/Boxes/i000000");
     assert_eq!(inst, Some("Cube".to_owned()), "the box is its prototype's type");
@@ -82,14 +90,17 @@ fn segment_one_composes_its_boxes() {
 fn segment_two_composes_its_clusters() {
     let (paths, ops) = compose_example("box_scatter.ops.toml");
     assert_eq!(ops.len(), 4, "both segments cook their own two nodes");
-    assert_eq!(paths.len(), 2507, "composed prims: {}", paths.len());
+    assert_eq!(paths.len(), 2593, "composed prims: {}", paths.len());
     // One cluster is one box cluster: 60 boxes behind a same-stack reference to the
     // `/World/Boxes` layer the same graph cooked.
     let under_one_cluster = paths
         .iter()
         .filter(|p| p.starts_with("/World/Clusters/i000000/"))
         .count();
-    assert_eq!(under_one_cluster, 60, "one cluster composes 60 boxes");
+    assert_eq!(
+        under_one_cluster, 62,
+        "one cluster composes 60 boxes plus the cluster's own points/prototype"
+    );
     let inst = stack_prim("box_scatter.ops.toml", "/World/Boxes/i000000");
     assert_eq!(inst, Some("Cube".to_owned()), "the box is its prototype's type");
 }

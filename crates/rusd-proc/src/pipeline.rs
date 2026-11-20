@@ -117,6 +117,62 @@ fn author_cloud(d: &mut dyn sdf::AbstractData, prim: &str, local: &[[f64; 3]]) -
 /// The replacement, per op (v1.5.1): hide the consumed input where it is, without
 /// touching the layer that authored it. An `over` plus a `visibility` token — never a
 /// delete and never `active = false` (which a weaker layer cannot win back).
+///
+/// The asset name a product authors for a parameter that named `<file>:<prim>`: the
+/// string the document wrote, one directory up — a product is written into
+/// `<doc_dir>/out/`, so a material named beside the document is `../<file>` from the
+/// product that reads it. Resolution to an absolute path stays the reading side's job.
+fn authored_asset(raw: &str) -> Option<String> {
+    let i = raw.rfind(':')?;
+    if i == 0 || !raw[i + 1..].starts_with('/') {
+        return None;
+    }
+    let authored = &raw[..i];
+    let drive = authored.len() > 2
+        && authored.as_bytes()[1] == b':'
+        && (authored.as_bytes()[2] == b'/' || authored.as_bytes()[2] == b'\\');
+    if authored.starts_with('/') || authored.starts_with("../") || drive {
+        Some(authored.to_owned())
+    } else {
+        Some(format!("../{authored}"))
+    }
+}
+
+/// **The operator's schema is the USD hierarchy under the prim it wrote** (v1.13): one
+/// child prim per declared input, named exactly as the document names it (`points`,
+/// `prototype`, `domain`, …). A child that names another layer carries the `reference`
+/// to it; a child naming a prim of this stack is an empty `def` that stands for that
+/// structure.
+fn author_inputs(
+    d: &mut dyn sdf::AbstractData,
+    base: &str,
+    inputs: &[(String, String)],
+    doc_dir: Option<&str>,
+) -> AuthResult {
+    for (slot, value) in inputs {
+        let child = format!("{base}/{slot}");
+        PrimSpec::new(d, child.as_str(), Specifier::Def, "")?;
+        let Ok(reference) = rusd_scene::reference::parse(value, doc_dir) else {
+            continue;
+        };
+        let Some(asset) = authored_asset(value) else {
+            continue;
+        };
+        let path = reference.path.clone();
+        let op = sdf::ReferenceListOp::explicit([sdf::Reference {
+            asset_path: asset,
+            prim_path: path,
+            ..Default::default()
+        }]);
+        d.set_field(
+            &sdf::path(&child)?,
+            sdf::FieldKey::References.as_str(),
+            SdfValue::ReferenceListOp(op),
+        );
+    }
+    Ok(())
+}
+
 fn author_hide(d: &mut dyn sdf::AbstractData, prim: &str) -> AuthResult {
     if let Ok(target) = sdf::path(prim) {
         PrimSpec::over(d, target)?;
@@ -194,12 +250,15 @@ impl Generator for RusdSamplePoints {
         let cloud = points_path(&base);
 
         let mut layer = sdf::Layer::new_anonymous("rusd_sample_points.usda");
+        let ctx_inputs = ctx.inputs.clone();
+        let ctx_doc_dir = ctx.doc_dir;
         layer
             .edit(|l| {
                 let d = l.data_mut();
                 PrimSpec::new(d, base.as_str(), Specifier::Def, "Xform")?;
                 author_cloud(d, &cloud, &local)?;
                 author_hide(d, &input)?;
+                author_inputs(d, &base, &ctx_inputs, ctx_doc_dir)?;
                 Ok(())
             })
             .map_err(|e| vec![Diagnostic::error("E_GEN", e.to_string()).at_prim(&base)])?;
@@ -322,6 +381,8 @@ impl Generator for RusdInstances {
 
         let mut rng = Rng::seeded(ctx.stage_seed, &base, ctx.seed);
         let mut layer = sdf::Layer::new_anonymous("rusd_instances.usda");
+        let ctx_inputs = ctx.inputs.clone();
+        let ctx_doc_dir = ctx.doc_dir;
         layer
             .edit(|l| {
                 let d = l.data_mut();
@@ -337,6 +398,7 @@ impl Generator for RusdInstances {
                     author_reference(d, &pp, &proto_asset, &proto_path, to_local(inv, *world), s)?;
                 }
                 author_hide(d, &input)?;
+                author_inputs(d, &base, &ctx_inputs, ctx_doc_dir)?;
                 Ok(())
             })
             .map_err(|e| vec![Diagnostic::error("E_GEN", e.to_string()).at_prim(&base)])?;

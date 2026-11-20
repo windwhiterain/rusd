@@ -248,6 +248,7 @@ impl CookEngine {
                 node.stage_seed,
                 node.doc_dir.as_deref(),
             );
+            ctx.inputs = node.inputs.clone();
             match g.eval(&mut ctx) {
                 Ok(layer) => {
                     diags.extend(ctx.take_warnings());

@@ -201,6 +201,9 @@ pub struct GenContext<'a> {
     /// document was handed in as text (`open{content}`): it has no directory, so a
     /// relative asset is a diagnostic rather than a guess at the process's cwd.
     pub doc_dir: Option<&'a str>,
+    /// **The inputs the document declared**, by its own slot names (v1.13): the operator's
+    /// schema, which the product authors under the prim it wrote as the USD hierarchy.
+    pub inputs: Vec<(String, String)>,
     reads: Vec<(String, String)>,
     warnings: Vec<Diagnostic>,
     /// The stage a material input is read from: the USD the input names, opened on its
@@ -225,6 +228,7 @@ impl<'a> GenContext<'a> {
             seed,
             stage_seed,
             doc_dir,
+            inputs: Vec::new(),
             reads: Vec::new(),
             warnings: Vec::new(),
             input_stage: None,
