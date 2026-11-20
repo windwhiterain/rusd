@@ -617,12 +617,12 @@ fn row(
         // open when the user asks, one row at a time.
         let id = ui.make_persistent_id((&node.id, root, depth));
         let mut open = ui.data(|d| {
-            d.get_temp::<bool>(id.with("open")).unwrap_or(
-                // A branch of a declared hierarchy (v1.13) is open by default — the
-                // `reference → file` root as much as the paths under it — because a
-                // collapsed one is a row that says nothing about what it holds.
-                depth == 0 || node.secondary.is_some(),
-            )
+            // **Open by default** (v1.13): every branch this tree draws is a fact the user
+            // asked to see — an operator's fields, the schema hierarchy under `input` and
+            // `output`, a USD's references. The aggregation that wanted collapsed rows
+            // (a 240-instance class) is not drawn any more, so a branch that is shut on
+            // arrival is just a row that says nothing about what it holds.
+            d.get_temp::<bool>(id.with("open")).unwrap_or(true)
         });
         ui.horizontal(|ui| {
             indent(ui, depth);
