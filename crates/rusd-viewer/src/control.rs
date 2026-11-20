@@ -65,13 +65,14 @@ pub const LOCAL_IO: i64 = -32002;
 ///
 /// One list, read by both the refusing side (an unknown method is answered right on
 /// the connection thread) and the report, so "what exists" is not spelled twice.
-pub const METHODS: [&str; 11] = [
+pub const METHODS: [&str; 12] = [
     "state",
     "open",
     "preview",
     "tree",
     "select",
     "isolate",
+    "script",
     "translate",
     "fit",
     "orbit",

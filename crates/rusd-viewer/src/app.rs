@@ -297,7 +297,10 @@ pub struct Shell {
     /// A local open in flight (v1.9): the geometry comes back from a **worker thread**, so a
     /// 2400-prim product no longer freezes the window and the control channel while it is
     /// opened. `Stage` itself is `!Send`, so the worker hands over the geometry alone.
-    opening: Option<(String, std::sync::mpsc::Receiver<Result<rusd_scene::SceneGeometry, String>>)>,
+    opening: Option<(
+        String,
+        std::sync::mpsc::Receiver<Result<rusd_scene::SceneGeometry, String>>,
+    )>,
     /// The layer a click asked to see while its local copy was **not yet on disk**. The
     /// click sends a `SyncLayer` for it; when that sync lands, this is the layer to open
     /// again, so the first click after an `open` is not a click that only syncs and shows
@@ -1086,10 +1089,7 @@ impl Shell {
                         "已同步 {} 块（本次取 {}）→ {}",
                         value.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0),
                         value.get("fetched").and_then(|v| v.as_u64()).unwrap_or(0),
-                        value
-                            .get("local")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or(""),
+                        value.get("local").and_then(|v| v.as_str()).unwrap_or(""),
                     );
                     // **A click waiting on this sync is answered now** (v1.9): it asked for a
                     // layer whose local copy was not written yet, and a sync alone shows
@@ -1173,8 +1173,7 @@ impl Shell {
         // **A layer click reaches that layer's row** (v1.5.8): the row may be scrolled
         // far out of sight, and an arc's target-layer leaf is a click on the layer, so
         // the panel brings the layer's own first-level row into view on the next pass.
-        if sel.kind == crate::tree::TreeNodeKind::Layer {
-        }
+        if sel.kind == crate::tree::TreeNodeKind::Layer {}
         self.tree.selection = Some(sel);
         self.request_repaint();
     }
@@ -1309,7 +1308,8 @@ impl Shell {
             // `rusd_op_…_2.rusd`), and the cache mirrors the layout, so the file opens as it
             // is. A resolver is still installed for a path this machine happens to lack a
             // byte-identical copy of.
-            let resolver = crate::cache::CacheResolver::new(crate::cache::LayerCache::default_dir());
+            let resolver =
+                crate::cache::CacheResolver::new(crate::cache::LayerCache::default_dir());
             let opened = openusd::usd::Stage::builder()
                 .resolver(resolver)
                 .open(path_for_thread.as_str());
@@ -1352,7 +1352,8 @@ impl Shell {
                 // the one composed, filter to that path.
                 if let Some(path) = self.pending_render.take() {
                     self.render_alone(path);
-                }                self.opening = None;
+                }
+                self.opening = None;
                 self.request_repaint();
             }
             Ok(Err(message)) => {
@@ -1440,8 +1441,11 @@ impl Shell {
             return;
         };
         let frame_size = (frame.width, frame.height);
-        let (frame_width, frame_height, camera_json) =
-            (frame.width, frame.height, crate::capture::camera_json_of(&frame.camera));
+        let (frame_width, frame_height, camera_json) = (
+            frame.width,
+            frame.height,
+            crate::capture::camera_json_of(&frame.camera),
+        );
         let Some(sel) = crate::panel::mask_rect(self.viewport.rect(), start, end, frame_size)
         else {
             self.status = "capture: 选区为空".to_owned();
@@ -1555,7 +1559,11 @@ impl Shell {
     }
 
     /// Paint the viewport from the frame's texture, GPU view or upload alike.
-    fn viewport_image(texture: egui::TextureId, size: egui::Vec2, uv: egui::Rect) -> egui::Image<'static> {
+    fn viewport_image(
+        texture: egui::TextureId,
+        size: egui::Vec2,
+        uv: egui::Rect,
+    ) -> egui::Image<'static> {
         egui::Image::new(egui::load::SizedTexture::new(texture, size)).uv(uv)
     }
 
@@ -1663,6 +1671,7 @@ impl Shell {
             "select" => self.control_select(&args, reply.clone()),
             "state" => Some(Ok(self.control_state())),
             "isolate" => self.control_isolate(&args),
+            "script" => self.control_script(&args),
             "translate" => self.control_translate(&args),
             "fit" => self.control_fit(),
             "orbit" => self.control_orbit(&args),
@@ -1758,7 +1767,8 @@ impl Shell {
         // waiter whose `awaiting` holds the tag that just landed, so a waiter built with
         // the empty `new` never matched anything and the control caller waited forever
         // (the work happened, the click worked, only the answer was lost).
-        self.waiting.push(Waiting::with(reply, Shape::Server, vec![OPEN_TAG]));
+        self.waiting
+            .push(Waiting::with(reply, Shape::Server, vec![OPEN_TAG]));
         self.status = format!("open {path}: 请求中…");
         self.send_net(NetCommand::Call {
             tag: OPEN_TAG.to_owned(),
@@ -1808,7 +1818,8 @@ impl Shell {
         if let Err(e) = self.need_server() {
             return Some(Err(e));
         }
-        self.waiting.push(Waiting::with(reply, Shape::Server, vec![PREVIEW_TAG]));
+        self.waiting
+            .push(Waiting::with(reply, Shape::Server, vec![PREVIEW_TAG]));
         self.send_net(NetCommand::Call {
             tag: PREVIEW_TAG.to_owned(),
             method: "preview".to_owned(),
@@ -2031,7 +2042,8 @@ impl Shell {
                          output), so there is no per-layer detail to show",
             })));
         };
-        self.waiting.push(Waiting::with(reply, shape, vec![NODE_TAG]));
+        self.waiting
+            .push(Waiting::with(reply, shape, vec![NODE_TAG]));
         self.select_path(&path);
         self.ask_node(&node_id);
         let _ = node_id;
@@ -2077,6 +2089,27 @@ impl Shell {
         Some(Ok(json!({
             "isolate": self.only_selected,
             "selection": self.model.selection,
+        })))
+    }
+
+    /// `script{on}`: the 「脚本」 view toggle, asked for as a state — the same flip
+    /// the tree panel's 「脚本/树」 button does (`panel.rs`). `{on: true}` reads the
+    /// composition tree as Rust pseudocode; `{on: false}` returns to the tree. Like
+    /// `isolate`, a control method is a name for that click, not a second path.
+    fn control_script(
+        &mut self,
+        args: &crate::control::Args<'_>,
+    ) -> Option<Result<serde_json::Value, (i64, String)>> {
+        let on = match args.boolean("on") {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
+        if self.tree.script_mode != on {
+            self.tree.script_mode = on;
+            self.window.request_redraw();
+        }
+        Some(Ok(json!({
+            "script": self.tree.script_mode,
         })))
     }
 
