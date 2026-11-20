@@ -2,6 +2,17 @@
 //! generator schemas. The registry is the single source of truth for validation
 //! and (later) coercion / USD schema mapping. Unknown schemas are tolerated
 //! (forward compatible, like USD's schema-less prims) with a warning.
+//!
+//! Two registries live here, and they answer two different questions. This
+//! module's tables answer what a schema's properties are ([`prop_type`]);
+//! [`usd_registry`] is USD's own [`SchemaRegistry`], built from the schema data in
+//! `schemas/`, and answers what one schema **is** — the subtype relation
+//! [`SchemaRegistry::is_a`] walks. A table cannot answer the second question, and
+//! a walk cannot type a value, so neither replaces the other.
+
+use std::sync::{Arc, OnceLock};
+
+use openusd::usd::{FamilySource, SchemaRegistry, SchemaRegistryBuilder};
 
 /// A property's value type, driving validation and coercion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -315,3 +326,101 @@ pub fn lookup(name: &str) -> Option<SchemaDef> {
         props,
     })
 }
+
+/// **The schema graph, as USD's own registry holds it.**
+///
+/// A `.rusd` document authors a USD layer, so the `typeName` in it means what USD
+/// says it means, and "is this input the schema the operator declared?" is
+/// [`SchemaRegistry::is_a`] — C++ `UsdSchemaRegistry::IsA`, the walk
+/// [`UsdPrim::is_a`](openusd::usd::Prim::is_a) answers with. That walk reads data,
+/// not code: per schema identifier its kind and its *direct* bases, which is what
+/// `plugInfo.json` carries for a C++ schema library, beside a `generatedSchema.usda`
+/// of class prims. `schemas/rusd_types_{manifest,schematics}.usda` is that pair, so
+/// the subtype relation is the registry's and there is no second table of it.
+///
+/// The family carries the relation alone: what a schema's attributes are, and what
+/// their fallbacks are, stays in the tables above, which is what [`prop_type`]
+/// answers from. Reading a fallback from two sources would be two answers to one
+/// question.
+///
+pub fn usd_registry() -> &'static Arc<SchemaRegistry> {
+    static REGISTRY: OnceLock<Arc<SchemaRegistry>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        // Both halves are compiled in and parsed once, exactly as the layers a
+        // C++ library resolves from disk would be: the registry reads them at
+        // build time and keeps what they hold.
+        let manifest = layer("rusd_types_manifest.usda", MANIFEST);
+        let schematics = layer("rusd_types_schematics.usda", SCHEMATICS);
+        SchemaRegistryBuilder::default()
+            .family(FamilySource {
+                name: "rusd",
+                manifest: &manifest,
+                schematics: &schematics,
+            })
+            .build()
+            .expect("the schema family registers")
+    })
+}
+
+const MANIFEST: &str = include_str!("../schemas/rusd_types_manifest.usda");
+const SCHEMATICS: &str = include_str!("../schemas/rusd_types_schematics.usda");
+
+/// One of the family's two layers, over the text compiled in above.
+fn layer(identifier: &str, text: &str) -> openusd::sdf::Layer {
+    openusd::sdf::Layer::from_bytes(identifier, text.as_bytes().to_vec())
+        .unwrap_or_else(|error| panic!("{identifier} parses: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn is_a(actual: &str, base: &str) -> bool {
+        usd_registry().is_a(
+            &openusd::tf::Token::from(actual),
+            &openusd::tf::Token::from(base),
+        )
+    }
+
+    /// **The subtype relation is the one USD's schema data declares** (the user: 就用 USD
+    /// 本身的 subtype 机制判断). Every answer below is `UsdSchemaRegistry::IsA`: the walk up
+    /// `bases`, read out of the manifest, crossing into the core family at `Typed`.
+    #[test]
+    fn is_a_walks_the_usd_schema_graph() {
+        // A schema is itself.
+        assert!(is_a("Mesh", "Mesh"));
+        // …and everything its chain names, however far up: Mesh → PointBased → Gprim →
+        // Boundable → Xformable → Imageable → Typed.
+        assert!(is_a("Mesh", "PointBased"));
+        assert!(is_a("Mesh", "Gprim"));
+        assert!(is_a("Mesh", "Xformable"));
+        assert!(is_a("Mesh", "Typed"), "the chain reaches the core family");
+        assert!(is_a("Points", "Gprim"));
+        assert!(is_a("Cube", "Boundable"));
+        // **Siblings are not bases**: `Mesh` and `Xform` both hang off `Xformable`, and
+        // that is the difference a string comparison cannot see.
+        assert!(!is_a("Mesh", "Xform"));
+        assert!(!is_a("Xform", "Gprim"));
+        // A material is neither geometry nor a transform, which is what a slot declared
+        // `Xformable` has to reject.
+        assert!(!is_a("Material", "Xformable"));
+        assert!(is_a("Material", "NodeBase"));
+        // Nothing derives from a name the data does not hold — not even itself.
+        assert!(!is_a("NoSuchSchema", "Typed"));
+    }
+
+    /// An abstract schema is a class, not a type a prim may author — which is why a slot
+    /// may *declare* `Xformable` while no wire can be one.
+    #[test]
+    fn abstract_schemas_are_not_concrete_types() {
+        let registry = usd_registry();
+        let concrete = |name: &str| {
+            registry.is_concrete_type(&openusd::tf::Token::from(name))
+        };
+        assert!(concrete("Mesh"));
+        assert!(concrete("Xform"));
+        assert!(!concrete("Xformable"));
+        assert!(!concrete("Gprim"));
+    }
+}
+

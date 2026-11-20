@@ -1,0 +1,76 @@
+#usda 1.0
+
+# The schematics half of USD's schema data: a flattened layer of one class prim
+# per schema, named after the schema identifier — the shape a schema library's
+# `generatedSchema.usda` has. The manifest beside this file supplies what
+# flattening drops (each schema's kind and its direct bases).
+#
+# Every class prim here is empty on purpose. A schema's properties and their
+# fallback values are `rusd_scene::schema`'s tables, not this layer's: this
+# family exists so that `SchemaRegistry::is_a` can answer whether one schema is
+# another, and a relation needs no attributes. Were fallbacks duplicated here,
+# a `.rusd` read would have two sources for one value's default.
+
+class "Imageable"
+{
+}
+
+class "Xformable"
+{
+}
+
+class Xform "Xform"
+{
+}
+
+class "Boundable"
+{
+}
+
+class "Gprim"
+{
+}
+
+class "PointBased"
+{
+}
+
+class Cube "Cube"
+{
+}
+
+class Sphere "Sphere"
+{
+}
+
+class Cylinder "Cylinder"
+{
+}
+
+class Mesh "Mesh"
+{
+}
+
+class Points "Points"
+{
+}
+
+class Camera "Camera"
+{
+}
+
+class DirectionalLight "DirectionalLight"
+{
+}
+
+class PointLight "PointLight"
+{
+}
+
+class "NodeBase"
+{
+}
+
+class Material "Material"
+{
+}

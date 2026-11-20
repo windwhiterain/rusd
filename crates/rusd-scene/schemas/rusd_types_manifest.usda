@@ -1,0 +1,128 @@
+#usda 1.0
+
+# The manifest half of USD's schema data: the part a C++ schema library ships as
+# `plugInfo.json`, beside the `generatedSchema.usda` in the file next to this one.
+#
+# One entry per schema identifier, carrying the two fields flattening a schema
+# layer cannot: `schemaKind`, which decides whether a prim may author the name as
+# its own `typeName` (`concreteTyped`) or whether it only exists to be derived
+# from (`abstractTyped`), and `bases`, the schema's *direct* bases by identifier.
+# `UsdSchemaRegistry::IsA` walks `bases` transitively — that walk is the whole of
+# USD's subtype relation, and it is why this file exists: "is this input the
+# schema the operator declared?" is `IsA`, not an equality between two strings.
+#
+# The family declares no properties. What a schema's attributes are, and what
+# their fallbacks are, stays in `rusd_scene::schema`'s own tables: those are what
+# the `.rusd` reader and writer type values with. This file answers the one
+# question they cannot — whether one schema is another.
+#
+# The bases are USD's own. `Imageable`, `Xformable`, `Boundable`, `Gprim` and
+# `PointBased` are the `usdGeom` classes that carry the relation a geometry
+# document actually relies on, and `NodeBase` is `usdShade`'s. The chain stops at
+# `Typed`, which this family does not declare: the `usd` core family the registry
+# is built with already owns that identifier, and redeclaring it would be a
+# duplicate. A base may name a schema another family registered, which is exactly
+# how `Typed` is reached here.
+# --- usdGeom: the transformable/imageable spine ------------------------------
+
+def "Imageable"
+{
+    uniform token schemaKind = "abstractTyped"
+    uniform token[] bases = ["Typed"]
+}
+
+def "Xformable"
+{
+    uniform token schemaKind = "abstractTyped"
+    uniform token[] bases = ["Imageable"]
+}
+
+def "Xform"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["Xformable"]
+}
+
+def "Boundable"
+{
+    uniform token schemaKind = "abstractTyped"
+    uniform token[] bases = ["Xformable"]
+}
+
+def "Gprim"
+{
+    uniform token schemaKind = "abstractTyped"
+    uniform token[] bases = ["Boundable"]
+}
+
+def "PointBased"
+{
+    uniform token schemaKind = "abstractTyped"
+    uniform token[] bases = ["Gprim"]
+}
+
+def "Cube"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["Gprim"]
+}
+
+def "Sphere"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["Gprim"]
+}
+
+def "Cylinder"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["Gprim"]
+}
+
+def "Mesh"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["PointBased"]
+}
+
+def "Points"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["PointBased"]
+}
+
+# `UsdGeomCamera` is a `Xformable`, not a `Gprim`: it has a transform and no
+# bounds, which is exactly the distinction `Boundable` draws.
+def "Camera"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["Xformable"]
+}
+
+# --- usdLux: a light is a transform, not geometry ---------------------------
+
+def "DirectionalLight"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["Xformable"]
+}
+
+def "PointLight"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["Xformable"]
+}
+
+# --- usdShade: a material is neither geometry nor a transform ----------------
+
+def "NodeBase"
+{
+    uniform token schemaKind = "abstractTyped"
+    uniform token[] bases = ["Typed"]
+}
+
+def "Material"
+{
+    uniform token schemaKind = "concreteTyped"
+    uniform token[] bases = ["NodeBase"]
+}
