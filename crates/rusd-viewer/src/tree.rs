@@ -824,59 +824,35 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         });
     }
 
-    // **Each declared input, by its name** (v1.12), followed by the USD structure it
-    // resolves to (v1.12): `domain → terrain.rusd:/World/Terrain`, `points →
-    // /World/Samples/points`, `prototype → box.rusd:/World/Prototypes/Box`. The name is
-    // the document's — it is what the operator's table says — and the right-hand side is
-    // the named structure, so both halves of the ruling are on the row.
-    //
-    // An input that names a prim of this stack also renders that path alone (`render`);
-    // one that names another layer is that layer's row, opened on click.
+    // **The USD hierarchy the operator declares — that *is* its inputs and outputs**
+    // (v1.13): there is no separate slot name, because a slot's name is the document's
+    // bookkeeping and the structure is the name. An input that names another layer is a
+    // branch rooted at that `reference`, its prim path underneath; every other input and
+    // output is a branch of this stack's own paths, merged so a shared prefix is one branch.
+    let mut named: Vec<String> = layer.outputs.clone();
     for input in &layer.inputs {
-        let (id, prim, label, render) = match (&input.asset, &input.prim) {
-            (Some(asset), Some(prim)) => (
-                asset.clone(),
-                None,
-                format!(
-                    "{} \u{2192} {}:{prim}",
-                    input.slot,
+        match (&input.asset, &input.prim) {
+            (Some(asset), Some(prim)) => children.push(TreeNode {
+                id: asset.clone(),
+                kind: TreeNodeKind::Arc,
+                label: format!(
+                    "reference \u{2192} {}",
                     strip_anon_prefix(asset).rsplit(['/', '\\']).next().unwrap_or(asset)
                 ),
-                false,
-            ),
-            (None, Some(prim)) => (
-                format!("prim:{prim}"),
-                Some(prim.clone()),
-                format!("{} \u{2192} {prim}", input.slot),
-                true,
-            ),
-            _ => continue,
-        };
-        children.push(TreeNode {
-            id,
-            kind: TreeNodeKind::Arc,
-            label,
-            prim,
-            op: false,
-            root: false,
-            session: false,
-            secondary: render.then(|| "render".to_owned()),
-            hover: Some(format!("文档声明的输入 {} = {}", input.slot, input.value)),
-            children: Vec::new(),
-        });
+                prim: None,
+                op: false,
+                root: false,
+                session: false,
+                secondary: None,
+                hover: Some(input.value.clone()),
+                children: hierarchy_rows(&[prim.clone()]),
+            }),
+            (None, Some(prim)) => named.push(prim.clone()),
+            _ => {}
+        }
     }
-
-    // **The hierarchy those names resolve into** (v1.13): the same structures, as the
-    // paths they are — `World / Samples / points` — because a name alone does not say
-    // what shape the operator reads and writes.
-    let mut named: Vec<String> = layer.outputs.clone();
-    named.extend(        layer
-            .inputs
-            .iter()
-            .filter(|i| i.asset.is_none())
-            .filter_map(|i| i.prim.clone()),
-    );
     children.extend(hierarchy_rows(&named));
+
 
     // **No prim rows.** v1.3 (user ruling, `docs/PROTOCOL.md`): a city stack has
     // hundreds of prims and listing them ``既撑爆面板宽度又没人读`` — the tree is
@@ -1896,3 +1872,4 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
