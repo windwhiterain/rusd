@@ -799,11 +799,23 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 })
                 .collect::<Vec<_>>()
                 .join(" / ");
+            // **The row is `name : schema`** — what the document calls the input, and what
+            // USD says the thing is (`Points`, `Cube`, `Mesh`). The path levels themselves
+            // are the row's detail (hover, `comp_node`), so an operator with two inputs has
+            // two rows.
+            let schema = input
+                .structure
+                .last()
+                .and_then(|(_, schema)| schema.clone())
+                .filter(|s| !s.is_empty());
+            let label = match schema {
+                Some(schema) => format!("{} : {schema}", input.slot),
+                None => input.slot.clone(),
+            };
             children.push(TreeNode {
                 id,
                 kind: TreeNodeKind::Arc,
-                label: input.slot.clone(),
-                prim: prim.clone(),
+                label,                prim: prim.clone(),
                 op: false,
                 root: false,
                 session: false,
