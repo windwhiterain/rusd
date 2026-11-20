@@ -1,14 +1,10 @@
-//! The two example documents, cooked and composed the way the viewer composes them.
+//! The two example documents, cooked and read the way the viewer reads them.
 //!
-//! Both examples are **operator graphs** (`.ops.toml`): the document names what to run
-//! and who reads whom, the cook writes one `.rusd` layer per operator into `<examples>/out`,
-//! and the stack a picture is made from is the document root plus those files.
-//!
-//! The numbers are the documents' acceptance ones (v1.9): `box_cluster.ops.toml` is
-//! segment one (volume → 60 boxes, 66 prims) and `box_scatter.ops.toml` is both segments in
-//! one graph (60 boxes + 40 clusters of them, 2551 prims). Where the old `.rusd` examples
-//! counted a prim per container the document itself authored, an operator graph authors
-//! none: the counted prims are the operators' outputs alone.
+//! Both examples are **operator graphs** (`.ops.toml`): the document names what to run and
+//! the one USD each operator reads and writes. Every operator writes **its own USD** —
+//! `samples.rusd`, `boxes.rusd`, … — and nothing stacks them: a stage holds one USD
+//! (v1.13, 不同的东西在各自的 USD), so these tests open one product at a time and assert
+//! what it holds, and assert that the composed stack holds nothing of them.
 
 use std::path::{Path, PathBuf};
 
@@ -32,7 +28,7 @@ fn doc_dir() -> String {
 }
 
 /// Cook a document into `<examples>/out` and compose the stack a picture is made from.
-fn compose_example(name: &str) -> (Vec<String>, Vec<rusd_proc::CookOp>) {
+fn cook_example(name: &str) -> Vec<rusd_proc::CookOp> {
     let dir = examples();
     let dir_text = doc_dir();
     let text = std::fs::read_to_string(dir.join(name)).unwrap();
@@ -40,8 +36,6 @@ fn compose_example(name: &str) -> (Vec<String>, Vec<rusd_proc::CookOp>) {
     let stage = rusd_scene::lower(&doc).unwrap();
     let nodes = rusd_proc::nodes_from_doc(&doc, Some(&dir_text));
     let mut engine = rusd_proc::default_registry();
-    // Products land in `<doc_dir>/out` (v1.9): the arcs a product authors are relative
-    // (`../box.rusd`, a bare `rusd_op_*.rusd`), so they only resolve from there.
     engine.set_out_dir(Some(dir.join("out")));
     let result = engine.cook(&stage, &nodes);
     assert!(
@@ -64,77 +58,107 @@ fn compose_example(name: &str) -> (Vec<String>, Vec<rusd_proc::CookOp>) {
             op.layer_path
         );
     }
-    let composed = rusd_proc::compose_stack(&stage, &mut ops).unwrap();
-    (paths_of(&composed), ops)
-}
-
-#[test]
-fn segment_one_composes_its_boxes() {
-    let (paths, ops) = compose_example("box_cluster.ops.toml");
-    assert_eq!(ops.len(), 2, "segment one is two operators");
-    assert_eq!(paths.len(), 66, "composed prims: {paths:?}");
-    // **One USD input, one USD output** (v1.13): the product authors the node's one input
-    // as a child prim of the prim it wrote, and nothing else.
-    for schema in ["/World/Samples/input", "/World/Boxes/input"] {
-        assert!(
-            paths.iter().any(|p| p == schema),
-            "{schema} is a prim: {paths:?}"
-        );
-    }
-    // 60 instances of `box.rusd`'s prototype, each one prim.
-    let inst = stack_prim("box_cluster.ops.toml", "/World/Boxes/i000000");
-    assert_eq!(inst, Some("Cube".to_owned()), "the box is its prototype's type");
-}
-
-#[test]
-fn segment_two_composes_its_clusters() {
-    let (paths, ops) = compose_example("box_scatter.ops.toml");
-    assert_eq!(ops.len(), 4, "both segments cook their own two nodes");
-    assert_eq!(paths.len(), 2551, "composed prims: {}", paths.len());
-    // One cluster is one box cluster: 60 boxes behind a same-stack reference to the
-    // `/World/Boxes` layer the same graph cooked.
-    let under_one_cluster = paths
-        .iter()
-        .filter(|p| p.starts_with("/World/Clusters/i000000/"))
-        .count();
+    // **Nothing is stacked** (v1.13): the stage the composition hands out holds no product.
+    let mut composed = rusd_proc::compose_stack(&stage, &mut ops).unwrap();
     assert_eq!(
-        under_one_cluster, 61,
-        "one cluster composes 60 boxes plus the cluster's own input"
+        paths_of(&composed).len(),
+        0,
+        "a stage holds one USD; the products are separate files"
     );
-    let inst = stack_prim("box_scatter.ops.toml", "/World/Boxes/i000000");
-    assert_eq!(inst, Some("Cube".to_owned()), "the box is its prototype's type");
+    let _ = &mut composed;
+    ops
 }
 
-/// The type a prim composes to, in `name`'s own stack.
-fn stack_prim(name: &str, path: &str) -> Option<String> {
-    let dir = examples();
-    let dir_text = doc_dir();
-    let text = std::fs::read_to_string(dir.join(name)).unwrap();
-    let doc = rusd_core::syntax::parse_in(&text, Some(&dir_text)).unwrap();
-    let stage = rusd_scene::lower(&doc).unwrap();
-    let nodes = rusd_proc::nodes_from_doc(&doc, Some(&dir_text));
-    let mut engine = rusd_proc::default_registry();
-    engine.set_out_dir(Some(dir.join("out")));
-    let mut ops = engine.cook(&stage, &nodes).ops;
-    let composed = rusd_proc::compose_stack(&stage, &mut ops).unwrap();
-    let prim = composed.prim(sdf::path(path).unwrap()).unwrap();
-    prim.type_name().ok().flatten().map(|t| t.to_string())
+/// One product's own prims, read as its own stage.
+fn prims_of(op: &rusd_proc::CookOp) -> Vec<String> {
+    let layer = rusd_scene::document::layer_from_file(Path::new(&op.layer_path)).unwrap();
+    let stack = Stage::builder().in_memory("check.rusd").unwrap();
+    let root = stack.root_layer().identifier().to_owned();
+    stack
+        .insert_layer(&root, 0, layer, LayerOffset::IDENTITY)
+        .unwrap();
+    paths_of(&stack)
 }
 
-/// The arcs a product authors are **relative** (v1.9): the material it names is
-/// `../box.rusd` — the file beside the `out/` it sits in — and a product another operator
-/// of the same graph wrote is a bare file name. An absolute path would pin the picture to
-/// one machine and one process's temp directory.
+/// Whether `path` is one of `base`'s instance prims (`i` + six digits).
+fn is_instance(path: &str, base: &str) -> bool {
+    let leaf = path.rsplit('/').next().unwrap_or("");
+    path.starts_with(&format!("{base}/"))
+        && path.split('/').count() == base.split('/').count() + 1
+        && leaf.len() == 7
+        && leaf.starts_with('i')
+        && leaf[1..].chars().all(|c| c.is_ascii_digit())
+}
+
+#[test]
+fn segment_one_cooks_a_usd_per_operator() {
+    let ops = cook_example("box_cluster.ops.toml");
+    assert_eq!(ops.len(), 2, "segment one is two operators");
+    let samples = ops.iter().find(|o| o.id == "/World/Samples").unwrap();
+    let boxes = ops.iter().find(|o| o.id == "/World/Boxes").unwrap();
+    assert!(
+        samples.layer_path.ends_with("samples.rusd"),
+        "the document names the file: {}",
+        samples.layer_path
+    );
+    assert!(
+        boxes.layer_path.ends_with("boxes.rusd"),
+        "the document names the file: {}",
+        boxes.layer_path
+    );
+    // The sampler's own USD: its output prim, the cloud it computed, and the one input it
+    // declares (`input`), which records the USD it reads and pulls nothing in.
+    let paths = prims_of(samples);
+    for wanted in ["/World/Samples", "/World/Samples/points", "/World/Samples/input"] {
+        assert!(paths.iter().any(|p| p == wanted), "{wanted} in {paths:?}");
+    }
+    // The instances' USD: its output prim, one prim per instance, and its one input.
+    let paths = prims_of(boxes);
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|p| is_instance(p, "/World/Boxes"))
+            .count(),
+        60,
+        "one instance prim per point"
+    );
+    assert!(
+        paths.iter().any(|p| p == "/World/Boxes/input"),
+        "the one input is a prim: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.starts_with("/World/Samples")),
+        "another operator's things are not in this USD: {paths:?}"
+    );
+}
+
+#[test]
+fn segment_two_cooks_four_usds() {
+    let ops = cook_example("box_scatter.ops.toml");
+    assert_eq!(ops.len(), 4, "both segments cook their own two nodes");
+    let clusters = ops.iter().find(|o| o.id == "/World/Clusters").unwrap();
+    assert!(clusters.layer_path.ends_with("clusters.rusd"));
+    let paths = prims_of(clusters);
+    assert_eq!(
+        paths
+            .iter()
+            .filter(|p| is_instance(p, "/World/Clusters"))
+            .count(),
+        40,
+        "one cluster prim per surface sample"
+    );
+}
+
+/// The arcs a product authors are **relative** (v1.9): the material it instances is
+/// `../box.rusd` — the file beside the `out/` it sits in. An absolute path would pin the
+/// picture to one machine and one process's temp directory.
 #[test]
 fn a_product_names_its_inputs_relatively() {
-    let (_paths, ops) = compose_example("box_cluster.ops.toml");
-    let boxes = ops
-        .iter()
-        .find(|op| op.id == "/World/Boxes")
-        .expect("the boxes operator cooked");
+    let ops = cook_example("box_cluster.ops.toml");
+    let boxes = ops.iter().find(|op| op.id == "/World/Boxes").unwrap();
     let text = std::fs::read_to_string(&boxes.layer_path).unwrap();
     assert!(
-        text.contains("../box.rusd"),
+        text.contains("../box.rusd:/World/Prototypes/Box"),
         "the prototype arc is the relative ../box.rusd:\n{text}"
     );
     assert!(
@@ -143,16 +167,14 @@ fn a_product_names_its_inputs_relatively() {
     );
 }
 
-/// The cook writes one file per node and inserts nothing: the stack is assembled from
-/// those files, and every layer of it is a `.rusd`.
+/// The cook writes one file per node and inserts nothing: every product is a `.rusd`.
 #[test]
 fn a_product_is_a_layer_file() {
-    let (_paths, ops) = compose_example("box_cluster.ops.toml");
+    let ops = cook_example("box_cluster.ops.toml");
     for op in &ops {
         let path = Path::new(&op.layer_path);
         let layer = rusd_scene::document::layer_from_file(path).unwrap();
         assert!(layer.identifier().ends_with(".rusd"));
-        // Re-read into a stack, the product keeps its prims.
         let stack = Stage::builder().in_memory("check.rusd").unwrap();
         let root = stack.root_layer().identifier().to_owned();
         stack

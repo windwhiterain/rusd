@@ -491,14 +491,36 @@ impl CompositionTree {
             });
         }
 
+        // **Every product is a row** (v1.13): a stage holds one USD, so the products are not
+        // layers of it — they are files the document wrote, each opened on its own, and the
+        // tree lists them by the file they are.
+        let mut layers = layers;
+        for op in ops {
+            if layers.iter().any(|l| same_file(&l.id, &op.layer_id)) {
+                continue;
+            }
+            let strength = layers.len();
+            layers.push(LayerEntry {
+                id: op.layer_id.clone(),
+                kind: "op",
+                strength,
+                op: true,
+                op_name: Some(op.generator.clone()),
+                node: Some(op.id.clone()),
+                op_input: op.input.clone(),
+                inputs: declared_inputs(op, stage),
+                outputs: op.writes.clone(),
+                description: op.description.clone(),
+            });
+        }
+
         let (prims, vsets) = scan_namespace(stage, &scans, &layers);
         CompositionTree {
             layers,
             arcs,
             prims,
             vsets,
-        }
-    }
+        }    }
     /// The ids of the opened layers, strongest first: what `layer{id}` accepts,
     /// and exactly what its refusal lists. Same rows, same order, as
     /// [`CompositionTree::to_json`]'s `layers`.

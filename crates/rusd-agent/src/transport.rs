@@ -1177,6 +1177,15 @@ impl Session {
             }
             out.push(json!({ "id": id, "file": file }));
         }
+        // **The products are files, not layers of this stage** (v1.13): a stage holds one
+        // USD, so a product is delivered the same way every other file is — by path.
+        for op in &self.cook_ops {
+            let id = op.layer_id.clone();
+            if out.iter().any(|e: &Value| e["id"] == json!(id)) {
+                continue;
+            }
+            out.push(json!({ "id": id, "file": op.layer_path }));
+        }
         // **The USD an operator declared is a file the client can open** (v1.12): the row
         // for it names this path, so the bytes have to reach the client's cache the same
         // way every other layer's do. It is not composed — it is delivered.

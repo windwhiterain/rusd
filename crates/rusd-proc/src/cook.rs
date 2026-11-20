@@ -420,19 +420,13 @@ pub fn compose_stack(doc: &Stage, ops: &mut [CookOp]) -> Result<Stage, Vec<Diagn
     // `metersPerUnit`) is stage metadata — it belongs to this stack, not to a layer — so it
     // is copied onto the stack's own root, and the picture is made of the products alone.
     copy_stage_metadata(&composed, &root, doc);
+    // **A stage holds one USD** (v1.13, the user's ruling): 不同的东西在各自的 USD, so the
+    // products are **not** stacked here. Each product is its own file; a view opens one of
+    // them, and the identifiers below are the ones that file has when opened on its own.
     for op in ops.iter_mut() {
-        let path = std::path::Path::new(&op.layer_path);
-        let layer = rusd_scene::document::layer_from_file(path)
-            .map_err(|e| vec![Diagnostic::error("E_COOK", e)])?;
-        let written = layer.identifier().to_owned();
-        composed
-            .insert_layer(&root, 0, layer, LayerOffset::IDENTITY)
-            .map_err(|e| vec![Diagnostic::error("E_COMPOSE", e.to_string())])?;
-        op.layer_id = composed
-            .layer_stack()
-            .into_iter()
-            .find(|id| same_file(id, &written))
-            .unwrap_or(written);
+        op.layer_id = rusd_scene::document::layer_from_file(std::path::Path::new(&op.layer_path))
+            .map(|l| l.identifier().to_owned())
+            .unwrap_or_else(|_| op.layer_path.clone());
     }
     Ok(composed)
 }
