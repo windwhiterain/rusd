@@ -1,0 +1,87 @@
+[stage]
+default_prim = "/World"
+
+[World]
+schema = "Xform"
+
+[World.Corners]
+schema = "Xform"
+
+[World.Corners.c000]
+schema = "Sphere"
+radius = 0.25
+"xformOp:translate" = [0.0, 0.0, 0.25]
+xformOpOrder = ["xformOp:translate"]
+
+[World.Corners.c001]
+schema = "Sphere"
+radius = 0.25
+"xformOp:translate" = [6.0, 0.0, 0.25]
+xformOpOrder = ["xformOp:translate"]
+
+[World.Corners.c002]
+schema = "Sphere"
+radius = 0.25
+"xformOp:translate" = [6.0, 6.0, 0.25]
+xformOpOrder = ["xformOp:translate"]
+
+[World.Corners.c003]
+schema = "Sphere"
+radius = 0.25
+"xformOp:translate" = [0.0, 6.0, 0.25]
+xformOpOrder = ["xformOp:translate"]
+
+[World.Gate]
+schema = "Xform"
+
+[World.Gate.left]
+schema = "Cube"
+size = 1.0
+"xformOp:translate" = [-2.0, 0.0, 1.0]
+xformOpOrder = ["xformOp:translate"]
+
+[World.Gate.lintel]
+schema = "Cube"
+size = 1.0
+"xformOp:scale" = [5.0, 1.0, 0.5]
+"xformOp:translate" = [0.0, 0.0, 2.5]
+xformOpOrder = ["xformOp:translate", "xformOp:scale"]
+
+[World.Gate.right]
+schema = "Cube"
+size = 1.0
+"xformOp:translate" = [2.0, 0.0, 1.0]
+xformOpOrder = ["xformOp:translate"]
+
+[World.Markers]
+schema = "Xform"
+
+[World.Markers.m000]
+schema = "Sphere"
+radius = 0.3
+"xformOp:translate" = [-3.0, 4.0, 0.3]
+xformOpOrder = ["xformOp:translate"]
+
+[World.Markers.m001]
+schema = "Sphere"
+radius = 0.3
+"xformOp:translate" = [-1.5, 4.0, 0.3]
+xformOpOrder = ["xformOp:translate"]
+
+[World.Markers.m002]
+schema = "Sphere"
+radius = 0.3
+"xformOp:translate" = [0.0, 4.0, 0.3]
+xformOpOrder = ["xformOp:translate"]
+
+[World.Markers.m003]
+schema = "Sphere"
+radius = 0.3
+"xformOp:translate" = [1.5, 4.0, 0.3]
+xformOpOrder = ["xformOp:translate"]
+
+[World.Markers.m004]
+schema = "Sphere"
+radius = 0.3
+"xformOp:translate" = [3.0, 4.0, 0.3]
+xformOpOrder = ["xformOp:translate"]
