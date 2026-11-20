@@ -94,6 +94,9 @@ pub struct LayerNode {    /// The layer identifier, which is also this node's id
     /// **The named prim paths the operator's output authors** (v1.13): `outputs` in the
     /// document, as USD paths. Half of the hierarchy an operator declares.
     pub outputs: Vec<String>,
+    /// The `typeName` of each entry of [`LayerNode::outputs`], by index — `Points` for a
+    /// sampler's cloud, `Xform` for an operator's anchor. Absent (or short) is absence.
+    pub output_schemas: Vec<Option<String>>,
     /// The op's **output layer** identifier, as the server joined it to this entry
     /// (`CookOp.layer_id == layers[].id`, v1.5.1).
     ///
@@ -367,7 +370,17 @@ impl CompositionTree {
                                 .collect()
                         })
                         .unwrap_or_default(),
-                    output: optional_string(l, "output"),
+                    // The `typeName` of each output prim, by index; absent means the file
+                    // that holds it says no type (or a server older than the field).
+                    output_schemas: l
+                        .get("output_schemas")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .map(|v| v.as_str().map(str::to_owned))
+                                .collect()
+                        })
+                        .unwrap_or_default(),                    output: optional_string(l, "output"),
                     // v1.8: the op's anchor prim. Optional like its two neighbours above,
                     // and nothing is guessed from its absence.
                     node: optional_string(l, "node"),
@@ -851,21 +864,32 @@ fn output_row(layer: &LayerNode) -> TreeNode {
     row.children = layer
         .outputs
         .iter()
-        .filter(|path| path.as_str() != anchor)
-        .map(|path| TreeNode {
-            id: format!("prim:{path}"),
-            kind: TreeNodeKind::Prim,
-            label: path
+        .enumerate()
+        .filter(|(_, path)| path.as_str() != anchor)
+        .map(|(i, path)| {
+            let name = path
                 .strip_prefix(&format!("{anchor}/"))
                 .unwrap_or(path)
-                .to_owned(),
-            prim: Some(path.clone()),
-            op: false,
-            root: false,
-            session: false,
-            secondary: None,
-            hover: Some(format!("{path} · 点击只渲染这个命名路径")),
-            children: Vec::new(),
+                .to_owned();
+            // **The schema is in the label, the same shape the input side draws** (v1.16):
+            // `points : Points`. A dim suffix is easy to miss on a row whose whole point is
+            // that it names a structure with a type.
+            let schema = layer.output_schemas.get(i).cloned().flatten();
+            TreeNode {
+                id: format!("prim:{path}"),
+                kind: TreeNodeKind::Prim,
+                label: match schema {
+                    Some(schema) => format!("{name} : {schema}"),
+                    None => name,
+                },
+                prim: Some(path.clone()),
+                op: false,
+                root: false,
+                session: false,
+                secondary: None,
+                hover: Some(format!("{path} · 点击只渲染这个命名路径")),
+                children: Vec::new(),
+            }
         })
         .collect();
     row

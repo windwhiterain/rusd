@@ -834,7 +834,7 @@ fn note_scroll(what: &'static str, state: &egui::scroll_area::State, content_h: 
     let Ok(mut seen) = seen.lock() else {
         return;
     };
-    let now = state.offset().y.round() as i32;
+    let now = state.clamped_offset().y.round() as i32;
     if let Some(prev) = seen.insert(what, now)
         && prev != now
     {

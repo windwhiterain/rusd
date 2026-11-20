@@ -98,7 +98,7 @@ struct DeclaredInput {
     structure: Vec<(String, Option<String>)>,
 }
 
-fn declared_inputs(op: &CookOp, stage: &Stage) -> Vec<DeclaredInput> {
+fn declared_inputs(op: &CookOp, stage: &Stage, ops: &[CookOp]) -> Vec<DeclaredInput> {
     let doc_dir = std::path::Path::new(&op.layer_path)
         .parent()
         .and_then(|p| p.parent());
@@ -115,11 +115,11 @@ fn declared_inputs(op: &CookOp, stage: &Stage) -> Vec<DeclaredInput> {
         "points"
     };
     if let Some(points) = op.input.as_deref() {
-        out.push(input_entry(input_slot, points, doc_dir, stage));
+        out.push(input_entry(input_slot, points, doc_dir, stage, ops));
     }
     if matches!(op.generator.as_str(), "RusdInstances" | "RusdScatter") {
         for (_slot, value) in &op.inputs {
-            out.push(input_entry("prototype", value, doc_dir, stage));
+            out.push(input_entry("prototype", value, doc_dir, stage, ops));
         }
     }
     out
@@ -176,6 +176,7 @@ fn input_entry(
     value: &str,
     doc_dir: Option<&std::path::Path>,
     stage: &Stage,
+    ops: &[CookOp],
 ) -> DeclaredInput {
     let parsed = doc_dir.and_then(|dir| {
         rusd_scene::reference::parse(value, Some(dir.to_string_lossy().as_ref())).ok()
@@ -196,30 +197,57 @@ fn input_entry(
                 parsed.as_ref().and_then(|p| p.asset.as_deref()),
                 prim.as_deref(),
                 stage,
+                ops,
             ),
         )],
     }
 }
 
 /// The `typeName` of the prim an input names, when the layer (or the stage) knows it.
-fn schema_of(asset: Option<&str>, prim: Option<&str>, stage: &Stage) -> Option<String> {
+fn schema_of(
+    asset: Option<&str>,
+    prim: Option<&str>,
+    stage: &Stage,
+    ops: &[CookOp],
+) -> Option<String> {
     let prim = prim?;
-    let owned;
-    let stage = match asset {
-        Some(a) => {
-            owned = openusd::usd::Stage::open(a).ok();
-            match owned.as_ref() {
-                Some(s) => s,
-                None => stage,
+    let path = sdf::path(prim).ok()?;
+    let lookup = |s: &Stage| {
+        s.prim(path.clone())
+            .ok()
+            .and_then(|p| p.type_name().ok().flatten())
+            .map(|t| t.as_str().to_owned())
+            .filter(|t| !t.is_empty())
+    };
+    if let Some(asset) = asset {
+        return openusd::usd::Stage::open(asset)
+            .ok()
+            .and_then(|s| lookup(&s))
+            .or_else(|| lookup(stage));
+    }
+    if let Some(ty) = lookup(stage) {
+        return Some(ty);
+    }
+    // **A prim of another product is not in this stage** (v1.13): a product is a file, not
+    // a layer of anybody's stack, so the stage knows nothing about `points` or `prototype`
+    // — their rows came out with no schema at all. The operator that wrote the prim does
+    // know: its output file is opened and asked, matched by the longest anchor that covers
+    // the path.
+    let mut best: Option<&CookOp> = None;
+    let mut best_len = 0usize;
+    for op in ops {
+        for written in &op.writes {
+            let covers = prim == *written || prim.starts_with(&format!("{written}/"));
+            if covers && written.len() >= best_len {
+                best = Some(op);
+                best_len = written.len();
             }
         }
-        None => stage,
-    };
-    sdf::path(prim)
+    }
+    let op = best?;
+    openusd::usd::Stage::open(&op.layer_path)
         .ok()
-        .and_then(|p| stage.prim(p).ok())
-        .and_then(|p| p.type_name().ok().flatten())
-        .map(|t| t.as_str().to_owned())
+        .and_then(|s| lookup(&s))
 }
 
 /// Every level of `prim` (its ancestors and itself) with the schema it composes to.
@@ -295,6 +323,11 @@ struct LayerEntry {
     /// **The named prim paths this node's output authors** (v1.13): the other half of the
     /// hierarchy an operator declares — its `outputs` in the document, as USD paths.
     outputs: Vec<String>,
+    /// The `typeName` of each of those, when the file that holds the prim says one — the
+    /// output side of the tree draws `points : Points` and `prototype : Xform` the way the
+    /// input side does. Filled at build time, because a prim of another product is not in
+    /// this stage and the answer needs that file opened.
+    output_schemas: Vec<Option<String>>,
     /// What this layer **is**, in words (PROTOCOL v1.5.9). Two sources, one field:
     /// an `op` layer takes its generator node's own `description = "..."`, and any
     /// other layer takes a document **layer annotation**
@@ -542,9 +575,17 @@ impl CompositionTree {
                     node: joined.map(|o| o.id.clone()),
                     op_input: joined.and_then(|o| o.input.clone()),
                     inputs: joined
-                        .map(|o| declared_inputs(o, stage))
+                        .map(|o| declared_inputs(o, stage, ops))
                         .unwrap_or_default(),
                     outputs: joined.map(|o| o.writes.clone()).unwrap_or_default(),
+                    output_schemas: joined
+                        .map(|o| {
+                            o.writes
+                                .iter()
+                                .map(|w| schema_of(None, Some(w), stage, ops))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     file: joined.and_then(|o| o.output_file.clone()),
                     description,
                 }
@@ -566,7 +607,7 @@ impl CompositionTree {
         let declared: Vec<(String, String)> = ops
             .iter()
             .flat_map(|op| {
-                declared_inputs(op, stage)
+                declared_inputs(op, stage, ops)
                     .into_iter()
                     .filter_map(|i| Some((i.asset?, i.value)))
             })
@@ -595,6 +636,7 @@ impl CompositionTree {
                 op_input: Some(input.clone()),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
+                output_schemas: Vec::new(),
                 file,
                 // No description: the row reads `<file> [reference · n]`, the same shape
                 // every other material row has. What the operator said about it is the
@@ -620,8 +662,13 @@ impl CompositionTree {
                 op_name: Some(op.generator.clone()),
                 node: Some(op.id.clone()),
                 op_input: op.input.clone(),
-                inputs: declared_inputs(op, stage),
+                inputs: declared_inputs(op, stage, ops),
                 outputs: op.writes.clone(),
+                output_schemas: op
+                    .writes
+                    .iter()
+                    .map(|w| schema_of(None, Some(w), stage, ops))
+                    .collect(),
                 file: op.output_file.clone(),
                 description: op.description.clone(),
             });
@@ -741,6 +788,7 @@ impl CompositionTree {
                         }))
                         .collect::<Vec<_>>());
                     row["outputs"] = json!(l.outputs);
+                    row["output_schemas"] = json!(l.output_schemas);
                     row["output"] = json!(document_output(l));
                     row["node"] = json!(l.node);
                 }
