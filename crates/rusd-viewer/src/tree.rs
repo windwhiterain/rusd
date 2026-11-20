@@ -741,25 +741,26 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         });
     }
 
-    // **Every input the operator declared, by its own name** (v1.12). An `instances` op
-    // has two (`points`, `prototype`) and a future one may have n; the rows are made from
-    // the list, never from a fixed pair of fields. A slot naming a layer is a `reference`
-    // row for that USD; a slot naming a prim of this stack is a row for that prim.
+    // **Every input, expressed as the USD named structure it points at** (v1.12, the
+    // user's ruling): an operator has one USD **reference** input and one USD output, and
+    // its other inputs resolve to named structures inside the USD tree — so a slot is
+    // drawn as that structure (`reference \u{2192} box.rusd:/World/Prototypes/Box` or
+    // `\u{2192} /World/Samples/points`), never as the document's own bookkeeping name.
+    // The slot name lives in the hover, where "which input was this" is answered.
     for input in &layer.inputs {
         let (id, prim, label) = match (&input.asset, &input.prim) {
             (Some(asset), Some(prim)) => (
                 asset.clone(),
                 None,
                 format!(
-                    "{} \u{2192} {}:{prim}",
-                    input.slot,
+                    "reference \u{2192} {}:{prim}",
                     strip_anon_prefix(asset).rsplit(['/', '\\']).next().unwrap_or(asset)
                 ),
             ),
             (None, Some(prim)) => (
                 format!("prim:{prim}"),
                 Some(prim.clone()),
-                format!("{} \u{2192} {prim}", input.slot),
+                format!("\u{2192} {prim}"),
             ),
             _ => continue,
         };
