@@ -117,6 +117,51 @@ fn declared_inputs(op: &CookOp, stage: &Stage) -> Vec<DeclaredInput> {
     out
 }
 
+/// The document's own `input` string for this operator: `"/World/Boxes"`,
+/// `"volume.rusd:/World/Volume"`. The declaration is the cook's `inputs`, whose slot the
+/// graph spells `input`; a document that names its slots otherwise is read by the one entry
+/// that is not the implicit `points` cloud, and the last fallback is the geometry parameter
+/// the node was cooked with.
+fn document_input(layer: &LayerEntry) -> Option<String> {
+    layer
+        .inputs
+        .iter()
+        .find(|i| i.slot == "input")
+        .or_else(|| layer.inputs.iter().rev().find(|i| i.slot != "points"))
+        .or_else(|| layer.inputs.first())
+        .map(|i| i.value.clone())
+        .or_else(|| layer.op_input.clone())
+}
+
+/// The document's own `output` string for this operator — `usd path:/hierarchy`, spelled
+/// with the file the document named (`instances.rusd:/World/Instances`).
+///
+/// The file part is the cook's `output_file`; a document that names no file falls back to
+/// the file name of the layer it produced, which is the same file.
+fn document_output(layer: &LayerEntry) -> Option<String> {
+    let file = layer
+        .file
+        .clone()
+        .unwrap_or_else(|| file_name(&layer.id).to_owned());
+    if file.is_empty() {
+        return None;
+    }
+    Some(match layer.outputs.first() {
+        Some(prim) => format!("{file}:{prim}"),
+        None => file,
+    })
+}
+
+/// The file part of an authored `usd path:/hierarchy` spelling: `"terrain.rusd:/World/Terrain"`
+/// → `"terrain.rusd"`, and a bare prim path (`"/World/Boxes"`) → `None`.
+fn authored_file(value: &str) -> Option<String> {
+    let i = value.rfind(':')?;
+    if i == 0 || !value[i + 1..].starts_with('/') {
+        return None;
+    }
+    Some(value[..i].to_owned())
+}
+
 /// One input of an operator schema: its name, the USD it names, and that prim's schema.
 fn input_entry(
     name: &str,
@@ -248,6 +293,11 @@ struct LayerEntry {
     /// (`[doc.prototypes] layer = "prototypes.usda" description = "..."`). Absent
     /// when neither says anything, and reported as `null`.
     description: Option<String>,
+    /// **The file the document names for this USD**, exactly as the author spelled it
+    /// (`instances.rusd`, `terrain.rusd`) — not the resolved absolute path. A row that
+    /// prints a path prints this one (v1.15): the absolute spelling is the server's, the
+    /// document's is the author's.
+    file: Option<String>,
 }
 
 /// The cook output layers of `stage` in **cook order** (oldest first), which is
@@ -487,6 +537,7 @@ impl CompositionTree {
                         .map(|o| declared_inputs(o, stage))
                         .unwrap_or_default(),
                     outputs: joined.map(|o| o.writes.clone()).unwrap_or_default(),
+                    file: joined.and_then(|o| o.output_file.clone()),
                     description,
                 }
             })
@@ -499,19 +550,33 @@ impl CompositionTree {
         // could show it. The entry is a **row**, not a layer of the stack: it composes
         // nothing and is labelled `reference`, and its detail is the file's own text.
         let mut layers = layers;
-        let declared: Vec<(String, String)> = layers
+        // **The nodes are the source, not the rows** (v1.14): a material is read by an
+        // operator, and an operator's layer may not be in the stage yet when this runs —
+        // the products are appended below. Reading the declaration off the cook's own node
+        // list finds every USD the document names, whether or not that layer already has a
+        // row, so `terrain.rusd` gets one as readily as a product does.
+        let declared: Vec<(String, String)> = ops
             .iter()
-            .flat_map(|l| {
-                l.inputs
-                    .iter()
-                    .filter_map(|i| Some((i.asset.clone()?, i.value.clone())))
+            .flat_map(|op| {
+                declared_inputs(op, stage)
+                    .into_iter()
+                    .filter_map(|i| Some((i.asset?, i.value)))
             })
             .collect();
         for (asset, input) in declared {
-            if layers.iter().any(|l| same_file(&l.id, &asset)) {
+            // **A product is not a material** (v1.14): this pass runs before the products
+            // are appended below, so an operator whose USD input is another operator's own
+            // output has to be recognised by the cook's file names rather than by the rows
+            // that do not exist yet. Otherwise the product is pushed as a `reference` and
+            // the product loop then skips it — a cooked file would lose its op row.
+            if layers.iter().any(|l| same_file(&l.id, &asset))
+                || ops.iter().any(|op| same_file(&op.layer_path, &asset))
+            {
                 continue;
             }
             let strength = layers.len();
+            // Spelled before `asset` moves into `id`: the row prints the document's spelling.
+            let file = authored_file(&input).or_else(|| Some(file_name(&asset).to_owned()));
             layers.push(LayerEntry {
                 id: asset,
                 kind: "reference",
@@ -519,9 +584,10 @@ impl CompositionTree {
                 op: false,
                 op_name: None,
                 node: None,
-                op_input: Some(input),
+                op_input: Some(input.clone()),
                 inputs: Vec::new(),
                 outputs: Vec::new(),
+                file,
                 // No description: the row reads `<file> [reference · n]`, the same shape
                 // every other material row has. What the operator said about it is the
                 // file's detail (`comp_node`), not its row.
@@ -548,8 +614,30 @@ impl CompositionTree {
                 op_input: op.input.clone(),
                 inputs: declared_inputs(op, stage),
                 outputs: op.writes.clone(),
+                file: op.output_file.clone(),
                 description: op.description.clone(),
             });
+        }
+
+        // **A file's own edges are facts about that file** (v1.14): `scan_arcs` walked the
+        // layers the stage opened, and a product is not one of them — so its row could
+        // only say `reference: （none）` about a file that references another one from
+        // every instance prim. Each file that has no scan of its own is opened as a stage
+        // and read the same way; the targets are resolved by file name, because the file
+        // spells them the way its author did (`boxes.rusd`, relative) and the tree names
+        // them by identifier.
+        let mut arcs = arcs;
+        for layer in &layers {
+            if scans.iter().any(|scan| scan.id == layer.id) {
+                continue;
+            }
+            arcs.extend(file_arcs(&layer.id, &layers));
+        }
+        // Each file numbered its own edges from zero. An arc's id is how a client asks
+        // `comp_node` about it (the index into this list), so the ids are renumbered over
+        // the joined list — one numbering, no duplicates.
+        for (n, arc) in arcs.iter_mut().enumerate() {
+            arc.id = format!("arc:{n}");
         }
 
         let (prims, vsets) = scan_namespace(stage, &scans, &layers);
@@ -624,7 +712,11 @@ impl CompositionTree {
                 // generator ran, `node` says which node of the document it was.
                 if l.op {
                     row["op_name"] = json!(l.op_name);
-                    row["input"] = json!(l.op_input);
+                    // **The document's own words** (v1.15): the operator's `input` and
+                    // `output` strings, `usd path:/hierarchy` — `input = "/World/Boxes"`,
+                    // `output = "instances.rusd:/World/Instances"`. A row prints what the
+                    // author wrote: the resolved absolute path is the server's business.
+                    row["input"] = json!(document_input(l));
                     row["inputs"] = json!(l
                         .inputs
                         .iter()
@@ -641,7 +733,7 @@ impl CompositionTree {
                         }))
                         .collect::<Vec<_>>());
                     row["outputs"] = json!(l.outputs);
-                    row["output"] = json!(l.id);
+                    row["output"] = json!(document_output(l));
                     row["node"] = json!(l.node);
                 }
                 row
@@ -1154,6 +1246,45 @@ fn arc_detail(stage: &Stage, arc: &ArcEntry) -> Value {
 }
 
 // --- arcs -------------------------------------------------------------------
+
+/// The edges one USD file carries, read by opening that file as a stage of its own.
+///
+/// A file an operator wrote is not a layer of the stage the tree was built from, so
+/// [`scan_arcs`] never saw it. Its references are still facts about it — `instances.rusd`
+/// references `boxes.rusd` from every instance prim — and a row that said otherwise would
+/// be reporting the stage's reach as the file's content.
+///
+/// The arcs have the shape the stage's arcs have, with `source_layer` rewritten to the file
+/// that carries them (a freshly opened stage's root identifier is a resolved spelling of
+/// the same file). A target is resolved against `layers` — exactly, then by file name —
+/// because the file writes it the way an author did (`boxes.rusd`) and the tree names the
+/// layers by identifier.
+fn file_arcs(path: &str, layers: &[LayerEntry]) -> Vec<ArcEntry> {
+    let Ok(stage) = openusd::usd::Stage::open(path) else {
+        return Vec::new();
+    };
+    let Some(root) = stage.layer_stack().into_iter().next() else {
+        return Vec::new();
+    };
+    let scans = vec![LayerScan {
+        id: root.clone(),
+        resolved: Some(path.to_owned()),
+        specs: layer_specs(&stage, &root),
+    }];
+    scan_arcs(&stage, &scans)
+        .into_iter()
+        .map(|mut arc| {
+            arc.source_layer = path.to_owned();
+            let target = &arc.target_layer;
+            if let Some(layer) = layers.iter().find(|l| {
+                same_file(&l.id, target) || file_name(&l.id) == file_name(target)
+            }) {
+                arc.target_layer = layer.id.clone();
+            }
+            arc
+        })
+        .collect()
+}
 
 fn scan_arcs(stage: &Stage, scans: &[LayerScan]) -> Vec<ArcEntry> {
     let mut arcs: Vec<ArcEntry> = Vec::new();

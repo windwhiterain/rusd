@@ -678,334 +678,283 @@ impl TreeNodeKind {
 /// `comp_node` about exactly the same node as the root row does; the branch is one
 /// click away in the roots and is not repeated.
 pub fn roots(tree: &CompositionTree) -> Vec<TreeNode> {
-    tree.draw_order()
-        .into_iter()
-        .map(|layer| layer_subtree(tree, layer))
-        .collect()
+    let order = tree.draw_order();
+    // **The document's operations first, then every USD** (v1.14): the operators are the
+    // document, the USDs are what it reads and writes, and the two sets are drawn one after
+    // the other rather than mixed, so a reader can walk either without picking the other's
+    // rows out.
+    let mut out: Vec<TreeNode> = order
+        .iter()
+        .copied()
+        .filter(|layer| layer.op)
+        .map(|layer| operation_row(tree, layer))
+        .collect();
+    out.extend(order.iter().copied().map(|layer| usd_row(tree, layer)));
+    out
 }
 
-/// The named hierarchy a layer declares, as nested rows.
+/// What a field row prints where the thing it names has none.
+const NONE: &str = "（none）";
+
+/// **An operation row**: the document's own four fields and nothing else (v1.14, the
+/// user's ruling — 「合成树里只显示每个 operation 的 description, operator, input usd
+/// path/{hierarchy}, output usd path/{hierarchy}」).
 ///
-/// `/World/Samples/points` and `/World/Boxes` become `World → Samples → points` and
-/// `World → Boxes`: the components are the rows, a shared prefix is one branch, and the
-/// path a row stands for is its id (`prim:<path>`). Every row is marked `render`, which
-/// is what makes a click on it show **that path alone**.
-fn hierarchy_rows(paths: &[String]) -> Vec<TreeNode> {
-    use std::collections::BTreeSet;
-    let mut nodes: BTreeSet<String> = BTreeSet::new();
-    for path in paths {
-        let mut acc = String::new();
-        for part in path.split('/').filter(|p| !p.is_empty()) {
-            acc.push('/');
-            acc.push_str(part);
-            nodes.insert(acc.clone());
-        }
-    }
-    fn children_of<'a>(nodes: &'a BTreeSet<String>, prefix: &str) -> Vec<&'a String> {
-        nodes
-            .iter()
-            .filter(|n| n.rsplit_once('/').map(|(p, _)| p == prefix).unwrap_or(false))
-            .collect()
-    }
-    fn make(nodes: &BTreeSet<String>, path: &str) -> TreeNode {
-        let is_root = path.matches('/').count() == 1;
-        TreeNode {
-            id: format!("prim:{path}"),
-            kind: TreeNodeKind::Prim,
-            // A root row spells the whole path (`/World`), so the branch says which path it
-            // is without being expanded; a child row is its own name and is indented.
-            label: if is_root {
-                path.to_owned()
-            } else {
-                path.rsplit('/').next().unwrap_or(path).to_owned()
-            },            prim: Some(path.to_owned()),
-            op: false,
-            root: false,
-            session: false,
-            // The one word that says what a click means for this row.
-            secondary: Some("render".to_owned()),
-            hover: Some(format!("{path} · 点击只渲染这个命名路径")),
-            children: children_of(nodes, path)
-                .into_iter()
-                .map(|child| make(nodes, child))
-                .collect(),
-        }
-    }
-    children_of(&nodes, "")
-        .into_iter()
-        .map(|root| make(&nodes, root))
-        .collect()
-}
-
-/// A declared input's USD hierarchy, as rows: every level of the path, nested, each row
-/// labelled `name : schema` (`World : Xform`, `Terrain : Mesh`). Clicking a row renders
-/// that one path.
-fn structure_rows(structure: &[(String, Option<String>)], branch: &str) -> Option<TreeNode> {
-    fn make(structure: &[(String, Option<String>)], branch: &str, path: &str) -> TreeNode {        let schema = structure
-            .iter()
-            .find(|(p, _)| p == path)
-            .and_then(|(_, s)| s.clone())
-            .filter(|s| !s.is_empty());
-        let leaf = path.rsplit('/').next().unwrap_or(path);
-        // **The row is the hierarchy itself** (v1.13, the user's ruling: hierarchy *is*
-        // the schema). Nothing is appended to it — no document slot name and no typeName:
-        // the path is how USD names the structure the operator reads.
-        let label = path.to_owned();        let children = structure
-            .iter()
-            .filter(|(p, _)| p.rsplit_once('/').map(|(parent, _)| parent == path).unwrap_or(false))
-            .map(|(child, _)| make(structure, branch, child))
-            .collect();
-        TreeNode {
-            // **The row's id carries its branch** (v1.13): two inputs of one operator can
-            // both start at `/World`, and a row id that spelled only the path would give the
-            // two branches one egui id — one set of expansion state, one hit area.
-            id: format!("{branch}:{path}"),
-            kind: TreeNodeKind::Prim,
-            label,
-            prim: Some(path.to_owned()),
-            op: false,
-            root: false,
-            session: false,
-            secondary: Some("render".to_owned()),
-            hover: Some(match schema.as_deref().filter(|s| !s.is_empty()) {
-                Some(schema) => format!("{path} : {schema}"),
-                None => format!("{path} (no typeName)"),
-            }),
-            children,
-        }    }
-    let root = structure.first()?.0.clone();
-    Some(make(structure, branch, &root))}
-/// One layer's branch: its arcs and the prims it authors.
-fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
-    let mut children: Vec<TreeNode> = Vec::new();
-    // **An operator's hierarchy is its inputs — one row each, and nothing else** (v1.13):
-    // `points` and `prototype` for an `instances` op, one `domain` for a sampler. What a row
-    // stands for (the USD structure it names, level by level, with each level's schema) is
-    // the row's own detail — its tooltip and its `comp_node` — not rows hung under it: the
-    // hierarchy the operator *declares* has exactly the number of entries its document's
-    // inputs table has.
-    if !layer.inputs.is_empty() {
-        // **The schema and the USD hierarchy are the same set** (v1.13): `{points, prototype}`
-        // for an `instances` op, `{domain}` for a sampler. One row per member, nothing under
-        // it — the members are the hierarchy, not a path through it.
-        for input in &layer.inputs {
-            let (id, prim) = match (&input.asset, &input.prim) {
-                (Some(asset), _) => (asset.clone(), None),
-                (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
-                _ => continue,
-            };
-            let schema = input
-                .structure
-                .iter()
-                .find(|(name, _)| name == &input.slot)
-                .and_then(|(_, schema)| schema.clone())
-                .filter(|s| !s.is_empty());
-            children.push(TreeNode {
-                id,
-                kind: TreeNodeKind::Arc,
-                // **The input row shows its schema** (v1.13): `input : Cube`, `input :
-                // Mesh`, `input : Xform` — the `typeName` of the prim it names, so the UI
-                // says what the operator takes, not only that it takes something.
-                label: match schema {
-                    Some(schema) => format!("{} : {schema}", input.slot),
-                    None => input.slot.clone(),
-                },                prim: prim.clone(),
-                op: false,
-                root: false,
-                session: false,
-                secondary: Some(if prim.is_some() { "render" } else { "open" }.to_owned()),
-                hover: Some(input.value.clone()),
-                children: Vec::new(),
-            });
-        }
-
-        return TreeNode {
-            id: layer.id.clone(),
-            kind: TreeNodeKind::Layer,
-            label: layer_row_label(tree, layer),
-            prim: None,
-            op: layer.op,
-            root: is_root_layer(layer),
-            session: is_session_layer(layer),
-            secondary: layer_row_secondary(tree, layer),
-            hover: Some(format!("层 {}", layer.id)),
-            children,
-        };
-    }
-
-
-
-
-
-
-
-    for group in arc_groups(tree, &layer.id) {        // A leaf naming the target layer (see `roots`): the edge is visible, and
-        // the branch it points at is not copied.
-        let kids: Vec<TreeNode> = if group.representative().crosses_layers() {
-            // **The target layer's leaf is the layer's own row** (the user's ruling: a
-            // click here must equal a click on the layer itself). Same id, so the same
-            // `comp_node{layer id}` ask, the same row lookup, the same scroll target;
-            // and the same `op`/`root` flags, because those are what
-            // [`crate::panel::action_for`] reads to decide what a click means. Copying
-            // them is what makes the two clicks one rule rather than two branches that
-            // have to be kept in step: the panel decides for both, and it decides by the
-            // target layer's own kind of row.
-            //
-            // The label names the layer rather than spelling its identifier: this leaf
-            // *is* a mention of that layer, and the user's ruling is that a layer reads
-            // the same everywhere.
-            let target = tree.layer(&group.key.target_layer);
-            vec![TreeNode {
-                id: group.key.target_layer.clone(),
-                kind: TreeNodeKind::Layer,
-                label: match target {
-                    Some(t) => format!(
-                        "\u{2192} {}",
-                        layer_description(t).unwrap_or_else(|| display_name_of(t))
-                    ),
-                    None => format!("\u{2192} {}", strip_anon_prefix(&group.key.target_layer)),
-                },
-                prim: None,
-                op: target.is_some_and(|t| t.op),
-                root: target.is_some_and(is_root_layer),
-                session: target.is_some_and(is_session_layer),
-                secondary: None,
-                // The leaf names the layer on the row, so its tooltip says what the row
-                // *is* -- the edge that reached it -- and the wire identifier of the
-                // layer, which the `→ name` label no longer spells.
-                hover: Some(format!(
-                    "\u{2192} {} 的层 {} · 点击等于点该层本体",
-                    group.key.kind, group.key.target_layer
-                )),
-                children: Vec::new(),
-            }]
-        } else {
-            Vec::new()
-        };
-        // **The group's instances, as rows** (v1.5.4, and the user's follow-up: a
-        // 240-way cluster has to be walkable down to one mesh). One row per arc,
-        // naming the prim that arc is authored on; the rows are collapsed until the
-        // row above is opened, which is the whole point of the aggregation.
-        //
-        // A clicked instance row is an ordinary prim row: its `prim` is the arc's
-        // `source_prim`, so `Shell::on_tree_select` selects that prim in the
-        // viewport, copies its path and asks `comp_node` for its detail -- the same
-        // path a viewport pick takes. An N = 1 group gets its one row too
-        // (v1.5.4: N = 1 时源 prim 行仍可展开).
-        //
-        // The **pseudo-root** authors no instance row: a `subLayer` arc reports
-        // `source_prim: "/"`, which is the stage itself and not a mesh an instance
-        // stands for ([`is_pseudo_root`]). Without that, every sublayer edge would
-        // grow a `prim:/` child that selects the whole stage.
-        // **No prim rows** (v1.3 ruling, restated by the user for v1.5.4): a
-        // 240-instance class does not become 240 path rows in the tree. The row
-        // stays one line naming the class; one mesh is inspected by picking it in
-        // the viewport, whose detail is the per-layer view.
-        // **What the row's click means** (v1.5.4 + the user's follow-up).
-        //
-        // A **single** edge keeps exactly the id and the selection it had before there
-        // were groups (v1.5.4: 点击语义不变): `arc:<n>`, and the prim it is authored on.
-        //
-        // A group of several is an edge *class*, and an edge selects **no** prim
-        // (「聚合行自身点击：仍不选 prim（它是一条边）」): `prim: None` is what says so
-        // -- `TreeSelection::prim` is the field every selection side effect reads
-        // (the viewport's selection, the clipboard toast, the re-render), so `None`
-        // there is the whole of "this click picks nothing". Its detail is still asked,
-        // of the prim the edges point at (`comp_node{目标}`), which is the node whose
-        // layer view says what the class is -- the contract's 「该行仍选择目标 prim
-        // （comp_node{目标}）」, honoured for the *ask* while the viewport stays put.
-        // A group's id is the **layer its edges point into** (`box.rusd`), not the prim in
-        // it: `prim:<path>` is only a `comp_node` node when the stage holds that prim, and
-        // a prototype lives in the material layer, so the id the row handed out was one the
-        // server refused (`comp_node: no node has the id "prim:/World/Prototypes/Box"`) —
-        // a click that showed an error and no picture. The layer id is a node the server
-        // always has, and clicking it means what the user's ruling says an arc's click
-        // means: 点 reference 的层叶子 == 点这个 layer 的本身 (`crate::panel::action_for`
-        // opens the layer for a row with no prim).
-        let (id, prim) = if group.count() == 1 {
-            let arc = group.representative();
-            (arc.id.clone(), Some(arc.source_prim.clone()))
-        } else {
-            (group.key.target_layer.clone(), None)
-        };
-        children.push(TreeNode {
-            id,
-            kind: TreeNodeKind::Arc,
-            label: group.label(&layer_display_name(&tree.layers, &group.key.target_layer)),
-            prim,
-            op: false,
-            root: false,
-            session: false,
-            secondary: None,
-            hover: None,
-            children: kids,
-        });
-    }
-
-
-
-    // **No prim rows.** v1.3 (user ruling, `docs/PROTOCOL.md`): a city stack has
-    // hundreds of prims and listing them ``既撑爆面板宽度又没人读`` — the tree is
-    // about structure (layers, arcs, variants). A prim is inspected by picking it in
-    // the viewport, which turns the picked path into `prim_nodes[].id` and asks
-    // `comp_node{id}` (`CompositionTree::prim_id`). The payload still *carries*
-    // `prim_nodes`, and the variant sets below are keyed by the prim they belong to,
-    // so the rows a prim owns are still reachable — only the path rows are gone.
-    for prim in tree.prims_in(&layer.id) {
-        let kids: Vec<TreeNode> = tree
-            .variants_of(&prim.path)
-            .into_iter()
-            .map(|vset| TreeNode {
-                id: vset.id.clone(),
-                kind: TreeNodeKind::VariantSet,
-                label: match &vset.selection {
-                    Some(sel) => format!("{} = {sel}", vset.name),
-                    None => format!("{} (none)", vset.name),
-                },
-                prim: Some(prim.path.clone()),
-                op: false,
-                root: false,
-                session: false,
-                secondary: None,
-                hover: None,
-                children: vset
-                    .variants
-                    .iter()
-                    .map(|v| TreeNode {
-                        // A variant's own spec is not a `comp_node` node — only its
-                        // *set* is. The row is therefore a label, and its id is the
-                        // set's, so clicking it asks the same question the set does
-                        // rather than one the server would refuse.
-                        id: vset.id.clone(),
-                        kind: TreeNodeKind::VariantSet,
-                        label: v.clone(),
-                        prim: Some(prim.path.clone()),
-                        op: false,
-                        root: false,
-                        session: false,
-                        secondary: None,
-                        hover: None,
-                        children: Vec::new(),
-                    })
-                    .collect(),
-            })
-            .collect();
-        if !kids.is_empty() {
-            children.extend(kids);
-        }
-    }
-
+/// `description` is the row's title, because it is the sentence a reader scans for; the
+/// other three are rows under it, labelled with the document's own keys — `operator`,
+/// `input`, `output`. The row keeps `op: true`, so a click on the title is still the cook
+/// stop it has been since v1.4: *what the row shows* is v1.14's ruling, *what its click
+/// means* is v1.4's, and neither is derived from the other.
+fn operation_row(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     TreeNode {
         id: layer.id.clone(),
         kind: TreeNodeKind::Layer,
-        label: layer_row_label(tree, layer),
+        label: layer_description(layer).unwrap_or_else(|| display_name_of(layer)),
+        prim: None,
+        op: true,
+        root: false,
+        session: false,
+        secondary: None,
+        hover: Some(format!(
+            "算子 {} · 层 {}",
+            layer.op_name.as_deref().unwrap_or(NONE),
+            layer.id
+        )),
+        children: vec![
+            field_row(
+                "operator",
+                layer.op_name.clone().unwrap_or_else(|| NONE.to_owned()),
+                layer.id.clone(),
+                TreeNodeKind::Prim,
+                None,
+            ),
+            input_row(tree, layer),
+            output_row(layer),
+        ],
+    }
+}
+
+/// **The `input` row**: the one USD this operator references, spelled the way its document
+/// spells it — `volume.rusd:/World/Volume`, `box.rusd:/World/Prototypes/Box` — and, where the
+/// document wrote only a prim (`/World/Boxes`), that prim's own USD in front of it
+/// (`boxes.rusd:/World/Boxes`).
+///
+/// A row that printed the bare prim said half of what the operator reads: the file is what
+/// a reader has to open, and the path after the colon is where inside it the structure is.
+/// The file in front is resolved through the layer that writes that prim, so the two halves
+/// are the same USD by construction.
+fn input_row(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
+    let mut value = layer.input.clone().unwrap_or_else(|| NONE.to_owned());
+    // The wire's entries carry the resolved asset and prim, which is what a click needs: a
+    // row prints the document's spelling, a click takes a layer id.
+    let declared = layer.inputs.iter().find(|input| input.value == value);
+    let (asset, prim) = match declared {
+        Some(input) => (input.asset.clone(), input.prim.clone()),
+        None => (None, None),
+    };
+    if spelled_file(&value).is_none()
+        && value.starts_with('/')
+        && let Some(file) = owner_file(tree, &value)
+    {
+        value = format!("{file}:{value}");
+    }
+    match (asset, prim) {
+        // A USD of its own: the click opens that file, which is the click a material row
+        // already has (v1.8).
+        (Some(asset), _) => field_row("input", value, asset, TreeNodeKind::Arc, None),
+        // A prim of the picture: the click renders that path alone (v1.13).
+        (None, Some(prim)) => {
+            let mut row = field_row(
+                "input",
+                value,
+                format!("prim:{prim}"),
+                TreeNodeKind::Arc,
+                Some(prim),
+            );
+            row.secondary = Some("render".to_owned());
+            row
+        }
+        (None, None) => field_row("input", value, layer.id.clone(), TreeNodeKind::Prim, None),
+    }
+}
+
+/// **The `output` row**: the USD this operator writes, `file:/hierarchy`, in the document's
+/// own spelling (`instances.rusd:/World/Instances`). Its click opens that file alone, so the
+/// product a row names is one click from the row that names it.
+fn output_row(layer: &LayerNode) -> TreeNode {
+    let value = layer.output.clone().unwrap_or_else(|| {
+        let file = usd_file_of(layer);
+        match layer.outputs.first() {
+            Some(prim) => format!("{file}:{prim}"),
+            None => file,
+        }
+    });
+    field_row("output", value, layer.id.clone(), TreeNodeKind::Arc, None)
+}
+
+/// **A USD row**: the file's path (its title), then every `reference` and `sublayer` it
+/// carries — and nothing else (v1.14). A file with neither has no rows under it: a
+/// `reference: （none）` line says nothing a missing line does not.
+///
+/// The row keeps the layer's own `op`/`root`/`session` flags, so its click still means what
+/// it meant: a cook stop previews up to itself, a material previews alone, the session layer
+/// only shows its detail.
+fn usd_row(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
+    let mut children = reference_rows(tree, layer);
+    children.extend(sublayer_rows(tree, layer));
+    TreeNode {
+        id: layer.id.clone(),
+        kind: TreeNodeKind::Layer,
+        label: usd_file_of(layer),
         prim: None,
         op: layer.op,
         root: is_root_layer(layer),
         session: is_session_layer(layer),
-        secondary: layer_row_secondary(tree, layer),
+        secondary: None,
         hover: Some(format!("层 {}", layer.id)),
         children,
+    }
+}
+
+/// One **reference** the layer carries: `reference: boxes.rusd:/World/Boxes ×2400`.
+///
+/// One row per **distinct target**, counting the prims that carry it — a 2400-instance
+/// product references one USD from 2400 prims, which is one fact about the file and not
+/// 2400 rows. A single reference prints the prim that carries it instead of a count.
+fn reference_rows(tree: &CompositionTree, layer: &LayerNode) -> Vec<TreeNode> {
+    let mut groups: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for arc in tree.arcs_from(&layer.id) {
+        if arc.kind != "reference" {
+            continue;
+        }
+        groups
+            .entry((arc.target_layer.clone(), arc.target_prim.clone()))
+            .or_default()
+            .push(arc.source_prim.clone());
+    }
+    groups
+        .into_iter()
+        .map(|((target, prim), sources)| {
+            let value = format!("{}:{}", usd_name_of(&target), prim);
+            let mut row = field_row("reference", value, target.clone(), TreeNodeKind::Arc, None);
+            row.secondary = Some(match sources.len() {
+                1 => sources[0].clone(),
+                n => format!("×{n}"),
+            });
+            // A target the stage never opened has no composition to show, so the row
+            // states the fact and asks nothing.
+            if tree.layer(&target).is_none() {
+                row.kind = TreeNodeKind::Prim;
+                row.id = layer.id.clone();
+            }
+            row
+        })
+        .collect()
+}
+
+/// One **sublayer** of the layer: `sublayer: C:/…/terrain.rusd`. A sublayer edge is a
+/// layer-level edge (`source_prim` is `/`), so there is nothing to count and one row per
+/// edge is the fact.
+fn sublayer_rows(tree: &CompositionTree, layer: &LayerNode) -> Vec<TreeNode> {
+    tree.arcs_from(&layer.id)
+        .into_iter()
+        .filter(|arc| arc.kind == "sublayer")
+        .map(|arc| {
+            let mut row = field_row(
+                "sublayer",
+                usd_name_of(&arc.target_layer),
+                arc.target_layer.clone(),
+                TreeNodeKind::Arc,
+                None,
+            );
+            if tree.layer(&arc.target_layer).is_none() {
+                row.kind = TreeNodeKind::Prim;
+                row.id = layer.id.clone();
+            }
+            row
+        })
+        .collect()
+}
+
+/// One field row: `<field>: <value>`, and what a click on it does is decided by the id,
+/// kind and `prim` it carries — a `render` row renders one path, an `arc` id opens one
+/// layer, and a row with neither is a plain selection.
+fn field_row(
+    field: &str,
+    value: impl Into<String>,
+    id: String,
+    kind: TreeNodeKind,
+    prim: Option<String>,
+) -> TreeNode {
+    TreeNode {
+        id,
+        kind,
+        label: format!("{field}: {}", value.into()),
+        prim,
+        op: false,
+        root: false,
+        session: false,
+        secondary: None,
+        hover: None,
+        children: Vec::new(),
+    }
+}
+
+/// The **file's own name**, which is what a USD row is titled by: `instances.rusd`,
+/// `terrain.rusd`, `session`. Never the wire identifier — that is the `path` row's job.
+/// The file this layer is, **spelled the way its document spelled it** (`instances.rusd`,
+/// `terrain.rusd`): an operator's declared `output` names its own file, and a layer no
+/// document named (the session layer, a stack's material) falls back to its file name.
+/// The absolute identifier is the server's spelling of the same file and is not what a row
+/// prints.
+fn usd_file_of(layer: &LayerNode) -> String {
+    if let Some(file) = layer.output.as_deref().and_then(spelled_file) {
+        return file.to_owned();
+    }
+    match layer.kind.as_str() {
+        "root" => "root".to_owned(),
+        "session" => "session".to_owned(),
+        _ => usd_name_of(&layer.id),
+    }
+}
+
+/// [`usd_name`] for an identifier this tree may hold no layer for — a reference's or a
+/// sublayer's target is named by the file an author wrote, not by a row.
+/// The file part of an authored `usd path:/hierarchy` spelling: `"boxes.rusd:/World/Boxes"`
+/// → `"boxes.rusd"`, and a bare prim path (`"/World/Boxes"`) → `None`. Windows drive
+/// letters survive it, because the colon that counts is the one before a `/`.
+fn spelled_file(value: &str) -> Option<&str> {
+    let i = value.rfind(':')?;
+    if i == 0 || !value[i + 1..].starts_with('/') {
+        return None;
+    }
+    Some(&value[..i])
+}
+
+/// The USD that writes `path`: the operator whose declared output is that path or an
+/// ancestor of it, spelled as its document spelled it.
+///
+/// This is what completes a bare input (`input = "/World/Boxes"`): the document names a
+/// structure inside the picture, and the layer that wrote that structure is the USD the row
+/// has to name beside it.
+fn owner_file(tree: &CompositionTree, path: &str) -> Option<String> {
+    tree.layers
+        .iter()
+        .find(|layer| {
+            layer
+                .outputs
+                .iter()
+                .any(|out| path == out || path.starts_with(&format!("{out}/")))
+        })
+        .map(usd_file_of)
+}
+
+fn usd_name_of(id: &str) -> String {
+    let name = strip_anon_prefix(id);
+    if name.is_empty() {
+        id.to_owned()
+    } else {
+        name
     }
 }
 
@@ -1984,3 +1933,98 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
 
 
 
+
+
+#[cfg(test)]
+mod rows_for_the_user {
+    use super::*;
+    use serde_json::json;
+
+    /// The composition tree of a two-op pipeline, as `composition_tree{}` sends it:
+    /// `instances.rusd` reads `/World/Boxes` (a prim `boxes.rusd` writes) and references
+    /// `boxes.rusd` from three instance prims; `boxes.rusd` reads `box.rusd` and carries no
+    /// reference of its own.
+    fn mock() -> CompositionTree {
+        CompositionTree::parse(&json!({
+            "layers": [
+                {
+                    "id": "/abs/out/instances.rusd",
+                    "kind": "op", "strength": 0, "op": true,
+                    "description": "把一簇 box 实例化到 quad 表面",
+                    "op_name": "RusdInstances",
+                    "input": "/World/Boxes",
+                    "output": "instances.rusd:/World/Instances",
+                    "inputs": [{"slot": "prototype", "value": "/World/Boxes",
+                                "asset": null, "prim": "/World/Boxes", "structure": []}],
+                    "outputs": ["/World/Instances"], "node": "/World/Instances"
+                },
+                {
+                    "id": "/abs/out/boxes.rusd",
+                    "kind": "op", "strength": 1, "op": true,
+                    "description": "每个点放一个 box",
+                    "op_name": "RusdInstances",
+                    "input": "box.rusd:/World/Prototypes/Box",
+                    "output": "boxes.rusd:/World/Boxes",
+                    "inputs": [{"slot": "prototype", "value": "box.rusd:/World/Prototypes/Box",
+                                "asset": "/abs/box.rusd", "prim": "/World/Prototypes/Box",
+                                "structure": []}],
+                    "outputs": ["/World/Boxes"], "node": "/World/Boxes"
+                }
+            ],
+            "arcs": [
+                {"id": "arc:0", "kind": "reference",
+                 "source_layer": "/abs/out/instances.rusd", "source_prim": "/World/Instances/i000000",
+                 "target_layer": "/abs/out/boxes.rusd", "target_prim": "/World/Boxes"},
+                {"id": "arc:1", "kind": "reference",
+                 "source_layer": "/abs/out/instances.rusd", "source_prim": "/World/Instances/i000001",
+                 "target_layer": "/abs/out/boxes.rusd", "target_prim": "/World/Boxes"},
+                {"id": "arc:2", "kind": "reference",
+                 "source_layer": "/abs/out/instances.rusd", "source_prim": "/World/Instances/i000002",
+                 "target_layer": "/abs/out/boxes.rusd", "target_prim": "/World/Boxes"}
+            ],
+            "prim_nodes": [],
+            "variant_sets": []
+        }))
+        .expect("the mock is the contract's shape")
+    }
+
+    fn find<'a>(rows: &'a [TreeNode], label: &str) -> &'a TreeNode {
+        rows.iter().find(|row| row.label == label).expect(label)
+    }
+
+    /// **The user's ruling** (v1.14/v1.15): an operation row shows its four fields, an
+    /// operation's `input` names the USD its prim lives in, every path is spelled the way the
+    /// document spells it, and a USD with neither a reference nor a sublayer has no such row.
+    #[test]
+    fn the_tree_shows_the_four_operator_fields_and_the_three_usd_facts() {
+        let tree = mock();
+        let rows = roots(&tree);
+
+        let op = find(&rows, "把一簇 box 实例化到 quad 表面");
+        let fields: Vec<&str> = op.children.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(
+            fields,
+            vec![
+                "operator: RusdInstances",
+                // The document wrote `/World/Boxes`; the row names the USD that holds it.
+                "input: boxes.rusd:/World/Boxes",
+                "output: instances.rusd:/World/Instances",
+            ]
+        );
+
+        // A reference is one row per distinct target, counting the prims that carry it.
+        let instances = find(&rows, "instances.rusd");
+        assert_eq!(instances.children.len(), 1, "{:?}", instances.children);
+        assert_eq!(instances.children[0].label, "reference: boxes.rusd:/World/Boxes");
+        assert_eq!(instances.children[0].secondary.as_deref(), Some("×3"));
+
+        // A USD that references nothing and has no sublayer says nothing under it.
+        let boxes = find(&rows, "boxes.rusd");
+        assert!(boxes.children.is_empty(), "{:?}", boxes.children);
+
+        // No row prints the identifier's own spelling, and none prints an absent field.
+        let all: Vec<String> = flatten(&rows).into_iter().map(|(_, row)| row.label).collect();
+        assert!(all.iter().all(|label| !label.contains("/abs/")));
+        assert!(!all.iter().any(|label| label.contains("（none）")));
+    }
+}
