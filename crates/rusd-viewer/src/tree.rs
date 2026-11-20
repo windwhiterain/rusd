@@ -719,14 +719,14 @@ fn hierarchy_rows(paths: &[String]) -> Vec<TreeNode> {
 /// One layer's branch: its arcs and the prims it authors.
 fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     let mut children: Vec<TreeNode> = Vec::new();
-    // **An operator's children are exactly the structures it declares** (v1.13): its
-    // inputs and its outputs, each as its own branch. Nothing else — the arcs the product
-    // happens to author are composition detail (and the prototype one merely repeats the
-    // declared input), so an op row that has declarations draws declarations.
-    if !layer.inputs.is_empty() || !layer.outputs.is_empty() {
+    // **An operator's children are exactly the inputs its document declares** (v1.13):
+    // `points` and `prototype` for an `instances` op, `domain` for a sampler — two rows,
+    // one row. The output is the row itself (the layer it wrote), and the arcs a product
+    // happens to author are not declarations, so neither is drawn here.
+    if !layer.inputs.is_empty() {
         for input in &layer.inputs {
-            match (&input.asset, &input.prim) {
-                (Some(asset), Some(prim)) => children.push(TreeNode {
+            let structure: Vec<TreeNode> = match (&input.asset, &input.prim) {
+                (Some(asset), Some(prim)) => vec![TreeNode {
                     id: asset.clone(),
                     kind: TreeNodeKind::Arc,
                     label: format!(
@@ -737,21 +737,31 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                     op: false,
                     root: false,
                     session: false,
-                    // Open on arrival: a collapsed branch says nothing about what the
-                    // operator reads, and these rows are what a reader came for.
                     secondary: Some("open".to_owned()),
                     hover: Some(input.value.clone()),
                     children: hierarchy_rows(&[prim.clone()]),
-                }),
-                (None, Some(prim)) => children.extend(hierarchy_rows(&[prim.clone()])),
-                _ => {}
-            }
+                }],
+                (None, Some(prim)) => hierarchy_rows(&[prim.clone()]),
+                _ => Vec::new(),
+            };
+            let stack_prim = input.prim.clone().filter(|_| input.asset.is_none());
+            children.push(TreeNode {
+                id: format!("input:{}", input.slot),
+                kind: TreeNodeKind::Arc,
+                label: input.slot.clone(),
+                prim: stack_prim.clone(),
+                op: false,
+                root: false,
+                session: false,
+                // A name is what the input is called; the structure under it is what it
+                // reads. Clicking the name renders that structure.
+                secondary: Some(if stack_prim.is_some() { "render" } else { "open" }.to_owned()),
+                hover: Some(input.value.clone()),
+                children: structure,
+            });
         }
-        // The output half, as **one** branch: the document may name an output and a prim
-        // under it (`/World/Samples`, `/World/Samples/points`), and drawing each as its
-        // own branch would repeat the parent.
-        children.extend(hierarchy_rows(&layer.outputs));
-        return TreeNode {            id: layer.id.clone(),
+        return TreeNode {
+            id: layer.id.clone(),
             kind: TreeNodeKind::Layer,
             label: layer_row_label(tree, layer),
             prim: None,
@@ -764,11 +774,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         };
     }
 
-
-
-
-    for group in arc_groups(tree, &layer.id) {
-        // A leaf naming the target layer (see `roots`): the edge is visible, and
+    for group in arc_groups(tree, &layer.id) {        // A leaf naming the target layer (see `roots`): the edge is visible, and
         // the branch it points at is not copied.
         let kids: Vec<TreeNode> = if group.representative().crosses_layers() {
             // **The target layer's leaf is the layer's own row** (the user's ruling: a
@@ -1891,6 +1897,7 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
 
 
