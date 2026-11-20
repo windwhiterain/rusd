@@ -10,18 +10,21 @@
 //! geometry once, and re-draws per camera change:
 //!
 //! ```text
-//! set_scene(owned geometry)   // bake + upload vertex/index buffers
+//! set_scene(owned geometry)   // bake each **mesh** once + upload one record per prim
 //! render(camera, config)      // uniforms + 2 passes + readback (no device, no shader build)
 //! ```
 //!
 //! Everything drawn here is `rusd_render`'s own pipeline, shader and math,
 //! copied with the lifetime split so the passes can be re-run: this is the same
-//! renderer, not a second opinion about the pixels. There is one deliberate
-//! difference (v1.11): a prim's local-to-world matrix is applied **by the vertex
-//! shader**, not baked into its vertices, because that is what makes a moved prim a
-//! 64-byte write. The arithmetic is then f32 where `rusd_render` bakes in f64, so the
-//! two can differ in the last bit of a world position; geometry, lighting and camera
-//! math are otherwise the same code.
+//! renderer, not a second opinion about the pixels. There are two deliberate
+//! differences. A prim's local-to-world matrix is applied **by the vertex shader**
+//! (v1.11), not baked into its vertices, because that is what makes a moved prim a
+//! 64-byte write. And since v1.14 the vertices are **only** the prototype's geometry:
+//! the colour, the id and the marker flag live in a per-prim *instance record*, so every
+//! prim that draws the same mesh shares one upload and one `draw_indexed` call — a box
+//! scattered 2400 times is one 24-vertex box, 2400 records and one draw. The arithmetic
+//! is then f32 where `rusd_render` bakes in f64, so the two can differ in the last bit of
+//! a world position; geometry, lighting and camera math are otherwise the same code.
 //!
 //! Error-tolerant by the crate's rule: every failure is a [`Diagnostic`] with a
 //! stable `E_` code, never a panic.
@@ -34,14 +37,42 @@ use rusd_scene::geometry::{self, Camera, GeoItem, Mat, SceneGeometry};
 
 use crate::diag;
 
+/// **A prototype's own geometry**, and nothing else (v1.14). Where it is drawn, what
+/// colour it is and which prim it is belong to the **instance record**, so the same 24
+/// bytes serve every copy of a mesh: a scene of 2400 identical boxes uploads one box.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
     pos: [f32; 3],
     normal: [f32; 3],
-    color: [f32; 3],
-    id: u32,
-    flag: f32,
+}
+
+/// One prim's record in the instance buffer (v1.14) — `Inst` in the shader, 160 bytes:
+/// two matrices, the colour, and the id the `prim-id` pass writes.
+///
+/// **The whole point of `draw_indexed(…, first..first + count)`**: the vertex shader reads
+/// this by `@builtin(instance_index)`, so one draw call draws every prim that shares a
+/// mesh, and a moved prim is a 64-byte write into `model` with no vertex touched.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable, PartialEq)]
+struct Inst {
+    /// `model` at 0, the normal matrix at 64, the colour at 128, the id and the marker
+    /// flag at 144: four spans a partial write can address on its own.
+    model: [f32; 16],
+    normal: [f32; 16],
+    color: [f32; 4],
+    id_flag: [u32; 4],
+}
+
+impl Inst {
+    /// What a record holds before its first write: NaN compares unequal to everything,
+    /// including itself, so the first diff writes every span without a `fresh` flag.
+    const EMPTY: Self = Self {
+        model: [f32::NAN; 16],
+        normal: [f32::NAN; 16],
+        color: [f32::NAN; 4],
+        id_flag: [u32::MAX; 4],
+    };
 }
 
 /// Shader byte-identical to `rusd_render`'s: beauty (directional + ambient) and
@@ -62,34 +93,37 @@ struct VsOut {
     @location(3) flag: f32,
 };
 
-// --- the prim's own matrices (v1.11) -----------------------------------------
-// One record per **prim id**, so a prim that moves is a 64-byte write into
-// `model` and its vertices are never touched again: the vertex buffer holds the
-// prim's local geometry, and the world is what this record says it is.
-struct Prim {
+// --- the instance record (v1.14) ----------------------------------------------
+// **One draw, N instances**: the vertices hold a prototype's local geometry once, and
+// every prim that draws it is one record here — its matrices, colour, id and the marker
+// flag. `@builtin(instance_index)` picks the record, so a moved prim is 64 bytes of this
+// record and never a vertex again.
+struct Inst {
     model: mat4x4<f32>,
     // inverse-transpose of `model`'s upper 3x3, translation zero: a normal is not a
     // position, so a squashed prim must not get its lighting inverted.
     normal: mat4x4<f32>,
+    color: vec4<f32>,
+    // x = the prim id this record draws under, y = 1 for a point marker (a quad the
+    // shader builds in clip space) and 0 for geometry.
+    id_flag: vec4<u32>,
 };
-@group(0) @binding(1) var<storage, read> prims: array<Prim>;
+@group(0) @binding(1) var<storage, read> insts: array<Inst>;
 
 @vertex
 fn vs_main(
     @location(0) pos: vec3<f32>,
     @location(1) normal: vec3<f32>,
-    @location(2) color: vec3<f32>,
-    @location(3) id: u32,
-    @location(4) flag: f32,
+    @builtin(instance_index) index: u32,
 ) -> VsOut {
+    let inst = insts[index];
     var out: VsOut;
-    out.color = color;
-    out.id = id;
-    out.flag = flag;
-    // `pos` is the prim's **local** position; its matrix is what puts it in the world.
-    let p = prims[id];
-    let world = p.model * vec4<f32>(pos, 1.0);
-    if (flag > 0.5) {
+    out.color = inst.color.rgb;
+    out.id = inst.id_flag.x;
+    out.flag = f32(inst.id_flag.y);
+    // `pos` is the prototype's **local** position; its matrix is what puts it in the world.
+    let world = inst.model * vec4<f32>(pos, 1.0);
+    if (out.flag > 0.5) {
         // A point marker is a screen-space dot: the quad is built in clip space
         // from its centre, so zooming never turns a point into a tile. The half-size is
         // 14 px (v1.9: it was 6, and a sampling node's 40 points then read as an empty
@@ -101,7 +135,7 @@ fn vs_main(
         out.normal = vec3<f32>(0.0, 0.0, 1.0);
     } else {
         out.pos = u.view_proj * world;
-        out.normal = (p.normal * vec4<f32>(normal, 0.0)).xyz;
+        out.normal = (inst.normal * vec4<f32>(normal, 0.0)).xyz;
     }
     return out;
 }
@@ -154,6 +188,11 @@ fn fs_outline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
         }
     }
     discard;
+    // Unreachable after a `discard`, but **not redundant**: DXC reads `discard` as a
+    // statement, not as the end of the function, so without this line it refuses the
+    // whole shader with "control may reach end of non-void function" — and the
+    // `selection-outline` pipeline then never builds.
+    return vec4<f32>(0.0);
 }
 "#;
 
@@ -168,9 +207,17 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 /// The persistent-device viewport: pipelines and a uniform buffer built once,
 /// the scene's vertex/index buffers rebuilt only when the snapshot changes.
-/// How many bytes one prim's matrix record takes: a model `mat4x4<f32>` and its
-/// normal matrix, so a moved prim is exactly one 64-byte write.
-const PRIM_RECORD_BYTES: u64 = 128;
+///
+/// How many bytes one **instance record** takes (v1.14): a model `mat4x4<f32>`, its
+/// normal matrix, the colour and the id/flag pair. Its two 64-byte halves are why a
+/// moved prim is exactly one 64-byte write, and its four spans
+/// (`0..64`, `64..128`, `128..144`, `144..160`) are what a partial write addresses.
+const INST_RECORD_BYTES: u64 = 160;
+/// Where each span of an [`Inst`] starts and ends, in bytes.
+const INST_MODEL: std::ops::Range<usize> = 0..64;
+const INST_NORMAL: std::ops::Range<usize> = 64..128;
+const INST_COLOR: std::ops::Range<usize> = 128..144;
+const INST_ID_FLAG: std::ops::Range<usize> = 144..160;
 
 pub struct Viewport {
     device: wgpu::Device,
@@ -189,15 +236,20 @@ pub struct Viewport {
     uniform_bgl: wgpu::BindGroupLayout,
     uniform_buf: wgpu::Buffer,
 
-    /// The per-prim matrix records (v1.11), indexed by prim id: `model` at `id * 128`,
-    /// the normal matrix at `id * 128 + 64`. **A moved prim writes only one of them** —
-    /// a drag is 64 bytes, never a vertex.
-    prim_buf: wgpu::Buffer,
-    /// Capacity of [`Self::prim_buf`] in records.
-    prim_cap: u32,
-    /// What each prim's record holds now. An absent entry is a record the next sync
-    /// must write; a matching one is why a drag writes nothing for the other prims.
-    prim_mats: std::collections::BTreeMap<String, PrimMatrices>,
+    /// The per-prim **instance records** (v1.14), 160 bytes each, read by the vertex
+    /// shader through `@builtin(instance_index)`: `model` at `n * 160`, the normal
+    /// matrix at `n * 160 + 64`, the colour at `+128`, the id/flag pair at `+144`.
+    /// **A moved prim writes only the first span** — a drag is 64 bytes, never a vertex.
+    inst_buf: wgpu::Buffer,
+    /// Capacity of [`Self::inst_buf`] in records.
+    inst_cap: u32,
+    /// Every instance record, in instance-index order: one entry per prim on the GPU.
+    /// The record it carries is what the GPU holds now, so a sync writes **only the
+    /// spans that differ** — which is why a repeat sync writes nothing at all.
+    insts: Vec<InstSlot>,
+    /// A prim path to its record's index. Stable while the prim lives; a compaction
+    /// renumbers it, and only a compaction does.
+    inst_index: std::collections::BTreeMap<String, u32>,
     /// How many bytes the last sync wrote into [`Self::prim_buf`]. What makes 「拖动一个
     /// prim 只写 64 字节」 an observation instead of a claim.
     pub matrix_bytes: usize,
@@ -213,11 +265,12 @@ pub struct Viewport {
     depth_view: wgpu::TextureView,
 
     // Scene buffers, **kept across snapshots** (v1.10: 渲染是 incremental 的 — a USD
-    // delta is a GPU buffer delta). Each prim owns a slab; only the slabs whose prim
-    // moved are rewritten, so a drag costs one prim's vertices and a one-operator patch
-    // costs that operator's prims. The buffers are an append-only arena: a slab that
-    // outgrows its space is appended at the tail and the old space is waste until the
-    // arena is compacted (at half waste, or when it must grow).
+    // delta is a GPU buffer delta). A slab belongs to a **mesh**, not to a prim (v1.14):
+    // every prim that draws the same geometry shares one, and the per-prim part is a
+    // record in [`Self::inst_buf`]. So a drag costs one record's model matrix, and a box
+    // scattered 2400 times costs one box. The buffers are an append-only arena: a slab
+    // that outgrows its space is appended at the tail and the old space is waste until
+    // the arena is compacted (at half waste, or when it must grow).
     vertex_buf: Option<wgpu::Buffer>,
     index_buf: Option<wgpu::Buffer>,
     /// Capacity in vertices / in indices.
@@ -229,7 +282,10 @@ pub struct Viewport {
     /// What the live slabs actually hold, so the waste is visible at a glance.
     live_vertices: u32,
     live_indices: u32,
-    slots: std::collections::BTreeMap<String, Slot>,
+    /// One slab per **mesh**, keyed by the hash of its geometry: a mesh is baked and
+    /// uploaded once however many prims draw it, which is what makes draw instancing
+    /// worth anything (2400 scattered boxes: one 24-vertex box on the GPU).
+    slots: std::collections::BTreeMap<u64, Slot>,
     /// The id a prim is drawn under in the `prim-id` pass. Stable for the life of the
     /// session, so a slab can be rewritten without renaming the prim to the picker.
     id_of: std::collections::BTreeMap<String, u32>,
@@ -241,13 +297,17 @@ pub struct Viewport {
     generation: u64,
     /// The 256-byte staging buffer a pick reads one texel into.
     pick_read: Option<wgpu::Buffer>,
-    /// The draws the live slabs leave, as `(first index, count)` runs over the index
-    /// buffer; contiguous slabs merge, so a freshly compacted arena is one draw.
-    draws: Vec<(u32, u32)>,
-    /// How many prims the last sync actually rewrote, and how many draws it left. What
-    /// makes "only the delta went to the GPU" observable instead of a claim.
+    /// The draws the live slabs leave: one indexed draw per **run of consecutive
+    /// instances of one mesh** (v1.14), so a box scattered 2400 times is **one** draw
+    /// call. Contiguous slabs merge, so a freshly compacted arena is one draw.
+    draws: Vec<Draw>,
+    /// How many meshes the last sync actually baked and uploaded, and how many draws it
+    /// left. What makes 「只把变化的部分传给 GPU」 observable instead of a claim.
     pub rewritten: usize,
     pub slots_live: usize,
+    /// How many instance records are live: the prims on the GPU. Read with `draws` to
+    /// see the instancing itself — 2400 instances, 1 draw, 1 slab.
+    pub instances_live: usize,
 
     // Reused readback buffers (grown as needed).
     beauty_read: wgpu::Buffer,
@@ -282,8 +342,9 @@ impl Viewport {
                     },
                     count: None,
                 },
-                // The per-prim matrices (v1.11): one record per prim id, read by the
-                // vertex shader, so a moved prim is a 64-byte write and no vertex moves.
+                // The per-prim **instance records** (v1.14): one 160-byte record per
+                // prim on the GPU, read by the vertex shader by `@builtin(instance_index)`,
+                // so one draw call draws every prim that shares a mesh.
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::VERTEX,
@@ -307,21 +368,21 @@ impl Viewport {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        // The per-prim matrix records (v1.11): one 128-byte record per prim id. Never
+        // The instance records (v1.14): one 160-byte record per prim on the GPU. Never
         // sized zero — one record of slack keeps the binding valid before a scene.
-        let prim_buf = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("viewer-prim-matrices"),
-            size: PRIM_RECORD_BYTES * 64,
-            // COPY_SRC as well: a grown record table is copied to the new buffer
-            // **on the GPU**, like every other buffer move here.
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+        let inst_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("viewer-instances"),
+            size: INST_RECORD_BYTES * 64,
+            // No COPY_SRC: a record table that outgrows its space is rewritten whole
+            // (the instances' indices compact with it), so nothing is moved on the GPU.
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let bind_group = Self::make_bind_group(&device, &bgl, &uniform_buf, &prim_buf);
+        let bind_group = Self::make_bind_group(&device, &bgl, &uniform_buf, &inst_buf);
         let vertex_layout = wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<Vertex>() as u64,
+            // **Per vertex, never per instance**: every copy of a mesh shares these 24
+            // bytes, which is the whole point of the split (v1.14).
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
@@ -333,21 +394,6 @@ impl Viewport {
                     format: wgpu::VertexFormat::Float32x3,
                     offset: 12,
                     shader_location: 1,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32x3,
-                    offset: 24,
-                    shader_location: 2,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Uint32,
-                    offset: 36,
-                    shader_location: 3,
-                },
-                wgpu::VertexAttribute {
-                    format: wgpu::VertexFormat::Float32,
-                    offset: 40,
-                    shader_location: 4,
                 },
             ],
         };
@@ -467,9 +513,10 @@ impl Viewport {
             bind_group,
             uniform_bgl: bgl,
             uniform_buf,
-            prim_buf,
-            prim_cap: 64,
-            prim_mats: std::collections::BTreeMap::new(),
+            inst_buf,
+            inst_cap: 64,
+            insts: Vec::new(),
+            inst_index: std::collections::BTreeMap::new(),
             matrix_bytes: 0,
             beauty_tex: targets.beauty_tex,
             beauty_view: targets.beauty_view,
@@ -498,6 +545,7 @@ impl Viewport {
             draws: Vec::new(),
             rewritten: 0,
             slots_live: 0,
+            instances_live: 0,
         }
     }
 
@@ -521,7 +569,9 @@ impl Viewport {
     /// know which prim to outline.
     pub fn id_of(&self, path: &str) -> Option<u32> {
         let id = self.id_of.get(path).copied()?;
-        self.slots.contains_key(path).then_some(id)
+        // "On the GPU" is an instance record now (v1.14), not a slab of its own: a prim
+        // shares its slab with every prim that draws the same mesh.
+        self.inst_index.contains_key(path).then_some(id)
     }
 
     /// The beauty texture, for a UI to display without a CPU round trip.
@@ -575,12 +625,12 @@ impl Viewport {
     }
 
     /// The bind group both scene passes use: the frame's uniforms and the per-prim
-    /// matrix records. Rebuilt whenever [`Self::prim_buf`] is replaced.
+    /// instance records. Rebuilt whenever [`Self::inst_buf`] is replaced.
     fn make_bind_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         uniform_buf: &wgpu::Buffer,
-        prim_buf: &wgpu::Buffer,
+        inst_buf: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("viewer-uniforms"),
@@ -592,25 +642,26 @@ impl Viewport {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: prim_buf.as_entire_binding(),
+                    resource: inst_buf.as_entire_binding(),
                 },
             ],
         })
     }
 
-    /// Bring the GPU geometry up to `geo`: **only the prims that actually changed are
-    /// baked and written** (v1.10 — a USD delta is a GPU buffer delta).
+    /// Bring the GPU geometry up to `geo`: **only what actually changed is baked and
+    /// written** (v1.10 — a USD delta is a GPU buffer delta), and what changes for a
+    /// moved prim is one instance record (v1.14).
     ///
     /// `overrides` is a gizmo drag's per-prim translation, and its keys are the only
     /// prims that can have moved — `only` is what says so, and with it set a drag costs
-    /// one prim's vertices instead of the scene's. `None` means "diff the whole scene",
-    /// which is what a fresh snapshot needs: it still bakes nothing whose signature
-    /// matches the slab already on the GPU.
+    /// one record's model matrix instead of the scene's. `None` means "diff the whole
+    /// scene", which is what a fresh snapshot needs: it still bakes nothing whose mesh is
+    /// already on the GPU and writes no record that already matches.
     ///
     /// `scope` is what a prim `geo` does not mention *is*: gone (`Scope::Whole`, a new
     /// composition) or merely hidden (`Scope::Filtered`, 「只看选中」 on). A hidden prim
-    /// keeps its slab, so turning the filter off costs nothing — v1.11: a filter is not
-    /// a scene change.
+    /// keeps its mesh and its record, and its run simply is not drawn, so turning the
+    /// filter off costs nothing — v1.11: a filter is not a scene change.
     pub fn set_scene(&mut self, geo: &SceneGeometry, scope: Scope) {
         self.sync(geo, &std::collections::BTreeMap::new(), None, scope);
     }
@@ -620,9 +671,10 @@ impl Viewport {
     /// local, so the prim follows the pointer without waiting for the server's
     /// snapshot.
     ///
-    /// **A drag is a 64-byte write** (v1.11): the override lands in the prim's matrix
-    /// record, not in its vertices, so the scene's vertex buffer is not touched at all
-    /// and `matrix_bytes` comes out `64` for a one-prim drag.
+    /// **A drag is a 64-byte write** (v1.11, still true under v1.14's instancing): the
+    /// override lands in the prim's instance record, in the `model` matrix half, not in
+    /// any vertex, so the scene's vertex buffer is not touched at all and `matrix_bytes`
+    /// comes out `64` for a one-prim drag.
     pub fn set_scene_with_translates(
         &mut self,
         geo: &SceneGeometry,
@@ -647,16 +699,63 @@ impl Viewport {
         if self.vertex_buf.is_none() {
             self.allocate(1024, 4096);
         }
-        // What the scene would need if every prim were appended fresh, and how much of
-        // the arena is already dead: either answer is a compaction.
-        let need_v: u32 = geo.items.iter().map(item_vertices).sum();
-        let need_i: u32 = geo.items.iter().map(item_indices).sum();
+
+        // --- what the scene wants: one entry per prim, reduced to a mesh hash -------
+        // After this the sync never looks at a mesh again unless it has to **bake** one,
+        // so a prim's geometry reaches the GPU once per hash and not once per prim —
+        // which is what makes 2400 scattered boxes one 24-vertex box (v1.14).
+        let mut live: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut wants: Vec<Want> = Vec::with_capacity(geo.items.len());
+        for (at, item) in geo.items.iter().enumerate() {
+            live.insert(item.path.clone());
+            // A prim the hint says cannot have moved is not even hashed: that is what
+            // makes a drag a one-prim delta rather than a scene walk.
+            if only.is_some_and(|set| !set.contains(&item.path))
+                && self.inst_index.contains_key(&item.path)
+            {
+                continue;
+            }
+            let transform = match overrides.get(&item.path) {
+                Some(t) => {
+                    let mut m = item.transform;
+                    m[12] = t[0];
+                    m[13] = t[1];
+                    m[14] = t[2];
+                    m
+                }
+                None => item.transform,
+            };
+            wants.push(Want {
+                at,
+                sig: mesh_signature(item),
+                vcount: item_vertices(item),
+                icount: item_indices(item),
+                transform,
+                color: [item.color[0], item.color[1], item.color[2], 1.0],
+                marker: item.markers.is_some(),
+            });
+        }
+
+        // --- the arena: grow or compact when the meshes it lacks no longer fit -------
+        // Only the meshes that are **not on the GPU yet** count: a scene whose every mesh
+        // is already a slab needs no room at all, however many prims it names.
+        let mut need_v = 0u32;
+        let mut need_i = 0u32;
+        let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for want in &wants {
+            if seen.insert(want.sig) && !self.slots.contains_key(&want.sig) {
+                need_v += want.vcount;
+                need_i += want.icount;
+            }
+        }
         let waste_v = self.vertex_len.saturating_sub(self.live_vertices);
         let waste_i = self.index_len.saturating_sub(self.live_indices);
-        let grow = self.vertex_len + need_v > self.vertex_cap || self.index_len + need_i > self.index_cap;
+        let must = self.vertex_len + need_v > self.vertex_cap
+            || self.index_len + need_i > self.index_cap;
         let stale = (self.vertex_cap > 8192 && waste_v > self.vertex_cap / 2)
             || (self.index_cap > 8192 && waste_i > self.index_cap / 2);
-        if grow || stale {
+        // **A delta sync compacts only when it must**: a drag must not move the arena.
+        if must || (only.is_none() && stale) {
             // **A compaction is a device-to-device move** (v1.10): the live slabs are copied
             // from the old buffers to the new ones with `copy_buffer_to_buffer`, so nothing
             // that did not change crosses the bus — no re-bake, no re-upload, no CPU pixels.
@@ -675,10 +774,10 @@ impl Viewport {
             let mut vertex_at = 0u32;
             let mut index_at = 0u32;
             let mut rebased: Vec<u32> = Vec::new();
-            let mut slabs: Vec<(String, Slot)> = self
+            let mut slabs: Vec<(u64, Slot)> = self
                 .slots
                 .iter()
-                .map(|(path, slot)| (path.clone(), slot.clone()))
+                .map(|(sig, slot)| (*sig, slot.clone()))
                 .collect();
             slabs.sort_by_key(|(_, slot)| slot.vstart);
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -686,7 +785,7 @@ impl Viewport {
             });
             if let Some(from_v) = &old_vertex {
                 let _ = &old_index;
-                for (path, slot) in slabs {
+                for (sig, slot) in slabs {
                     if slot.vcount > 0 {
                         encoder.copy_buffer_to_buffer(
                             from_v,
@@ -706,7 +805,7 @@ impl Viewport {
                     }
                     rebased.extend(slab_indices.iter().copied());
                     moved.insert(
-                        path,
+                        sig,
                         Slot {
                             vstart: vertex_at,
                             istart: index_at,
@@ -729,145 +828,182 @@ impl Viewport {
             self.live_vertices = vertex_at;
             self.live_indices = index_at;
         }
-        let mut live: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        // Room for every prim this scene could mint an id for, **in one go**: a first upload
-        // of a 2400-prim scene would otherwise recreate the table (and its bind group) seven
-        // times on the way up from 64 records.
-        self.grow_prim((self.paths.len() + geo.items.len() + 1) as u32);
-        for item in &geo.items {
-            live.insert(item.path.clone());
-            let transform = match overrides.get(&item.path) {
-                Some(t) => {
-                    let mut m = item.transform;
-                    m[12] = t[0];
-                    m[13] = t[1];
-                    m[14] = t[2];
-                    m
-                }
-                None => item.transform,
-            };
-            // A prim the hint says cannot have moved keeps its slab and its matrices
-            // without even being hashed: that is what makes a drag a one-prim delta
-            // rather than a scene walk.
-            let skipped = only.is_some_and(|set| !set.contains(&item.path));
-            let want = PrimMatrices::of(&transform);
-            if skipped
-                && self.slots.contains_key(&item.path)
-                && self.prim_mats.get(&item.path) == Some(&want)
-            {
-                continue;
-            }
-            let id = self.prim_id(&item.path);
-            self.grow_prim(id + 1);
-            // **Only a changed mesh is re-baked** (v1.11): a prim that merely moved keeps
-            // its slab — its vertices stay local, and the move is one matrix record.
-            let signature = signature_of(item);
-            let stale = self
+        // A mesh no live prim names is either **gone** (a composition changed) or merely
+        // **hidden** (a filter is on), and only the caller knows which. Gone frees its
+        // slab; hidden keeps it, so lifting 「只看选中」 re-bakes nothing.
+        if scope == Scope::Whole && only.is_none() {
+            let kept: std::collections::BTreeSet<u64> = wants.iter().map(|w| w.sig).collect();
+            let gone_meshes: Vec<u64> = self
                 .slots
-                .get(&item.path)
-                .map_or(true, |slot| slot.signature != signature);
-            if !stale {
-                self.write_prim(&item.path, id, want);
+                .keys()
+                .copied()
+                .filter(|sig| !kept.contains(sig))
+                .collect();
+            for sig in gone_meshes {
+                if let Some(slot) = self.slots.remove(&sig) {
+                    self.live_vertices = self.live_vertices.saturating_sub(slot.vcount);
+                    self.live_indices = self.live_indices.saturating_sub(slot.icount);
+                }
+            }
+        }
+
+        // --- bake the meshes that are not on the GPU yet, **one per hash** ----------
+        for want in &wants {
+            if self.slots.contains_key(&want.sig) {
                 continue;
             }
-            let (vcount, icount) = (item_vertices(item), item_indices(item));
-            // In place when the prim's slab is exactly the right size (the common case:
-            // a re-coloured prim); otherwise a fresh slab at the tail.
-            let in_place = self.slots.get(&item.path).map_or(false, |s| {
-                s.vcount == vcount && s.icount == icount
-            });
-            let (vstart, istart) = if in_place {
-                let s = &self.slots[&item.path];
-                (s.vstart, s.istart)
-            } else {
-                (self.vertex_len, self.index_len)
+            let (Some(vertex_buf), Some(index_buf)) = (self.vertex_buf.clone(), self.index_buf.clone())
+            else {
+                return;
             };
-            let mut vertices: Vec<Vertex> = Vec::with_capacity(vcount as usize);
-            let mut indices: Vec<u32> = Vec::with_capacity(icount as usize);
-            bake_item(item, id, vstart, &mut vertices, &mut indices);
-            let Some(vertex_buf) = &self.vertex_buf else { return };
-            let Some(index_buf) = &self.index_buf else { return };
+            let (vstart, istart) = (self.vertex_len, self.index_len);
+            let mut vertices: Vec<Vertex> = Vec::with_capacity(want.vcount as usize);
+            let mut indices: Vec<u32> = Vec::with_capacity(want.icount as usize);
+            bake_mesh(&geo.items[want.at], vstart, &mut vertices, &mut indices);
             if !vertices.is_empty() {
                 self.queue.write_buffer(
-                    vertex_buf,
+                    &vertex_buf,
                     u64::from(vstart) * vertex_stride,
                     bytemuck::cast_slice(&vertices),
                 );
             }
             if !indices.is_empty() {
                 self.queue.write_buffer(
-                    index_buf,
+                    &index_buf,
                     u64::from(istart) * 4,
                     bytemuck::cast_slice(&indices),
                 );
             }
-            if !in_place {
-                self.vertex_len += vcount;
-                self.index_len += icount;
-                self.live_vertices += vcount;
-                self.live_indices += icount;
-            }
+            self.vertex_len += want.vcount;
+            self.index_len += want.icount;
+            self.live_vertices += want.vcount;
+            self.live_indices += want.icount;
             self.slots.insert(
-                item.path.clone(),
+                want.sig,
                 Slot {
-                    signature,
                     vstart,
-                    vcount,
+                    vcount: want.vcount,
                     istart,
-                    icount,
-                    shown: true,
-                    indices: indices.clone(),
+                    icount: want.icount,
+                    indices,
                 },
             );
             self.rewritten += 1;
-            self.write_prim(&item.path, id, want);
         }
-        // A prim the scene no longer mentions is either **gone** or merely **hidden**:
-        // the two look the same here, and only the caller knows which. Gone frees its
-        // slab (a composition changed); hidden keeps it and draws nothing (v1.11 — turning
-        // 「只看选中」 off must not re-bake the scene).
-        match scope {
-            Scope::Whole => {
-                let gone: Vec<String> = self
-                    .slots
-                    .keys()
-                    .filter(|p| !live.contains(p.as_str()))
-                    .cloned()
-                    .collect();
-                for path in gone {
-                    if let Some(slot) = self.slots.remove(&path) {
-                        self.live_vertices = self.live_vertices.saturating_sub(slot.vcount);
-                        self.live_indices = self.live_indices.saturating_sub(slot.icount);
+
+        // --- the instance records: one per prim, and nothing written for a match -----
+        // Room for every record this sync could mint, **in one go**: a first upload of a
+        // 2400-prim scene would otherwise recreate the table (and its bind group) a dozen
+        // times on the way up from 64 records. A grown table holds garbage, so it is
+        // rewritten whole below and the per-record diff has nothing to add.
+        let fresh = wants
+            .iter()
+            .filter(|w| !self.inst_index.contains_key(&geo.items[w.at].path))
+            .count() as u32;
+        let regrown = self.grow_inst((self.insts.len() + fresh as usize + 1) as u32);
+        let mut changed: Vec<(u32, Inst)> = Vec::new();
+        for want in &wants {
+            let path = &geo.items[want.at].path;
+            let id = self.prim_id(path);
+            let m = PrimMatrices::of(&want.transform);
+            let record = Inst {
+                model: m.model,
+                normal: m.normal,
+                color: want.color,
+                id_flag: [id, u32::from(want.marker), 0, 0],
+            };
+            match self.inst_index.get(path).copied() {
+                Some(index) => {
+                    // A prim whose **mesh** changed draws another prototype, so it joins
+                    // that mesh's run. Its record keeps its slot: only a compaction
+                    // renumbers records.
+                    let slot = &mut self.insts[index as usize];
+                    slot.sig = want.sig;
+                    if slot.inst != record {
+                        let have = slot.inst;
+                        slot.inst = record;
+                        changed.push((index, have));
                     }
                 }
-                // Whatever is left is in the composition, so it is drawn: a prim that was
-                // hidden by a filter and stayed unchanged never reached the loop above.
-                for slot in self.slots.values_mut() {
-                    slot.shown = true;
-                }
-            }
-            Scope::Filtered => {
-                for (path, slot) in self.slots.iter_mut() {
-                    slot.shown = live.contains(path.as_str());
+                None => {
+                    let index = self.insts.len() as u32;
+                    self.insts.push(InstSlot {
+                        path: path.clone(),
+                        sig: want.sig,
+                        inst: record,
+                        alive: true,
+                        shown: true,
+                    });
+                    self.inst_index.insert(path.clone(), index);
+                    // A record the GPU has never held: compared against the sentinel,
+                    // every one of its four spans differs, so its first upload is 160.
+                    changed.push((index, Inst::EMPTY));
                 }
             }
         }
-        // The draws the slabs leave: contiguous runs merge, so an arena whose slabs were
-        // appended together is one draw, and a fragmented one a few more.
-        let mut runs: Vec<(u32, u32)> = Vec::new();
-        let mut slabs: Vec<&Slot> = self.slots.values().filter(|s| s.shown).collect();
-        slabs.sort_by_key(|s| s.istart);
-        for slot in slabs {
-            if slot.icount == 0 {
+        // A prim the scene no longer names is gone or hidden, the same pair as a mesh.
+        if scope == Scope::Whole && only.is_none() {
+            let gone: Vec<String> = self
+                .inst_index
+                .keys()
+                .filter(|path| !live.contains(path.as_str()))
+                .cloned()
+                .collect();
+            for path in gone {
+                if let Some(index) = self.inst_index.remove(&path) {
+                    self.insts[index as usize].alive = false;
+                }
+            }
+        }
+        // Show exactly what the scene names. A hidden prim keeps its record, so a filter
+        // costs no upload at all: the runs below simply stop drawing it.
+        for slot in self.insts.iter_mut() {
+            slot.shown = slot.alive && live.contains(&slot.path);
+        }
+
+        // --- write the records that differ ---------------------------------------
+        // Dead records waste the table, so half of it being dead is a compaction — and a
+        // compaction renumbers records, which is the one thing that makes the next write
+        // the whole table. A delta sync never does it.
+        let dead = self.insts.iter().filter(|slot| !slot.alive).count();
+        let compacted = only.is_none() && dead > 0 && dead * 2 > self.insts.len() && self.compact_insts();
+        if regrown || compacted {
+            self.write_all_insts();
+        } else {
+            for (index, have) in changed {
+                self.write_inst(index, have);
+            }
+        }
+
+        // --- the draws: one per run of consecutive, drawn instances of one mesh ------
+        // A run breaks on a hidden prim or on the next prim naming another mesh, so 2400
+        // boxes scattered in one go are a **single** `draw_indexed(indices, 0, 0..2400)`.
+        let mut runs: Vec<(u64, u32, u32)> = Vec::new();
+        for (i, slot) in self.insts.iter().enumerate() {
+            if !slot.shown {
                 continue;
             }
+            let at = i as u32;
             match runs.last_mut() {
-                Some((start, count)) if *start + *count == slot.istart => *count += slot.icount,
-                _ => runs.push((slot.istart, slot.icount)),
+                Some((sig, start, count)) if *sig == slot.sig && *start + *count == at => *count += 1,
+                _ => runs.push((slot.sig, at, 1)),
             }
         }
-        self.draws = runs;
+        self.draws.clear();
+        for (sig, first, count) in runs {
+            if let Some(slot) = self.slots.get(&sig) {
+                if slot.icount > 0 {
+                    self.draws.push(Draw {
+                        istart: slot.istart,
+                        icount: slot.icount,
+                        first,
+                        count,
+                    });
+                }
+            }
+        }
         self.slots_live = self.slots.len();
+        self.instances_live = self.inst_index.len();
     }
 
     /// (Re)create the two scene buffers at `vertex_cap` vertices and `index_cap` indices.
@@ -896,74 +1032,84 @@ impl Viewport {
         self.index_cap = index_cap.max(1);
     }
 
-    /// Make room for `records` per-prim records. The old table is copied to the new
-    /// buffer **on the GPU**, and [`Self::prim_mats`] is kept, so a scene that grew does
-    /// not rewrite the records that already match.
-    fn grow_prim(&mut self, records: u32) {
-        if records <= self.prim_cap {
-            return;
+    /// Make room for `records` instance records, answering whether the buffer was
+    /// replaced. The old contents are **not** copied: a grown table holds garbage, so the
+    /// sync that grew it rewrites every record from [`Self::insts`] — 160 bytes per prim,
+    /// which is what a first snapshot costs.
+    fn grow_inst(&mut self, records: u32) -> bool {
+        if records <= self.inst_cap {
+            return false;
         }
-        let cap = records.max(self.prim_cap.saturating_mul(2));
-        let new = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("viewer-prim-matrices"),
-            size: u64::from(cap) * PRIM_RECORD_BYTES,
-            usage: wgpu::BufferUsages::STORAGE
-                | wgpu::BufferUsages::COPY_DST
-                | wgpu::BufferUsages::COPY_SRC,
+        let cap = records.max(self.inst_cap.saturating_mul(2));
+        self.inst_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("viewer-instances"),
+            size: u64::from(cap) * INST_RECORD_BYTES,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("viewer-grow-prims"),
-            });
-        encoder.copy_buffer_to_buffer(
-            &self.prim_buf,
-            0,
-            &new,
-            0,
-            u64::from(self.prim_cap) * PRIM_RECORD_BYTES,
-        );
-        self.queue.submit(Some(encoder.finish()));
-        self.prim_buf = new;
-        self.prim_cap = cap;
-        let bg = Self::make_bind_group(
+        self.inst_cap = cap;
+        self.bind_group = Self::make_bind_group(
             &self.device,
             &self.uniform_bgl,
             &self.uniform_buf,
-            &self.prim_buf,
+            &self.inst_buf,
         );
-        self.bind_group = bg;
+        true
     }
 
-    /// Point a prim's record at `want`, writing **only the halves that differ**: a drag
-    /// moves the model matrix and leaves the normal matrix alone, so a drag of one prim
-    /// writes 64 bytes and touches no vertex.
-    fn write_prim(&mut self, path: &str, id: u32, want: PrimMatrices) {
-        let have = self.prim_mats.get(path).copied();
-        let base = u64::from(id) * PRIM_RECORD_BYTES;
-        let model = have.map_or(true, |h| h.model != want.model);
-        let normal = have.map_or(true, |h| h.normal != want.normal);
-        // The record is contiguous, so a prim whose matrices both changed (a first upload, a
-        // rotated parent) is **one** 128-byte write; a drag is one 64-byte write.
-        if model && normal {
-            let mut record = [0f32; 32];
-            record[..16].copy_from_slice(&want.model);
-            record[16..].copy_from_slice(&want.normal);
-            self.queue
-                .write_buffer(&self.prim_buf, base, bytemuck::cast_slice(&record));
-            self.matrix_bytes += 128;
-        } else if model || normal {
-            let (at, half) = if model {
-                (base, &want.model)
-            } else {
-                (base + 64, &want.normal)
-            };
-            self.queue
-                .write_buffer(&self.prim_buf, at, bytemuck::cast_slice(half));
-            self.matrix_bytes += 64;
+    /// Drop the dead records and renumber the live ones, in order. The one thing that
+    /// moves a prim to another instance index, and so the one thing that makes the next
+    /// write a whole-table one.
+    fn compact_insts(&mut self) -> bool {
+        let mut kept: Vec<InstSlot> = Vec::with_capacity(self.insts.len());
+        let mut index = std::collections::BTreeMap::new();
+        for slot in self.insts.drain(..) {
+            if !slot.alive {
+                continue;
+            }
+            index.insert(slot.path.clone(), kept.len() as u32);
+            kept.push(slot);
         }
-        self.prim_mats.insert(path.to_owned(), want);
+        self.insts = kept;
+        self.inst_index = index;
+        true
+    }
+
+    /// Rewrite the spans of one record that differ from `have`, as **one** contiguous
+    /// write: a drag differs in `model` alone (64 bytes), a re-colour in `color` alone
+    /// (16), and a prim's first record in all four (160).
+    fn write_inst(&mut self, index: u32, have: Inst) {
+        let want = self.insts[index as usize].inst;
+        if have == want {
+            return;
+        }
+        let old = bytemuck::bytes_of(&have);
+        let new = bytemuck::bytes_of(&want);
+        let mut span: Option<(usize, usize)> = None;
+        for part in [INST_MODEL, INST_NORMAL, INST_COLOR, INST_ID_FLAG] {
+            if old[part.clone()] != new[part.clone()] {
+                span = Some(match span {
+                    Some((lo, _)) => (lo, part.end),
+                    None => (part.start, part.end),
+                });
+            }
+        }
+        let Some((lo, hi)) = span else { return };
+        let at = u64::from(index) * INST_RECORD_BYTES + lo as u64;
+        self.queue.write_buffer(&self.inst_buf, at, &new[lo..hi]);
+        self.matrix_bytes += hi - lo;
+    }
+
+    /// Write the whole instance table, as one contiguous upload: what a first snapshot
+    /// costs (`N * 160` bytes) and what a compaction costs to put right.
+    fn write_all_insts(&mut self) {
+        if self.insts.is_empty() {
+            return;
+        }
+        let recs: Vec<Inst> = self.insts.iter().map(|slot| slot.inst).collect();
+        self.queue
+            .write_buffer(&self.inst_buf, 0, bytemuck::cast_slice(&recs));
+        self.matrix_bytes += recs.len() * INST_RECORD_BYTES as usize;
     }
 
     /// The stable id a prim draws under in the `prim-id` pass.
@@ -1167,11 +1313,16 @@ impl Viewport {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, vertex_buf.slice(..));
             pass.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            // One draw per *run* of live slabs (v1.10): the index buffer is an arena whose
-            // slabs are appended in prim order, so an uncompacted scene is one run and a
-            // fragmented one is a few. Indices are absolute, so the base vertex is 0.
-            for (start, count) in &self.draws {
-                pass.draw_indexed(*start..*start + *count, 0, 0..1);
+            // **One draw per run of consecutive prims that share a mesh** (v1.14): the
+            // index range is the prototype's, the instance range is the prims'. A box
+            // scattered 2400 times is one `draw_indexed`, 36 indices, 2400 instances.
+            // Indices are absolute, so the base vertex is 0.
+            for draw in &self.draws {
+                pass.draw_indexed(
+                    draw.istart..draw.istart + draw.icount,
+                    0,
+                    draw.first..draw.first + draw.count,
+                );
             }
         }
         {
@@ -1200,8 +1351,14 @@ impl Viewport {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, vertex_buf.slice(..));
             pass.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            for (start, count) in &self.draws {
-                pass.draw_indexed(*start..*start + *count, 0, 0..1);
+            // The same instanced draws as the beauty pass: the id comes out of the very
+            // record the colour did, so a pick of one of 2400 boxes works.
+            for draw in &self.draws {
+                pass.draw_indexed(
+                    draw.istart..draw.istart + draw.icount,
+                    0,
+                    draw.first..draw.first + draw.count,
+                );
             }
         }
         // **The selection's outline** (v1.10): after the id pass, colour the border of the
@@ -1443,26 +1600,65 @@ pub enum Scope {
     Filtered,
 }
 
-/// One prim's slab in the two scene buffers (v1.10). `vstart` is in vertices, `istart`
-/// in indices; the slab's indices are **absolute** (already biased by `vstart`), which is
-/// what lets a slab be rewritten in place, skipped, or copied device-to-device unchanged.
+/// One **mesh's** slab in the two scene buffers (v1.10, shared since v1.14). `vstart` is
+/// in vertices, `istart` in indices; the slab's indices are **absolute** (already biased
+/// by `vstart`), which is what lets a slab be skipped, or copied device-to-device
+/// unchanged when the arena compacts.
+///
+/// The map that owns it is keyed by the mesh's hash, so a slot **exists if and only if**
+/// that exact geometry is on the GPU — which is why a mesh is baked once and never again.
 #[derive(Clone)]
 struct Slot {
-    /// What the slab was baked from. Equal means "the prim did not move" and the GPU is
-    /// left alone — the whole point of the delta path.
-    signature: u64,
     vstart: u32,
     vcount: u32,
     istart: u32,
     icount: u32,
-    /// Whether this slab is drawn: a filter clears it without freeing the slab, so the
-    /// prim's geometry is still there the moment it comes back.
-    shown: bool,
     /// The slab's indices **as baked** (absolute: `slab base + mesh index`). Kept on the
     /// CPU because a compaction moves the slab's vertices to a new base, and an absolute
     /// index that is not rebased points into somebody else's vertices — boxes joined by
     /// long triangles was exactly that.
     indices: Vec<u32>,
+}
+
+/// One prim, as this sync wants it: what to draw and where. The mesh is reduced to its
+/// hash at the door, so the rest of the sync never touches a mesh unless it bakes one.
+struct Want {
+    /// Index into `SceneGeometry::items` — where the mesh lives, if it must be baked.
+    at: usize,
+    /// The hash of the geometry this prim draws: the key of its slab.
+    sig: u64,
+    vcount: u32,
+    icount: u32,
+    transform: Mat,
+    color: [f32; 4],
+    /// A `Points` prim draws screen-space dots rather than its mesh (v1.14: the flag that
+    /// says so lives in the instance record, not in every vertex).
+    marker: bool,
+}
+
+/// One prim's place in the instance table: which slab draws it, what the GPU holds for
+/// it, and whether it is drawn at all. Its index in `Viewport::insts` **is** the
+/// `@builtin(instance_index)` the shader reads it by.
+struct InstSlot {
+    path: String,
+    /// The mesh slab this prim draws — the mesh hash, as [`Want::sig`] has it.
+    sig: u64,
+    /// The record exactly as the GPU holds it (or holds nothing, before the first write).
+    inst: Inst,
+    /// False once the prim is gone: its record is waste until the table compacts.
+    alive: bool,
+    /// Whether this prim is drawn. A filter clears it without freeing the record, so the
+    /// prim is back the moment the filter is, at no cost at all.
+    shown: bool,
+}
+
+/// One draw call: `draw_indexed(istart..istart + icount, 0, first..first + count)` — one
+/// mesh's indices, instanced over every consecutive prim that draws it.
+struct Draw {
+    istart: u32,
+    icount: u32,
+    first: u32,
+    count: u32,
 }
 
 /// The vertices and indices one prim needs.
@@ -1480,21 +1676,21 @@ fn item_indices(item: &GeoItem) -> u32 {
     }
 }
 
-/// A hash of everything `bake_item` reads — and it reads **only the prim's own
-/// geometry** (v1.11): where the prim is drawn is the matrix record's business, so a
-/// move leaves this signature alone and the slab on the GPU untouched. The mesh is hashed
-/// whole rather than by pointer: `extract` builds fresh vectors per scene, so identity
-/// says nothing, and a signature that lies would leave a stale slab on the GPU.
-fn signature_of(item: &GeoItem) -> u64 {
+/// A hash of the **geometry** `bake_mesh` reads, and of nothing else (v1.14). Where the
+/// prim is drawn is the instance record's business, and what colour it is likewise, so a
+/// moved prim and a re-coloured prim both leave this alone — and two prims with the same
+/// geometry get the same hash, which is how they come to share one slab.
+///
+/// The mesh is hashed whole rather than by pointer: `extract` builds fresh vectors per
+/// scene, so identity says nothing, and a hash that lies would leave a stale slab on the
+/// GPU.
+fn mesh_signature(item: &GeoItem) -> u64 {
     fn mix(state: &mut u64, value: u64) {
         // FNV-1a over the value, one multiply per word: cheap and order-sensitive.
         *state ^= value;
         *state = state.wrapping_mul(0x100_0000_01b3);
     }
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for v in item.color.iter() {
-        mix(&mut h, u64::from(v.to_bits()));
-    }
     match &item.markers {
         Some(markers) => {
             mix(&mut h, 1);
@@ -1508,30 +1704,34 @@ fn signature_of(item: &GeoItem) -> u64 {
         None => {
             mix(&mut h, 2);
             mix(&mut h, item.mesh.positions.len() as u64);
+            mix(&mut h, item.mesh.normals.len() as u64);
             for p in &item.mesh.positions {
                 for v in p {
                     mix(&mut h, u64::from(v.to_bits()));
                 }
             }
-            for center in &item.mesh.indices {
-                mix(&mut h, u64::from(*center));
+            for n in &item.mesh.normals {
+                for v in n {
+                    mix(&mut h, u64::from(v.to_bits()));
+                }
+            }
+            mix(&mut h, item.mesh.indices.len() as u64);
+            for centre in &item.mesh.indices {
+                mix(&mut h, u64::from(*centre));
             }
         }
     }
     h
 }
 
-fn bake_item(
-    item: &GeoItem,
-    id: u32,
-    base: u32,
-    vertices: &mut Vec<Vertex>,
-    indices: &mut Vec<u32>,
-) {
+/// Bake a prim's **geometry** into vertices and indices: no colour, no id, no flag —
+/// those are the instance record's (v1.14). `base` is the slab's first vertex, so the
+/// indices are absolute and a slab can move without re-baking.
+fn bake_mesh(item: &GeoItem, base: u32, vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>) {
     if let Some(markers) = &item.markers {
         // One screen-space quad per marker (6 vertices): `normal` carries the
-        // corner (-1..1) and `flag` tells the shader to build the dot in clip
-        // space, so a point keeps its pixel size at any zoom. `pos` is the marker's
+        // corner (-1..1) and the instance's flag tells the shader to build the dot in
+        // clip space, so a point keeps its pixel size at any zoom. `pos` is the marker's
         // **local** centre; the prim's matrix puts it in the world (v1.11).
         for c in markers {
             let start = vertices.len() as u32;
@@ -1546,9 +1746,6 @@ fn bake_item(
                 vertices.push(Vertex {
                     pos: *c,
                     normal: [dx, dy, 0.0],
-                    color: item.color,
-                    id,
-                    flag: 1.0,
                 });
             }
             for k in 0..6 {
@@ -1561,9 +1758,6 @@ fn bake_item(
             vertices.push(Vertex {
                 pos: *p,
                 normal: *n,
-                color: item.color,
-                id,
-                flag: 0.0,
             });
         }
         indices.extend(item.mesh.indices.iter().map(|&i| base + start + i));
@@ -1713,4 +1907,176 @@ fn perspective(fovy_deg: f64, aspect: f64, near: f64, far: f64) -> Mat {
     m[11] = -1.0;
     m[14] = far * near / (near - far);
     m
+}
+
+#[cfg(test)]
+mod tests {
+    //! v1.14's claim, on a real device: **prims that share a mesh are one slab, one draw
+    //! call and N instance records**, a drag is 64 bytes, a repeat is zero — and the
+    //! picture proves each prim was drawn from its **own** record, which is exactly what a
+    //! run starting at an instance offset other than 0 would get wrong.
+    use super::*;
+    use rusd_scene::geometry::{Camera, GeoItem, Mesh};
+
+    fn headless() -> Option<(wgpu::Device, wgpu::Queue)> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            ..Default::default()
+        }))
+        .ok()?;
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("viewer-test"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .ok()
+    }
+
+    fn item(path: &str, mesh: Mesh, at: [f64; 3], color: [f32; 3]) -> GeoItem {
+        let mut transform = [0.0f64; 16];
+        transform[0] = 1.0;
+        transform[5] = 1.0;
+        transform[10] = 1.0;
+        transform[15] = 1.0;
+        transform[12] = at[0];
+        transform[13] = at[1];
+        transform[14] = at[2];
+        GeoItem {
+            path: path.to_owned(),
+            mesh,
+            transform,
+            color,
+            markers: None,
+        }
+    }
+
+    /// Three boxes that share one mesh, then a sphere: the sphere's run starts at instance
+    /// 3, so its draw is the one that catches a shader reading a record by the wrong index.
+    fn scene() -> SceneGeometry {
+        let red = [0.9, 0.1, 0.1];
+        let green = [0.1, 0.8, 0.1];
+        let cube = geometry::cube_mesh(2.0);
+        SceneGeometry {
+            items: vec![
+                item("/World/A", cube.clone(), [-9.0, 0.0, 0.0], red),
+                item("/World/B", cube.clone(), [-3.0, 0.0, 0.0], red),
+                item("/World/C", cube, [3.0, 0.0, 0.0], red),
+                item("/World/Z", geometry::sphere_mesh(1.2, 16, 12), [9.0, 0.0, 0.0], green),
+            ],
+            camera: None,
+            bounds: ([-11.0, -5.0, -2.0], [11.0, 5.0, 2.0]),
+            diags: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn shared_meshes_are_one_slab_one_draw() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("no DX12 adapter here; the GPU instancing test was skipped");
+            return;
+        };
+        let geo = scene();
+        let (w, h) = (160u32, 160u32);
+        let mut vp = Viewport::new(device, queue, w, h);
+
+        // --- the first upload: one slab per **mesh**, one record per prim --------------
+        vp.set_scene(&geo, Scope::Whole);
+        assert_eq!(vp.slots_live, 2, "three boxes share one slab; the sphere is the second");
+        assert_eq!(vp.instances_live, 4);
+        assert_eq!(vp.draws_count(), 2, "one draw per (mesh, run of instances)");
+        assert_eq!(vp.rewritten, 2, "two meshes were baked, not four prims");
+        assert_eq!(
+            vp.matrix_bytes,
+            4 * INST_RECORD_BYTES as usize,
+            "one 160-byte record per prim and no per-prim geometry"
+        );
+
+        // --- the same scene again: not one byte crosses the bus -------------------
+        vp.set_scene(&geo, Scope::Whole);
+        assert_eq!(vp.matrix_bytes, 0);
+        assert_eq!(vp.rewritten, 0);
+
+        // --- a drag is 64 bytes: the model matrix, and not a vertex -------------------
+        let mut moved = std::collections::BTreeMap::new();
+        moved.insert("/World/B".to_owned(), [-3.0, 0.0, 1.5]);
+        vp.set_scene_with_translates(&geo, &moved, Scope::Whole);
+        assert_eq!(vp.matrix_bytes, 64, "a one-prim drag writes one model matrix");
+        assert_eq!(vp.rewritten, 0, "no vertex was touched");
+        vp.set_scene(&geo, Scope::Whole);
+
+        // --- a filter is not a scene change --------------------------------------
+        let only = crate::scene::isolate(&geo, Some("/World/Z"));
+        vp.set_scene(&only, Scope::Filtered);
+        assert_eq!(vp.matrix_bytes, 0, "hiding three prims uploads nothing");
+        assert_eq!(vp.rewritten, 0);
+        assert_eq!(vp.draws_count(), 1, "only the sphere's run is drawn");
+        vp.set_scene(&geo, Scope::Whole);
+        assert_eq!(vp.matrix_bytes, 0, "lifting the filter uploads nothing either");
+        assert_eq!(vp.draws_count(), 2);
+
+        // --- the picture: every prim from its own record ----------------------------
+        let cam = Camera {
+            // Z is up, so a camera on +Z looking at the origin has its up vector parallel
+            // to its view direction — a degenerate view. Look along +Y instead.
+            position: [0.0, -60.0, 8.0],
+            look_at: [0.0, 0.0, 0.0],
+            fov_deg: 40.0,
+        };
+        let cfg = RenderConfig {
+            width: w,
+            height: h,
+            ambient: 1.0,
+            diffuse: 0.0,
+            background: [0.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        vp.render(&cam, geo.bounds, &cfg, None).expect("draw");
+        let (beauty, ids) = vp.grab().expect("grab");
+        let sphere_id = vp.id_of("/World/Z").expect("the sphere is on the GPU");
+        assert_eq!(sphere_id, 4, "ids follow the order the prims were first named in");
+        let mut seen = std::collections::BTreeSet::new();
+        let (mut boxes, mut dots) = (0usize, 0usize);
+        for (i, id) in ids.iter().enumerate() {
+            if *id == 0 {
+                continue;
+            }
+            seen.insert(*id);
+            let px = &beauty[i * 4..i * 4 + 4];
+            if *id == sphere_id {
+                dots += 1;
+                assert!(
+                    px[1] > px[0],
+                    "the sphere's run starts at instance 3: its pixels must be its own green"
+                );
+            } else {
+                boxes += 1;
+                assert!(px[0] > px[1], "a box's pixels must be red");
+            }
+        }
+        assert_eq!(seen.len(), 4, "all four prims drew, each under its own id");
+        assert!(boxes > 150 && dots > 40, "boxes={boxes} sphere={dots}");
+
+        // A pick of the sphere's own pixels names the sphere: the `prim-id` pass read the
+        // same instance record the beauty pass did.
+        let at = ids.iter().position(|id| *id == sphere_id).expect("sphere pixels");
+        let (x, y) = ((at % w as usize) as u32, (at / w as usize) as u32);
+        assert_eq!(vp.pick(x, y).expect("pick"), sphere_id);
+    }
+
+    /// The mesh hash is what decides sharing, so it must ignore what a prim does with the
+    /// mesh and see only the geometry itself.
+    #[test]
+    fn the_hash_sees_geometry_and_nothing_else() {
+        let cube = geometry::cube_mesh(2.0);
+        let a = item("/World/A", cube.clone(), [0.0, 0.0, 0.0], [0.9, 0.1, 0.1]);
+        let moved = item("/World/B", cube.clone(), [7.0, 2.0, -1.0], [0.1, 0.1, 0.9]);
+        let bigger = item("/World/C", geometry::cube_mesh(3.0), [0.0, 0.0, 0.0], [0.9, 0.1, 0.1]);
+        assert_eq!(mesh_signature(&a), mesh_signature(&moved), "where and what colour: no");
+        assert_ne!(mesh_signature(&a), mesh_signature(&bigger), "a different box is different");
+    }
 }

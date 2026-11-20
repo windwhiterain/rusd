@@ -933,17 +933,23 @@ pub struct Frame {
     /// id → prim path, shared with the render thread's own list (a frame must not clone
     /// thousands of strings to hand over a list that has not changed).
     pub paths: std::sync::Arc<Vec<String>>,
-    /// **What the last scene update actually sent to the GPU**: how many prim slabs were
-    /// re-baked and rewritten, and how many slabs are live. A camera move rewrites 0; a
-    /// drag rewrites 1; a fresh snapshot rewrites only the prims whose geometry moved.
-    /// Carried so "只把变化的部分传给 GPU" is a number, not a promise.
+    /// **What the last scene update actually sent to the GPU**: how many **meshes** were
+    /// baked and rewritten, and how many slabs and instance records are live. A camera
+    /// move rewrites 0; a drag rewrites 0 (one record's model matrix, 64 bytes); a fresh
+    /// snapshot rewrites only the meshes that were not already on the GPU — one box for
+    /// 2400 scattered prims (v1.14).
     pub rewritten: usize,
     pub slabs: usize,
-    /// How many draw runs those slabs left (contiguous slabs merge).
+    /// How many instance records the GPU holds: the prims it draws. Read with `draws` it
+    /// is the instancing itself — 2400 instances under 1 slab and 1 draw (v1.14).
+    pub instances: usize,
+    /// How many draw calls the last sync left: one per run of consecutive prims that
+    /// share a mesh, so an instanced scene is one (v1.14).
     pub draws: usize,
-    /// **How many bytes the last scene update wrote into the per-prim matrix buffer**
-    /// (v1.11). A moved prim is 64 bytes of model matrix and nothing else, so a one-prim
-    /// drag reads `matrix_bytes: 64, rewritten: 0` — the observation behind 「拖动一个 prim
+    /// **How many bytes the last scene update wrote into the instance-record buffer**
+    /// (v1.11, v1.14's layout). A moved prim is 64 bytes of model matrix and nothing
+    /// else, so a one-prim drag reads `matrix_bytes: 64, rewritten: 0` — the observation
+    /// behind 「拖动一个 prim
     /// 只能写 64 字节」.
     pub matrix_bytes: usize,
     /// How long this frame took to draw and read back.
@@ -1188,6 +1194,7 @@ impl RenderWorker {
                             paths: viewport.paths_arc(),
                             rewritten: viewport.rewritten,
                             slabs: viewport.slots_live,
+                            instances: viewport.instances_live,
                             draws: viewport.draws_count(),
                             matrix_bytes: viewport.matrix_bytes,
                             millis: started.elapsed().as_secs_f64() * 1000.0,

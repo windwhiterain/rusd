@@ -1715,8 +1715,8 @@ impl Shell {
             "orbit": self.orbit.map(orbit_json),
             "frame": self.frame.as_ref().map(|(f, _)| {
                 json!({ "seq": f.seq, "width": f.width, "height": f.height, "millis": f.millis,
-                        "rewritten": f.rewritten, "slabs": f.slabs, "draws": f.draws,
-                        "matrix_bytes": f.matrix_bytes })
+                        "rewritten": f.rewritten, "slabs": f.slabs, "instances": f.instances,
+                        "draws": f.draws, "matrix_bytes": f.matrix_bytes })
             }),
             "status": self.status,
         })
