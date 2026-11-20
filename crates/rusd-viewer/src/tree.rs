@@ -687,11 +687,17 @@ fn hierarchy_rows(paths: &[String]) -> Vec<TreeNode> {
             .collect()
     }
     fn make(nodes: &BTreeSet<String>, path: &str) -> TreeNode {
+        let is_root = path.matches('/').count() == 1;
         TreeNode {
             id: format!("prim:{path}"),
             kind: TreeNodeKind::Prim,
-            label: path.rsplit('/').next().unwrap_or(path).to_owned(),
-            prim: Some(path.to_owned()),
+            // A root row spells the whole path (`/World`), so the branch says which path it
+            // is without being expanded; a child row is its own name and is indented.
+            label: if is_root {
+                path.to_owned()
+            } else {
+                path.rsplit('/').next().unwrap_or(path).to_owned()
+            },            prim: Some(path.to_owned()),
             op: false,
             root: false,
             session: false,

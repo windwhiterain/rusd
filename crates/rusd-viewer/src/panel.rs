@@ -611,7 +611,13 @@ fn row(
         // 240-instance class's children are the noise the aggregation removes -- those
         // open when the user asks, one row at a time.
         let id = ui.make_persistent_id((&node.id, root, depth));
-        let mut open = ui.data(|d| d.get_temp::<bool>(id.with("open")).unwrap_or(depth == 0));
+        let mut open = ui.data(|d| {
+            d.get_temp::<bool>(id.with("open")).unwrap_or(
+                // A hierarchy row (v1.13) is open by default: `World / Samples / points` is
+                // the structure the operator declares, and a collapsed `World` says nothing.
+                depth == 0 || node.secondary.as_deref() == Some("render"),
+            )
+        });
         ui.horizontal(|ui| {
             indent(ui, depth);
             // The chevron. A row with nothing to open still gets the column's width, so
