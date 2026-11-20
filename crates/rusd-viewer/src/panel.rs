@@ -333,10 +333,16 @@ pub fn ask_for_layer(layer: &crate::tree::LayerNode) -> Option<LayerAsk> {
 /// One body and two adapters ([`ask_for`], [`ask_for_layer`]), because a row and the layer
 /// it names must answer the same question the same way: a badge that said 「只看」 about a
 /// layer whose row says 「预览 ≤」 would be two opinions of one click.
-fn ask_for_flags(op: bool, root: bool, session: bool) -> Option<LayerAsk> {
-    if op || root {
-        Some(LayerAsk::Upto)
-    } else if session {
+fn ask_for_flags(_op: bool, _root: bool, session: bool) -> Option<LayerAsk> {
+    // **点谁就渲染谁** (the user's ruling, v1.14): a layer row asks for **that USD** and
+    // nothing else — a product is not a stop in a prefix, it is a file, and clicking it
+    // shows it. No row composes "up to here" any more: `preview{upto: null}` (the final
+    // composition) is the only prefix left, and it is the 刷新/final control's, not a row's.
+    //
+    // The session layer is the one exception, and it is not a special rule: it has no
+    // picture of its own to show (every composition already starts from it), so its click
+    // is its detail.
+    if session {
         None
     } else {
         Some(LayerAsk::Solo)
@@ -554,7 +560,9 @@ fn row(
     let is_current_preview = depth == 0 && is_current_preview(node, preview);
     // The row's **drawn** title: an op row already carries the `<=` marker in its label
     // (v1.4), and the root row gains it while it is the prefix in force (v1.5.3).
-    let title = control_row_title(node, is_current_preview);
+    // **No marker on the title.** A row is what it is; 「≤」 said "the composition stops
+    // here", which is a rule about prefixes the click no longer has (点谁就渲染谁).
+    let title = node.label.clone();
     let text = match node.kind {
         TreeNodeKind::Layer if is_preview_row(node) => RichText::new(title).strong().underline(),
         TreeNodeKind::Layer => RichText::new(title).strong(),
@@ -725,33 +733,6 @@ fn row(
         }
     }
     clicked
-}
-
-/// The title a control row **draws**: its label, with the `≤` marker on it when that
-/// row is the composition in force.
-///
-/// Op rows carry the marker in the label itself (`crate::tree::roots` builds
-/// `≤ <generator> [...]`, v1.4), because for them it says "clicking previews up to
-/// here". The root row is a control from v1.5.3 only, and the contract spells its
-/// marker as part of *being the current preview* — 「`preview == root id` 时高亮 +
-/// `≤` 标记」 — so it is added here, at the one place that knows both the row and the
-/// state, rather than baked into a label the model cannot re-derive when the preview
-/// moves. A **material** row (v1.8: `preview{solo}`) is the same case, for the same
-/// reason.
-///
-/// A row titled by its **description** (the user's ruling for every described layer) is a
-/// control row like any other: the marker is still about the click, not about the text.
-pub fn control_row_title(node: &TreeNode, is_current_preview: bool) -> String {
-    // **`≤` says the composition stops here** (v1.5.3), so it belongs to a cook stop — an
-    // operator's row or the root layer's — and not to a material: `preview{solo}` shows
-    // one USD and stops nowhere in the cook order, which is why a clicked path used to
-    // wear the mark for no reason. The op rows carry it too: their label is the
-    // description alone now, so nothing else says they are the prefix in force.
-    if is_current_preview && (node.op || node.root) {
-        format!("≤ {}", node.label)
-    } else {
-        node.label.clone()
-    }
 }
 
 /// What a row says when the pointer rests on it: what its click means (for a control

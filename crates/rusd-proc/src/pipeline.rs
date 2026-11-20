@@ -115,28 +115,6 @@ fn author_cloud(d: &mut dyn sdf::AbstractData, prim: &str, local: &[[f64; 3]]) -
 }
 
 /// The replacement, per op (v1.5.1): hide the consumed input where it is, without
-/// touching the layer that authored it. An `over` plus a `visibility` token — never a
-/// delete and never `active = false` (which a weaker layer cannot win back).
-///
-/// The asset name a product authors for a parameter that named `<file>:<prim>`: the
-/// string the document wrote, one directory up — a product is written into
-/// `<doc_dir>/out/`, so a material named beside the document is `../<file>` from the
-/// product that reads it. Resolution to an absolute path stays the reading side's job.
-fn authored_asset(raw: &str) -> Option<String> {
-    let i = raw.rfind(':')?;
-    if i == 0 || !raw[i + 1..].starts_with('/') {
-        return None;
-    }
-    let authored = &raw[..i];
-    let drive = authored.len() > 2
-        && authored.as_bytes()[1] == b':'
-        && (authored.as_bytes()[2] == b'/' || authored.as_bytes()[2] == b'\\');
-    if authored.starts_with('/') || authored.starts_with("../") || drive {
-        Some(authored.to_owned())
-    } else {
-        Some(format!("../{authored}"))
-    }
-}
 
 /// `RusdSamplePoints` (v1.5, extended v1.5.8): input geometry becomes a point cloud.
 ///
