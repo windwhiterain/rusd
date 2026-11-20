@@ -785,16 +785,19 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     // hierarchy the operator *declares* has exactly the number of entries its document's
     // inputs table has.
     if !layer.inputs.is_empty() {
-        // **The operator's schema is its declared inputs** (v1.13): `{points, prototype}`
-        // for an `instances` op, `{domain}` for a sampler. A stage root (`/World`) or the
-        // prim inside a structure (`Box`) is not part of it — the schema is the set of
-        // things the operator declares it takes, and each row is one of them.
+        // **Each declared input is a row, and under it is the USD hierarchy it names**
+        // (v1.13): `points` > /World > /World/Samples > /World/Samples/points, and
+        // `prototype` > /World > /World/Prototypes > /World/Prototypes/Box. The name is what
+        // the operator declares; the levels under it are the USD structure it stands for.
         for input in &layer.inputs {
             let (id, prim) = match (&input.asset, &input.prim) {
                 (Some(asset), _) => (asset.clone(), None),
                 (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
                 _ => continue,
             };
+            let structure = structure_rows(&input.structure, &input.slot)
+                .into_iter()
+                .collect();
             children.push(TreeNode {
                 id,
                 kind: TreeNodeKind::Arc,
@@ -805,7 +808,7 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 session: false,
                 secondary: Some(if prim.is_some() { "render" } else { "open" }.to_owned()),
                 hover: Some(input.value.clone()),
-                children: Vec::new(),
+                children: structure,
             });
         }
 
@@ -1952,6 +1955,7 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
 
 
