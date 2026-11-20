@@ -224,6 +224,28 @@ fn an_input_of_the_wrong_schema_is_reported() {
     );
 }
 
+/// **Every example graph cooks clean.**
+///
+/// A `.ops.toml` names operators and the parameters each takes; the cook runs them and
+/// writes one USD per operator. This is the guard that the operator vocabulary, the
+/// generators and the assets the graphs name still agree — for every example, not just
+/// the two the tests above spell out.
+#[test]
+fn every_example_graph_cooks() {
+    let mut names: Vec<String> = std::fs::read_dir(examples())
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".ops.toml"))
+        .collect();
+    names.sort();
+    assert!(!names.is_empty(), "examples/ holds graphs to cook");
+    for name in names {
+        let ops = cook_example(&name);
+        assert!(!ops.is_empty(), "{name} cooks at least one operator");
+    }
+}
+
 /// **A prototype USD cannot place is reported — and a subtype is not a mismatch** (the
 /// user: 就用 USD 本身的 subtype 机制判断). An instances node copies its prototype at every
 /// point, so the slot is declared `Xformable`: a class, not a type. The accepting half is

@@ -1,0 +1,17 @@
+# rusd 0.1 — RusdGrid cook 引擎演示（M2）
+#
+# 算子图：一个 5×5 的球体网格，由 cook 引擎过程化生成（非手写 prim）。
+# 算子没有 USD 输入，所以这份文档也不给 `input`——它只说自己写哪个 USD。
+
+[stage]
+default_prim = "/World"
+seed = 1
+
+[operator.Grid]
+operator    = "grid"
+description = "5×5 的球体网格，由 cook 引擎过程化生成"
+output      = "grid.rusd:/World/Grid"
+count_x = 5
+count_y = 5
+radius  = 0.4
+spacing = 2.0

@@ -1,0 +1,34 @@
+# rusd 0.1 — v1.5 演示：mesh → points → instances 两段 op 管线
+#
+# 输入是 `mesh_scatter.rusd` 里那块起伏地面。两段 op，每段写自己的 USD，
+# 中间态是一个真 layer：
+#
+#   RusdSamplePoints  按三角形**面积加权**采样 240 个点，在自己的输出层写
+#                     /World/TuftSamples/points（point3f[]）
+#   RusdInstances     读那个点云，逐点写 /World/Tufts/i000000…；原型跨资产
+#                     reference 到 `tuft.rusd:/World/Prototypes/Tuft`
+#
+# 确定性：采样流按 (stage.seed, 节点路径, 该节点 seed) 键控，改别的节点不 reshuffle。
+
+[stage]
+default_prim = "/World"
+seed = 20261118
+
+[operator.TuftSamples]
+operator    = "sample_points"
+description = "按三角形面积加权采样 240 个点"
+output      = "tuft_samples.rusd:/World/TuftSamples"
+input       = "mesh_scatter.rusd:/World/Terrain"
+count = 240
+seed  = 11
+
+# 只吃点云（没有 points ⇒ E_INPUT_GEOMETRY）。没有 count 参数：点云里有几个点就
+# 几个实例，max_prims 只做预算截断（保原序 + W_BUDGET）。
+[operator.Tufts]
+operator    = "instances"
+description = "点云 → 原型实例"
+output      = "tufts.rusd:/World/Tufts"
+input       = "tuft.rusd:/World/Prototypes/Tuft"
+max_prims = 5000
+scale     = { dist = "uniform", min = 0.7, max = 1.5 }
+seed      = 11

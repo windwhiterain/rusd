@@ -1,35 +1,25 @@
-# rusd 0.1 — 示例：一片确定性松林
-# 表面语法 = TOML 1.0 的 Rusd profile（docs/SPEC.md §2）。
-# 规范形：table 按路径字节序排序，键按名字排序；一 prim 一区块。
+# rusd 0.1 — 素材层：一片松林的相机与树原型。
+#
+# 这份文件是 **USD**：只有 prim 和 schema，没有算子。RusdScatter 在
+# `forest.ops.toml` 里引用它（`/World/Prototypes/Pine` 就是那棵被实例化的树）。
 
 [stage]
 default_prim = "/World"
 meters_per_unit = 1.0
-seed = 20261116
 up_axis = "Z"
 
 [World]
 schema = "Xform"
 
 [World.Camera]
+schema = "Camera"
 fov = 45.0
 look_at = [0.0, 0.0, 0.0]
 position = [60.0, -60.0, 40.0]
-schema = "Camera"
-
-[World.Forest]
-count = 500
-domain = { dist = "rect", w = 100.0, h = 100.0 }
-max_prims = 2000
-prototype = "/World/Prototypes/Pine"
-scale = { dist = "uniform", min = 0.8, max = 1.4 }
-schema = "RusdScatter"
-seed = 42
-yaw = { dist = "uniform", min = 0.0, max = 360.0 }
 
 [World.Prototypes]
 schema = "Xform"
 
 [World.Prototypes.Pine]
-radius = 0.5
 schema = "Sphere"
+radius = 0.5

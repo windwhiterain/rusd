@@ -64,7 +64,13 @@ Rusd 专注 agent 优先的表层语法、过程化展开、增量前端与渲�
   数字去下划线、非十进制归一为十进制；浮点恒带小数点；字符串归一为 basic string 最小转义；
   注释随 item 保留（toml_edit CST）。
 - 文件 UTF-8、LF（`.gitattributes` 强制）。
-- 示例见 `examples/forest.rusd`。
+- 示例见 `examples/forest.ops.toml`（算子图）与其素材层 `examples/forest.rusd`（USD）。
+
+> **两套词汇，各写各的文件**（v1.14）。`.rusd` 是 USD：只有 prim 与 `schema`，
+> 没有算子。`.ops.toml` 是**算子图**：只有 `operator` 与它的参数，不作者任何 prim。
+> 生成器名是 **operator**，不是 schema——它只在算子图里被引用，任何 layer 都不会
+> 把它写成 `typeName`；schema 注册表对它一概不认（`schema::lookup("RusdInstances")`
+> 返回 `None`，算子表在 `rusd_scene::operator`）。
 
 ## 3. 类型与 Schema
 

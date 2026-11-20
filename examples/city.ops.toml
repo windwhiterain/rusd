@@ -1,0 +1,39 @@
+# rusd 0.1 — 城市演示（M3）：街区 → 建筑，行道树
+#
+# 算子图。两个算子各写自己的 USD：
+#   RusdStreetGrid  生成街区与建筑（高度按分区分布采样），写 city_blocks.rusd
+#   RusdScatter     沿街撒行道树，读 `city.rusd` 里那棵树的 radius，形成 cook 依赖
+#
+# 街区没有 USD 输入（它从参数长出来）；行道树把 `input` 交给原型，域由 `domain` 给。
+
+[stage]
+default_prim = "/World"
+seed = 20261116
+
+[operator.Blocks]
+operator    = "street_grid"
+description = "生成街区与建筑（高度按分区分布采样）"
+output      = "city_blocks.rusd:/World/City"
+blocks_x      = 6
+blocks_y      = 6
+block_size    = [60.0, 60.0]
+street_width  = 12.0
+lot_width     = 18.0
+margin        = 4.0
+occupancy     = 0.9
+floor_height  = 3.2
+height        = { dist = "normal", mu = 24.0, sigma = 10.0 }
+zone          = "commercial"
+max_prims     = 20000
+seed          = 7
+
+[operator.StreetProps]
+operator    = "scatter"
+description = "沿街撒行道树（读 Tree 原型 radius，形成 cook 依赖）"
+output      = "city_props.rusd:/World/StreetProps"
+input       = "city.rusd:/World/Prototypes/Tree"
+count     = 300
+max_prims = 300
+domain    = { dist = "rect", w = 420.0, h = 420.0 }
+scale     = { dist = "uniform", min = 0.8, max = 1.3 }
+seed      = 23

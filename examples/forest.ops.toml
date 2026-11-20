@@ -1,0 +1,20 @@
+# rusd 0.1 — 示例：一片确定性松林
+#
+# 算子图：RusdScatter 在矩形域里撒 500 棵松树，原型是 `forest.rusd` 里那个 Sphere。
+# 撒布的采样流按 (stage.seed, 节点路径, 节点 seed) 键控，改别的节点不 reshuffle。
+
+[stage]
+default_prim = "/World"
+seed = 20261116
+
+[operator.Forest]
+operator    = "scatter"
+description = "一片确定性松林"
+output      = "forest_out.rusd:/World/Forest"
+input       = "forest.rusd:/World/Prototypes/Pine"
+count     = 500
+max_prims = 2000
+domain    = { dist = "rect", w = 100.0, h = 100.0 }
+scale     = { dist = "uniform", min = 0.8, max = 1.4 }
+yaw       = { dist = "uniform", min = 0.0, max = 360.0 }
+seed      = 42
