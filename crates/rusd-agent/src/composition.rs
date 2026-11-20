@@ -121,11 +121,11 @@ fn declared_inputs(op: &CookOp, stage: &Stage) -> Vec<DeclaredInput> {
                 value: value.clone(),
                 asset: parsed.as_ref().and_then(|p| p.asset.clone()),
                 prim: prim.clone(),
-                structure: structure_of(
-                    parsed.as_ref().and_then(|p| p.asset.as_deref()),
-                    prim.as_deref(),
-                    stage,
-                ),
+                // **The hierarchy is the set of declared slots themselves** (v1.13): the
+                // operator's schema is `{points, prototype}` and that set *is* its USD
+                // hierarchy — the names are the levels. What each names in the stage is the
+                // value the row stands for, reported as `value`.
+                structure: vec![(slot.clone(), None)],
             }
         })
         .collect()
@@ -1573,3 +1573,4 @@ fn reference_json(r: &sdf::Reference) -> Value {
 fn payload_json(p: &sdf::Payload) -> Value {
     json!({ "asset": p.asset_path, "path": p.prim_path.as_str() })
 }
+
