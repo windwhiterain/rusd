@@ -161,6 +161,8 @@ fn fs_outline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
 /// CPU side can hand them to egui, whose textures are sampled as gamma
 /// (`egui`'s `fs_main_gamma_framebuffer`). Same as `rusd_render`.
 const BEAUTY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+/// The format egui is handed the beauty texture under: the same bytes, **no sRGB decode**.
+const DISPLAY_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const ID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
@@ -203,6 +205,9 @@ pub struct Viewport {
     // Targets, rebuilt on resize.
     beauty_tex: wgpu::Texture,
     beauty_view: wgpu::TextureView,
+    /// The same texture as [`Self::beauty_view`], under [`DISPLAY_FORMAT`]: what a UI is
+    /// handed, so egui samples the sRGB bytes without decoding them again.
+    beauty_display: wgpu::TextureView,
     id_tex: wgpu::Texture,
     id_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
@@ -468,6 +473,7 @@ impl Viewport {
             matrix_bytes: 0,
             beauty_tex: targets.beauty_tex,
             beauty_view: targets.beauty_view,
+            beauty_display: targets.beauty_display,
             id_tex: targets.id_tex,
             id_view: targets.id_view,
             depth_view: targets.depth_view,
@@ -519,8 +525,13 @@ impl Viewport {
     }
 
     /// The beauty texture, for a UI to display without a CPU round trip.
+    ///
+    /// This is the **display** view (v1.11): the same bytes as the render target, under
+    /// [`DISPLAY_FORMAT`] so egui's shader — which treats a sampled texel as already
+    /// gamma-encoded — shows the picture the PNG holds. Handing egui the sRGB view made
+    /// the window show `linear(capture)`: 140,178,216 where the capture had 196,218,237.
     pub fn beauty_view(&self) -> &wgpu::TextureView {
-        &self.beauty_view
+        &self.beauty_display
     }
 
     /// Resize the render targets (the camera and scene are untouched, so a
@@ -536,6 +547,7 @@ impl Viewport {
         let targets = Targets::new(&self.device, width, height);
         self.beauty_tex = targets.beauty_tex;
         self.beauty_view = targets.beauty_view;
+        self.beauty_display = targets.beauty_display;
         self.id_tex = targets.id_tex;
         self.id_view = targets.id_view;
         self.depth_view = targets.depth_view;
@@ -594,8 +606,13 @@ impl Viewport {
     /// one prim's vertices instead of the scene's. `None` means "diff the whole scene",
     /// which is what a fresh snapshot needs: it still bakes nothing whose signature
     /// matches the slab already on the GPU.
-    pub fn set_scene(&mut self, geo: &SceneGeometry) {
-        self.sync(geo, &std::collections::BTreeMap::new(), None);
+    ///
+    /// `scope` is what a prim `geo` does not mention *is*: gone (`Scope::Whole`, a new
+    /// composition) or merely hidden (`Scope::Filtered`, 「只看选中」 on). A hidden prim
+    /// keeps its slab, so turning the filter off costs nothing — v1.11: a filter is not
+    /// a scene change.
+    pub fn set_scene(&mut self, geo: &SceneGeometry, scope: Scope) {
+        self.sync(geo, &std::collections::BTreeMap::new(), None, scope);
     }
 
     /// The same, with a few prims moved: `overrides` maps a prim path to the
@@ -610,9 +627,10 @@ impl Viewport {
         &mut self,
         geo: &SceneGeometry,
         overrides: &std::collections::BTreeMap<String, [f64; 3]>,
+        scope: Scope,
     ) {
         let only: std::collections::BTreeSet<String> = overrides.keys().cloned().collect();
-        self.sync(geo, overrides, Some(&only));
+        self.sync(geo, overrides, Some(&only), scope);
     }
 
     fn sync(
@@ -620,6 +638,7 @@ impl Viewport {
         geo: &SceneGeometry,
         overrides: &std::collections::BTreeMap<String, [f64; 3]>,
         only: Option<&std::collections::BTreeSet<String>>,
+        scope: Scope,
     ) {
         let vertex_stride = std::mem::size_of::<Vertex>() as u64;
         self.uploaded += 1;
@@ -789,29 +808,46 @@ impl Viewport {
                     vcount,
                     istart,
                     icount,
+                    shown: true,
                 },
             );
             self.rewritten += 1;
             self.write_prim(&item.path, id, want);
         }
-        // Prims the scene no longer has: their ids stay (a pick may still name one for
-        // a frame), their slabs become waste.
-        let gone: Vec<String> = self
-            .slots
-            .keys()
-            .filter(|p| !live.contains(p.as_str()))
-            .cloned()
-            .collect();
-        for path in gone {
-            if let Some(slot) = self.slots.remove(&path) {
-                self.live_vertices = self.live_vertices.saturating_sub(slot.vcount);
-                self.live_indices = self.live_indices.saturating_sub(slot.icount);
+        // A prim the scene no longer mentions is either **gone** or merely **hidden**:
+        // the two look the same here, and only the caller knows which. Gone frees its
+        // slab (a composition changed); hidden keeps it and draws nothing (v1.11 — turning
+        // 「只看选中」 off must not re-bake the scene).
+        match scope {
+            Scope::Whole => {
+                let gone: Vec<String> = self
+                    .slots
+                    .keys()
+                    .filter(|p| !live.contains(p.as_str()))
+                    .cloned()
+                    .collect();
+                for path in gone {
+                    if let Some(slot) = self.slots.remove(&path) {
+                        self.live_vertices = self.live_vertices.saturating_sub(slot.vcount);
+                        self.live_indices = self.live_indices.saturating_sub(slot.icount);
+                    }
+                }
+                // Whatever is left is in the composition, so it is drawn: a prim that was
+                // hidden by a filter and stayed unchanged never reached the loop above.
+                for slot in self.slots.values_mut() {
+                    slot.shown = true;
+                }
+            }
+            Scope::Filtered => {
+                for (path, slot) in self.slots.iter_mut() {
+                    slot.shown = live.contains(path.as_str());
+                }
             }
         }
         // The draws the slabs leave: contiguous runs merge, so an arena whose slabs were
         // appended together is one draw, and a fragmented one a few more.
         let mut runs: Vec<(u32, u32)> = Vec::new();
-        let mut slabs: Vec<&Slot> = self.slots.values().collect();
+        let mut slabs: Vec<&Slot> = self.slots.values().filter(|s| s.shown).collect();
         slabs.sort_by_key(|s| s.istart);
         for slot in slabs {
             if slot.icount == 0 {
@@ -1203,7 +1239,15 @@ impl Viewport {
 
 struct Targets {
     beauty_tex: wgpu::Texture,
+    /// The render target: `Rgba8UnormSrgb`, so the hardware encodes what `fs_beauty`
+    /// writes (a linear colour) into the sRGB bytes `capture` reads back.
     beauty_view: wgpu::TextureView,
+    /// The **same bytes**, handed to egui: a `Rgba8Unorm` view, i.e. no sRGB decode on
+    /// the sample. egui's shader expects a texel it samples to be *gamma-encoded* (its own
+    /// comment: “We expect "normal" textures that are NOT sRGB-aware”) and converts from
+    /// there — so an sRGB view would decode a second time and the window would show
+    /// `linear(capture)`: measured 196,218,237 in the PNG against 140,178,216 on screen.
+    beauty_display: wgpu::TextureView,
     id_tex: wgpu::Texture,
     id_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
@@ -1228,7 +1272,9 @@ impl Targets {
                 // Sampled by egui itself (v1.10): the frame is shown straight from this
                 // texture, so it has to be bindable.
                 | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
+            // …through the non-sRGB view below (v1.11: the window was showing the picture
+            // once too dark because egui decoded an already-decoded texel).
+            view_formats: &[DISPLAY_FORMAT],
         });
         let id_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("viewer-prim-id"),
@@ -1255,11 +1301,17 @@ impl Targets {
             view_formats: &[],
         });
         let beauty_view = beauty_tex.create_view(&Default::default());
+        let beauty_display = beauty_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("viewer-beauty-display"),
+            format: Some(DISPLAY_FORMAT),
+            ..Default::default()
+        });
         let id_view = id_tex.create_view(&Default::default());
         let depth_view = depth_tex.create_view(&Default::default());
         Self {
             beauty_tex,
             beauty_view,
+            beauty_display,
             id_tex,
             id_view,
             depth_view,
@@ -1372,6 +1424,17 @@ fn device_err(e: impl std::fmt::Display) -> Vec<Diagnostic> {
 /// One prim's slab in the two scene buffers (v1.10). `vstart` is in vertices, `istart`
 /// in indices; the slab's indices are **absolute** (already biased by `vstart`), which is
 /// what lets a slab be rewritten in place or skipped altogether.
+/// What a prim that `set_scene`'s geometry does not mention is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// A whole composition: a prim the scene lacks is **gone** (its slab becomes free
+    /// space).
+    Whole,
+    /// A filter over a scene already on the GPU: a prim the scene lacks is **hidden** —
+    /// its slab stays and simply draws nothing, so lifting the filter re-bakes nothing.
+    Filtered,
+}
+
 /// One prim's slab in the two scene buffers (v1.10). `vstart` is in vertices, `istart`
 /// in indices; the slab's indices are **absolute** (already biased by `vstart`), which is
 /// what lets a slab be rewritten in place, skipped, or copied device-to-device unchanged.
@@ -1384,6 +1447,9 @@ struct Slot {
     vcount: u32,
     istart: u32,
     icount: u32,
+    /// Whether this slab is drawn: a filter clears it without freeing the slab, so the
+    /// prim's geometry is still there the moment it comes back.
+    shown: bool,
 }
 
 /// The vertices and indices one prim needs.

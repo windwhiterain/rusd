@@ -1038,7 +1038,7 @@ impl RenderWorker {
                             geometry,
                             bounds: b,
                         } => {
-                            viewport.set_scene(&geometry);
+                            viewport.set_scene(&geometry, crate::gpu::Scope::Whole);
                             bounds = b;
                             // **This is the render thread's own camera, and its only
                             // source besides a `View` command.** The composed scene
@@ -1081,8 +1081,19 @@ impl RenderWorker {
                             if wanted != isolated {
                                 isolated = wanted;
                                 if let Some(geo) = &scene {
-                                    let filter = isolated.as_deref();
-                                    viewport.set_scene(&crate::scene::isolate(geo, filter));
+                                    // **A filter is not a scene change** (v1.11): the prims
+                                    // it hides keep their slabs on the GPU, so turning
+                                    // 「只看选中」 back off costs nothing at all — no
+                                    // re-bake, no upload, no clone of the scene.
+                                    match isolated.as_deref() {
+                                        Some(filter) => viewport.set_scene(
+                                            &crate::scene::isolate(geo, Some(filter)),
+                                            crate::gpu::Scope::Filtered,
+                                        ),
+                                        None => {
+                                            viewport.set_scene(geo, crate::gpu::Scope::Whole)
+                                        }
+                                    }
                                 }
                             }
                             dirty = true;
@@ -1109,7 +1120,12 @@ impl RenderWorker {
                                     .as_deref()
                                     .map(|filter| crate::scene::isolate(geo, Some(filter)));
                                 let shown = filtered.as_ref().unwrap_or(geo);
-                                viewport.set_scene_with_translates(shown, &overrides);
+                                let scope = if filtered.is_some() {
+                                    crate::gpu::Scope::Filtered
+                                } else {
+                                    crate::gpu::Scope::Whole
+                                };
+                                viewport.set_scene_with_translates(shown, &overrides, scope);
                                 selection = sel;
                                 dirty = true;
                             }

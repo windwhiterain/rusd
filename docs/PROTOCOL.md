@@ -701,3 +701,10 @@ prim**（视口描边高亮 + `comp_node` 详情，与视口 pick 同一条路�
 - **控制 RPC 新增 `translate{path, to}`**：拖动的一次 tick（本地预览，不写文档、不问 server），
   这样「拖动只写 64 字节」这一条不需要 computer use 也能复现——和 `state.frame.matrix_bytes`
   一起就是它的验收。
+- **「只看选中」是过滤，不是改场景**：被隐藏的 prim 的 slab 留在显存里（只把 `shown` 关掉），
+  所以开合「只看选中」= 0 次重烘、0 字节上传（实测 `rewritten: 0`，帧 ~3 ms；之前是 2399 次
+  重烘、~26–65 ms）。换合成（点另一层）才算场景变了，那时才回收 slab。
+- **屏幕直显的那张纹理要交给 egui 一个非 sRGB 视图**：egui 的 shader 假定采到的 texel 已经是
+gamma 编码（“We expect "normal" textures that are NOT sRGB-aware”），之前给的是 sRGB 视图，
+硬件多解一次码，窗口显示的其实是 `linear(capture)`（PNG 里的 (196,218,237) 在屏幕上是
+(140,178,216)）。现在同一个 texture 再开一个 `Rgba8Unorm` 视图给 egui，屏幕与 PNG 同色。
