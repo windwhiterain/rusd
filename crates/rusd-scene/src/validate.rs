@@ -113,17 +113,6 @@ pub fn validate(doc: &ParsedDocument) -> Vec<Diagnostic> {
                 }
                 continue;
             }
-            // **A named structure records where it lives in a property of its own name**
-            // (v1.13): `/World/Boxes/prototype` carries `prototype = "box.rusd:/World/Prototypes/Box"`,
-            // and no schema table has a word for it — the name is the operator's, and the
-            // structure it names is exactly what the file must be able to say. A string on a
-            // prim whose own leaf is that name is that record, not a typo.
-            {
-                let leaf = prim.path.as_str().rsplit('/').next().unwrap_or_default();
-                if name == leaf && matches!(val, Value::String(_)) {
-                    continue;
-                }
-            }
             match schema::prop_type(prim.schema.as_str(), name) {
                 Some(ty) => {
                     if !type_ok(val, ty) {

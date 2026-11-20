@@ -88,6 +88,13 @@ pub fn data_to_document(
             }
         }
         for name in property_names(data, &path) {
+            if schema::prop_type(&type_name, &name).is_none() {
+                // Rule 6 of the format: a property the schema table cannot type is not
+                // written at all, because the reader would have to guess its type from
+                // the value's shape and would guess a different one.
+                rendered.skipped.push(format!("{spelling}.{name}"));
+                continue;
+            }
             let Ok(prop_path) = path.append_property(&name) else {
                 rendered.skipped.push(format!("{spelling}.{name}"));
                 continue;
@@ -102,17 +109,6 @@ pub fn data_to_document(
             let Some(value) = field(data, &prop_path, FieldKey::Default.as_str()) else {
                 continue;
             };
-            // Rule 6 of the format: a property the schema table cannot type is not
-            // written, because the reader would have to guess its type from the value's
-            // shape and would guess a different one. A **string** is the one shape that
-            // needs no guess: a named structure under an operator's prim records the USD
-            // it points at that way, and no schema table has a word for it — the name is
-            // the operator's, and the value says where that structure lives.
-            let typeable = schema::prop_type(&type_name, &name).is_some();
-            if !typeable && !matches!(value, SdfValue::String(_)) {
-                rendered.skipped.push(format!("{spelling}.{name}"));
-                continue;
-            }
             match literal(&value) {
                 Some(text) => out.push_str(&format!("\"{}\" = {text}\n", escape(&name))),
                 None => rendered.skipped.push(format!("{spelling}.{name}")),

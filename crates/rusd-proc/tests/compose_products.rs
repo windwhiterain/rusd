@@ -106,10 +106,10 @@ fn segment_one_cooks_a_usd_per_operator() {
         "the document names the file: {}",
         boxes.layer_path
     );
-    // The sampler's own USD: its output prim, the cloud it computed, and the one input it
-    // declares (`input`), which records the USD it reads and pulls nothing in.
+    // The sampler's own USD: its output prim, the cloud it computed, and the one named
+    // structure it declares — `domain`, the USD it reads.
     let paths = prims_of(samples);
-    for wanted in ["/World/Samples", "/World/Samples/points", "/World/Samples/input"] {
+    for wanted in ["/World/Samples", "/World/Samples/points", "/World/Samples/domain"] {
         assert!(paths.iter().any(|p| p == wanted), "{wanted} in {paths:?}");
     }
     // The instances' USD: its output prim, one prim per instance, and its one input.
@@ -122,10 +122,14 @@ fn segment_one_cooks_a_usd_per_operator() {
         60,
         "one instance prim per point"
     );
-    assert!(
-        paths.iter().any(|p| p == "/World/Boxes/input"),
-        "the one input is a prim: {paths:?}"
-    );
+    // An `instances` operator reads `{points, prototype}`, so both are named structures
+    // under the prim it wrote.
+    for wanted in ["/World/Boxes/points", "/World/Boxes/prototype"] {
+        assert!(
+            paths.iter().any(|p| p == wanted),
+            "{wanted} in {paths:?}"
+        );
+    }
     assert!(
         !paths.iter().any(|p| p.starts_with("/World/Samples")),
         "another operator's things are not in this USD: {paths:?}"

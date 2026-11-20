@@ -147,32 +147,44 @@ fn author_inputs(
     d: &mut dyn sdf::AbstractData,
     base: &str,
     inputs: &[(String, String)],
+    stack: &str,
 ) -> AuthResult {
     for (slot, value) in inputs {
         let child = format!("{base}/{slot}");
-        // A **named structure** is an `Xform`: a container that carries no geometry of its
-        // own (the entry names where the structure lives, the string attribute below says
-        // which). A typeless `def` would be `unknown schema ''` to the reader.
-        PrimSpec::new(d, child.as_str(), Specifier::Def, "Xform")?;
-        // **The structure carries its own name, not a word of the document's** (v1.13, the
-        // user's ruling: 「USD 的 hierarchy 就是算子的 schema」): `domain` holds the USD its
-        // `domain` comes from, `prototype` the one its prototype comes from. `input` is the
-        // operator graph's word for “the one USD this node reads” — it is not part of any
-        // schema, so it is not a name a product should spell.
-        //
-        // The node names its target; it does not pull that USD in (不同的东西在各自的 USD):
-        // a string, no reference, so this file holds only what this operator computed.
-        let mut target = AttributeSpec::new(
-            d,
-            format!("{child}.{slot}").as_str(),
-            "string",
-            Variability::Uniform,
-            false,
-        )?;        target.set_default(SdfValue::String(value.clone()))?;
+        // **The named structure IS the input** (v1.13, the user's ruling: named inputs 用对
+        // usd 树上的对应 named 结构解析来表达): the child carries the reference to the USD and
+        // prim the document named, so what the operator read is readable *through* the
+        // hierarchy. Its type comes through the arc and its location is the arc — no
+        // property is invented for it: an `Xform` has no `domain`, and no schema has a
+        // word for “where this came from”. 不同的东西在各自的 USD：the other file stays the
+        // author of that structure, this one only points at it.
+        PrimSpec::new(d, child.as_str(), Specifier::Def, "")?;
+        let (asset, target) = match value.rfind(':') {
+            Some(i) if i > 0 && value[i + 1..].starts_with('/') => (
+                authored_asset(value).unwrap_or_default(),
+                value[i + 1..].to_owned(),
+            ),
+            // A prim of the picture: authored against this stack, and the writer rewrites
+            // the asset to the file that actually holds that prim.
+            _ => (stack.to_owned(), value.clone()),
+        };
+        let Ok(target) = sdf::path(&target) else {
+            continue;
+        };
+        let child_path = sdf::path(&child)?;
+        let op = sdf::ReferenceListOp::explicit([sdf::Reference {
+            asset_path: asset,
+            prim_path: target,
+            ..Default::default()
+        }]);
+        d.set_field(
+            &child_path,
+            sdf::FieldKey::References.as_str(),
+            SdfValue::ReferenceListOp(op),
+        );
     }
     Ok(())
 }
-
 
 /// `RusdSamplePoints` (v1.5, extended v1.5.8): input geometry becomes a point cloud.
 ///
@@ -238,12 +250,13 @@ impl Generator for RusdSamplePoints {
         let mut layer = sdf::Layer::new_anonymous("rusd_sample_points.usda");
         let ctx_inputs = ctx.inputs.clone();
         let ctx_doc_dir = ctx.doc_dir;
+        let stack_id = ctx.stage().root_layer().identifier().to_owned();
         layer
             .edit(|l| {
                 let d = l.data_mut();
                 PrimSpec::new(d, base.as_str(), Specifier::Def, "Xform")?;
                 author_cloud(d, &cloud, &local)?;
-                author_inputs(d, &base, &ctx_inputs)?;
+                author_inputs(d, &base, &ctx_inputs, &stack_id)?;
                 Ok(())
             })
             .map_err(|e| vec![Diagnostic::error("E_GEN", e.to_string()).at_prim(&base)])?;
@@ -368,6 +381,7 @@ impl Generator for RusdInstances {
         let mut layer = sdf::Layer::new_anonymous("rusd_instances.usda");
         let ctx_inputs = ctx.inputs.clone();
         let ctx_doc_dir = ctx.doc_dir;
+        let stack_id = ctx.stage().root_layer().identifier().to_owned();
         // **The cloud is the other half of the schema** (v1.13): an `instances` node reads
         // `{points, prototype}`. The document declares the prototype and the graph hands
         // the node its cloud, so both are authored under the prim this node wrote, named the
@@ -387,8 +401,8 @@ impl Generator for RusdInstances {
                     let s = sample_dist(&mut rng, scale_dist.as_ref(), 1.0);
                 author_reference(d, &pp, &proto_asset, &proto_path, to_local(inv, *world), s)?;
                 }
-                author_inputs(d, &base, &cloud_slot)?;
-                author_inputs(d, &base, &ctx_inputs)?;                Ok(())
+                author_inputs(d, &base, &cloud_slot, &stack_id)?;
+                author_inputs(d, &base, &ctx_inputs, &stack_id)?;                Ok(())
             })
             .map_err(|e| vec![Diagnostic::error("E_GEN", e.to_string()).at_prim(&base)])?;
         for w in warns {

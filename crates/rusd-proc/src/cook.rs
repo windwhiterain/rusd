@@ -311,10 +311,21 @@ impl CookEngine {
                         if let Some(anchor) = &stack_root_id
                             && asset == anchor.as_str()
                         {
+                            // **The file that holds this prim**: the anchor itself, or the
+                            // anchor a child sits under — an operator's `points` structure
+                            // names a prim inside the file another operator wrote. The
+                            // longest matching anchor wins.
+                            let mut home: Option<(&str, &str)> = None;
                             for (p, file) in &produced_anchors {
-                                if p == prim {
-                                    return Some(name(file));
+                                if prim == *p || prim.starts_with(&format!("{p}/")) {
+                                    let better = home.map(|(best, _)| p.len() > best.len()).unwrap_or(true);
+                                    if better {
+                                        home = Some((p, file));
+                                    }
                                 }
+                            }
+                            if let Some((_, file)) = home {
+                                return Some(name(file));
                             }
                             // A same-stack reference to a prim **the document itself**
                             // authors (`prototype = "/World/Prototypes/Pine"`): no product
