@@ -785,14 +785,28 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     // hierarchy the operator *declares* has exactly the number of entries its document's
     // inputs table has.
     if !layer.inputs.is_empty() {
-        // **The hierarchy is the schema** (v1.13, the user's ruling): an input is shown as
-        // the USD hierarchy it names — one row per level of the prim path, each carrying the
-        // schema that level composes to. No slot name of the document's appears: the
-        // hierarchy itself is the identity of the input.
+        // **The operator's schema is the set of its inputs** (v1.13): `{points, prototype}`
+        // for an `instances` op, `{domain}` for a sampler. That set is what the tree shows,
+        // one row per name; the USD structure a name stands for is the row's tooltip and its
+        // `comp_node`, not a row of its own.
         for input in &layer.inputs {
-            if let Some(root) = structure_rows(&input.structure, &input.slot) {
-                children.push(root);
-            }
+            let (id, prim) = match (&input.asset, &input.prim) {
+                (Some(asset), _) => (asset.clone(), None),
+                (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
+                _ => continue,
+            };
+            children.push(TreeNode {
+                id,
+                kind: TreeNodeKind::Arc,
+                label: input.slot.clone(),
+                prim: prim.clone(),
+                op: false,
+                root: false,
+                session: false,
+                secondary: Some(if prim.is_some() { "render" } else { "open" }.to_owned()),
+                hover: Some(input.value.clone()),
+                children: Vec::new(),
+            });
         }
 
         return TreeNode {
@@ -1938,6 +1952,7 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
 
 
