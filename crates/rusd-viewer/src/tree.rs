@@ -720,44 +720,30 @@ fn hierarchy_rows(paths: &[String]) -> Vec<TreeNode> {
 fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     let mut children: Vec<TreeNode> = Vec::new();
     // **An operator's children are exactly the inputs its document declares** (v1.13):
-    // `points` and `prototype` for an `instances` op, `domain` for a sampler — two rows,
-    // one row. The output is the row itself (the layer it wrote), and the arcs a product
-    // happens to author are not declarations, so neither is drawn here.
+    // `points` and `prototype` for an `instances` op, one `domain` for a sampler — one row
+    // each, `name → the USD structure it names`, and nothing else. The output is the row
+    // itself (the layer the operator wrote) and the arcs a product happens to author are
+    // composition detail, so neither is a child here.
     if !layer.inputs.is_empty() {
         for input in &layer.inputs {
-            let structure: Vec<TreeNode> = match (&input.asset, &input.prim) {
-                (Some(asset), Some(prim)) => vec![TreeNode {
-                    id: asset.clone(),
-                    kind: TreeNodeKind::Arc,
-                    label: format!(
-                        "reference \u{2192} {}",
-                        strip_anon_prefix(asset).rsplit(['/', '\\']).next().unwrap_or(asset)
-                    ),
-                    prim: None,
-                    op: false,
-                    root: false,
-                    session: false,
-                    secondary: Some("open".to_owned()),
-                    hover: Some(input.value.clone()),
-                    children: hierarchy_rows(&[prim.clone()]),
-                }],
-                (None, Some(prim)) => hierarchy_rows(&[prim.clone()]),
-                _ => Vec::new(),
+            let (id, prim) = match (&input.asset, &input.prim) {
+                (Some(asset), _) => (asset.clone(), None),
+                (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
+                _ => continue,
             };
-            let stack_prim = input.prim.clone().filter(|_| input.asset.is_none());
             children.push(TreeNode {
-                id: format!("input:{}", input.slot),
+                id,
                 kind: TreeNodeKind::Arc,
-                label: input.slot.clone(),
-                prim: stack_prim.clone(),
+                // The name is what the document calls the input; the right-hand side is
+                // the USD structure it names, spelled as the document spells it.
+                label: format!("{} \u{2192} {}", input.slot, input.value),
+                prim: prim.clone(),
                 op: false,
                 root: false,
                 session: false,
-                // A name is what the input is called; the structure under it is what it
-                // reads. Clicking the name renders that structure.
-                secondary: Some(if stack_prim.is_some() { "render" } else { "open" }.to_owned()),
+                secondary: Some(if prim.is_some() { "render" } else { "open" }.to_owned()),
                 hover: Some(input.value.clone()),
-                children: structure,
+                children: Vec::new(),
             });
         }
         return TreeNode {
@@ -773,6 +759,8 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
             children,
         };
     }
+
+
 
     for group in arc_groups(tree, &layer.id) {        // A leaf naming the target layer (see `roots`): the edge is visible, and
         // the branch it points at is not copied.
@@ -1897,6 +1885,7 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
 
 
