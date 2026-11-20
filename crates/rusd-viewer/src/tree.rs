@@ -824,15 +824,14 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         });
     }
 
-    // **The USD hierarchy the operator declares — that *is* its inputs and outputs**
-    // (v1.13): there is no separate slot name, because a slot's name is the document's
-    // bookkeeping and the structure is the name. An input that names another layer is a
-    // branch rooted at that `reference`, its prim path underneath; every other input and
-    // output is a branch of this stack's own paths, merged so a shared prefix is one branch.
-    let mut named: Vec<String> = layer.outputs.clone();
+    // **Each input is a branch named by its slot, and its content is the USD structure
+    // it reads** (v1.13). `domain` / `points` / `prototype` are the names the document
+    // gives its inputs — an input has to be nameable — and what a name stands for is a
+    // named USD structure: `terrain.rusd`'s `/World/Terrain`, or `/World/Samples/points`
+    // in this stack. The hierarchy is the branch's content, not a label beside a name.
     for input in &layer.inputs {
-        match (&input.asset, &input.prim) {
-            (Some(asset), Some(prim)) => children.push(TreeNode {
+        let structure: Vec<TreeNode> = match (&input.asset, &input.prim) {
+            (Some(asset), Some(prim)) => vec![TreeNode {
                 id: asset.clone(),
                 kind: TreeNodeKind::Arc,
                 label: format!(
@@ -846,12 +845,27 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 secondary: None,
                 hover: Some(input.value.clone()),
                 children: hierarchy_rows(&[prim.clone()]),
-            }),
-            (None, Some(prim)) => named.push(prim.clone()),
-            _ => {}
-        }
+            }],
+            (None, Some(prim)) => hierarchy_rows(&[prim.clone()]),
+            _ => Vec::new(),
+        };
+        let stack_prim = input.prim.clone().filter(|_| input.asset.is_none());
+        children.push(TreeNode {
+            id: format!("input:{}", input.slot),
+            kind: TreeNodeKind::Arc,
+            label: input.slot.clone(),
+            prim: stack_prim.clone(),
+            op: false,
+            root: false,
+            session: false,
+            secondary: stack_prim.as_ref().map(|_| "render".to_owned()),
+            hover: Some(input.value.clone()),
+            children: structure,
+        });
     }
-    children.extend(hierarchy_rows(&named));
+    // The output half: the structures the operator writes, by their paths.
+    children.extend(hierarchy_rows(&layer.outputs));
+
 
 
     // **No prim rows.** v1.3 (user ruling, `docs/PROTOCOL.md`): a city stack has
@@ -1872,4 +1886,5 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
