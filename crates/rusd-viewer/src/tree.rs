@@ -777,17 +777,44 @@ fn structure_rows(structure: &[(String, Option<String>)]) -> Option<TreeNode> {
 /// One layer's branch: its arcs and the prims it authors.
 fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     let mut children: Vec<TreeNode> = Vec::new();
-    // **An operator's children are the USD hierarchies its inputs name** (v1.13): every
-    // level of the path, labelled with the **schema** that level composes to — `/World`
-    // is an `Xform`, `/World/Terrain` a `Mesh` — because that hierarchy *is* what the
-    // operator reads. There is no separate slot name: `domain` is the document's word for
-    // it, and the document is not USD. The output is the row itself, and the arcs a
-    // product happens to author are composition detail, so neither is a child here.
+    // **An operator's hierarchy is its inputs — one row each, and nothing else** (v1.13):
+    // `points` and `prototype` for an `instances` op, one `domain` for a sampler. What a row
+    // stands for (the USD structure it names, level by level, with each level's schema) is
+    // the row's own detail — its tooltip and its `comp_node` — not rows hung under it: the
+    // hierarchy the operator *declares* has exactly the number of entries its document's
+    // inputs table has.
     if !layer.inputs.is_empty() {
         for input in &layer.inputs {
-            if let Some(root) = structure_rows(&input.structure) {
-                children.push(root);
-            }
+            let (id, prim) = match (&input.asset, &input.prim) {
+                (Some(asset), _) => (asset.clone(), None),
+                (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
+                _ => continue,
+            };
+            let structure = input
+                .structure
+                .iter()
+                .map(|(path, schema)| match schema {
+                    Some(schema) => format!("{path} : {schema}"),
+                    None => path.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(" / ");
+            children.push(TreeNode {
+                id,
+                kind: TreeNodeKind::Arc,
+                label: input.slot.clone(),
+                prim: prim.clone(),
+                op: false,
+                root: false,
+                session: false,
+                secondary: Some(if prim.is_some() { "render" } else { "open" }.to_owned()),
+                hover: Some(if structure.is_empty() {
+                    input.value.clone()
+                } else {
+                    format!("{} = {structure}", input.value)
+                }),
+                children: Vec::new(),
+            });
         }
         return TreeNode {
             id: layer.id.clone(),
@@ -802,6 +829,8 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
             children,
         };
     }
+
+
 
 
 
@@ -1930,6 +1959,7 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
 
 
