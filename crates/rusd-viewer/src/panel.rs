@@ -484,6 +484,33 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
     action
 }
 
+/// The action a click **at `depth`** asks for: the same action, with the depth of the row
+/// that was clicked written into its selection.
+///
+/// Two rows of one tree can answer to one `comp_node` id — an operator's `input` row and
+/// the schema entry that names the same structure — so "which node" is not enough to say
+/// which row lit. The shell ignores the depth; it is the panel's own bookkeeping.
+fn at_depth(action: TreeAction, depth: usize) -> TreeAction {
+    match action {
+        TreeAction::Render(mut selection) => {
+            selection.depth = Some(depth);
+            TreeAction::Render(selection)
+        }
+        TreeAction::Select(mut selection) => {
+            selection.depth = Some(depth);
+            TreeAction::Select(selection)
+        }
+        TreeAction::Layer { mut selection, ask } => {
+            selection.depth = Some(depth);
+            TreeAction::Layer { selection, ask }
+        }
+        TreeAction::None => TreeAction::None,
+        // An action that carries no selection of its own (a preview stop, the refresh
+        // button): the depth has nothing to say about it.
+        other => other,
+    }
+}
+
 /// One row, and its subtree. Returns what a click asked for, if anything.
 ///
 /// `root` -- the index of the top-level row this subtree hangs from -- is part of the
@@ -517,6 +544,7 @@ fn row(
     let is_selected = selected.is_some_and(|s| {
         s.id == node.id
             && s.kind == node.kind
+            && s.depth.is_none_or(|d| d == depth)
             && (node.kind != TreeNodeKind::Layer || depth == 0)
     });
     // A row that is **the current preview** is marked too: the user needs to see where
@@ -577,7 +605,7 @@ fn row(
             }
             if response.clicked() {
                 // The same rule as every other row: a control layer row is a layer row.
-                clicked = Some(click_action(node));
+                clicked = Some(at_depth(click_action(node), depth));
             }
             // v1.5: the row's second half — `{input} → {output summary}` — is drawn
             // **beside** the title and is not itself a control: one row, one click,
@@ -601,7 +629,7 @@ fn row(
                 *scroll_to = None;
             }
             if response.clicked() {
-                clicked = Some(click_action(node));
+                clicked = Some(at_depth(click_action(node), depth));
             }
         });
     } else {
@@ -628,28 +656,50 @@ fn row(
             indent(ui, depth);
             // The chevron. A row with nothing to open still gets the column's width, so
             // the titles of a tree line up whatever branch they are on.
-            let chevron = if node.children.is_empty() {
-                "  "
-            } else if open {
-                "\u{25be}"
-            } else {
-                "\u{25b8}"
-            };
+            //
+            // **The triangle is drawn, not a glyph** (the user's 方框: `▸`/`▾` are not in
+            // the CJK face this window loads — msyh.ttc has no U+25B8/U+25BE — so they
+            // came out as tofu). A shape has no font.
             let enabled = !node.children.is_empty();
-            let arrow = ui
-                .add_enabled_ui(enabled, |ui| {
-                    ui.add(egui::Button::new(chevron).frame(false))
-                })
-                .inner
-                .on_hover_text(if enabled {
-                    if open {
-                        "收起"
-                    } else {
-                        "展开这一行的子节点"
-                    }
+            let sense = if enabled {
+                egui::Sense::click()
+            } else {
+                egui::Sense::hover()
+            };
+            let (rect, arrow) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), sense);
+            if enabled {
+                let color = if arrow.hovered() {
+                    ui.visuals().strong_text_color()
                 } else {
-                    ""
-                });
+                    ui.visuals().text_color()
+                };
+                let c = rect.center();
+                let r = 3.5;
+                let points = if open {
+                    vec![
+                        egui::pos2(c.x - r, c.y - r * 0.6),
+                        egui::pos2(c.x + r, c.y - r * 0.6),
+                        egui::pos2(c.x, c.y + r * 0.8),
+                    ]
+                } else {
+                    vec![
+                        egui::pos2(c.x - r * 0.6, c.y - r),
+                        egui::pos2(c.x + r * 0.8, c.y),
+                        egui::pos2(c.x - r * 0.6, c.y + r),
+                    ]
+                };
+                ui.painter()
+                    .add(egui::Shape::convex_polygon(points, color, egui::Stroke::NONE));
+            }
+            let arrow = arrow.on_hover_text(if enabled {
+                if open {
+                    "收起"
+                } else {
+                    "展开这一行的子节点"
+                }
+            } else {
+                ""
+            });
             if arrow.clicked() && enabled {
                 open = !open;
                 ui.data_mut(|d| d.insert_temp(id.with("open"), open));
@@ -662,7 +712,7 @@ fn row(
                 *scroll_to = None;
             }
             if response.clicked() {
-                clicked = Some(click_action(node));
+                clicked = Some(at_depth(click_action(node), depth));
             }
             subtitle(ui, node);
         });

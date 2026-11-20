@@ -2779,6 +2779,7 @@ impl Shell {
                     id: id.clone(),
                     kind: crate::tree::TreeNodeKind::Prim,
                     prim: Some(path.to_owned()),
+                    depth: None,
                 });
                 self.ask_node(&id);
             }

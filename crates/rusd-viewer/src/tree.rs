@@ -1974,8 +1974,15 @@ pub struct TreeSelection {
     pub id: String,
     pub kind: TreeNodeKind,
     pub prim: Option<String>,
+    /// **Which row of the drawn tree was clicked** — the depth it was drawn at, when the
+    /// click came from the panel. One tree can draw two rows answering to one
+    /// `comp_node` id: an operator's `input` row and the schema entry naming that same
+    /// structure are the same node, and a selection that named only the node lit both
+    /// (the user: 点 `prototype` 把 `input` 本身也选中了). `None` for a selection that did
+    /// not come from a row — a viewport pick — and then every row standing for that node
+    /// is marked.
+    pub depth: Option<usize>,
 }
-
 impl TreeSelection {
     /// Build one from a row.
     pub fn of(node: &TreeNode) -> Self {
@@ -1983,8 +1990,8 @@ impl TreeSelection {
             id: node.id.clone(),
             kind: node.kind,
             prim: node.prim.clone(),
-        }
-    }
+            depth: None,
+        }    }
 }
 
 /// The clipboard payload a tree click produces: a prim path for a row that
