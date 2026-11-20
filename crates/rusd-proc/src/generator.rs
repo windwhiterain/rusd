@@ -343,7 +343,7 @@ impl<'a> GenContext<'a> {
     /// `Xformable` without `MaterialBindingAPI` passes a slot that asks only for the class
     /// and fails one that asks for both.
     pub fn expect_slot(&mut self, raw: &str, operator: &str, slot: &str, base: &str) {
-        let Some(port) = rusd_scene::operator::input(operator, slot) else {
+        let Some(port) = rusd_script::ops::input(operator, slot) else {
             // A port the operator does not declare asks nothing; the read that wanted it
             // is the one that reports.
             return;

@@ -426,7 +426,7 @@ impl CookEngine {
 /// reported against the node all the same — the document is what named the operator, and
 /// nothing else would tell the author that the operator did not do what it says.
 fn check_output(op: &CookOp, diags: &mut Vec<Diagnostic>) {
-    let ports = rusd_scene::operator::outputs(&op.generator);
+    let ports = rusd_script::ops::outputs(&op.generator);
     if ports.is_empty() {
         return;
     }

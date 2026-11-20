@@ -324,11 +324,75 @@ fn main() {
                 Err(diags) => print_diags(&diags),
             }
         }
+        Some("script") => script_command(&args[1..]),
         Some(other) => {
             eprintln!("rusd: '{other}' is not implemented yet — see docs/ROADMAP.md");
             std::process::exit(2);
         }
     }
+}
+
+/// **`rusd script check|run <file.rs>`** (SPEC D15): an operator is a Rust function, and
+/// compiling the script that calls them *is* the type check.
+///
+/// `check` answers rustc's diagnostics as JSON — a wrong wire is `E_SCRIPT_TYPE` at the
+/// script's own line, before anything runs. `run` compiles and runs; the script writes
+/// its own `.ops.toml` and `.rusd` files, with the workspace root as its cwd. Arguments
+/// after the script path are passed to it.
+fn script_command(args: &[String]) {
+    let usage = "usage: rusd script check|run <file.rs> [args…]";
+    let (Some(action), Some(path)) = (args.first().map(String::as_str), args.get(1)) else {
+        eprintln!("{usage}");
+        std::process::exit(2);
+    };
+    let script = std::path::Path::new(path);
+    let runner = match rusd_script::runner::Runner::discover(script) {
+        Ok(r) => r,
+        Err(e) => print_diags(&[rusd_core::Diagnostic::error("E_SCRIPT", e)]),
+    };
+    match action {
+        "check" => match runner.check(script) {
+            Ok(diags) => {
+                for d in &diags {
+                    println!("{}", d.to_json());
+                }
+                println!("{{\"ok\":true,\"script\":{}}}", json_string(path));
+            }
+            Err(diags) => print_diags(&diags),
+        },
+        "run" => match runner.run(script, &args[2..]) {
+            Ok(run) => {
+                for d in &run.diags {
+                    println!("{}", d.to_json());
+                }
+                print!("{}", run.stdout);
+                eprint!("{}", run.stderr);
+                if run.status != 0 {
+                    std::process::exit(run.status);
+                }
+            }
+            Err(diags) => print_diags(&diags),
+        },
+        other => {
+            eprintln!("rusd script: '{other}' is not check or run\n{usage}");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// A JSON string, for the one summary line `script check` prints.
+fn json_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// The directory of `path`, which a relative asset path in a generator parameter

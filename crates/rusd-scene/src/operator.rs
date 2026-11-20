@@ -14,6 +14,14 @@
 //! A node's slot constraint is the same two halves a USD prim's type has: the typed
 //! schema it must be (the class) and the API schemas it must have applied (the
 //! interfaces), which is what [`SlotSchema`] spells and [`unmet`] answers.
+//!
+//! **The vocabulary lives here; the operators do not** (D15). An operator is a Rust
+//! function in `rusd-script`, and its signature — the Rust types of its input and
+//! output ports — *is* its schema. [`Shape`] is the owned description those types
+//! produce, so the cook's runtime check and the script's compile-time check read one
+//! declaration instead of two tables that can disagree. What stays here is what a
+//! hand-written `.ops.toml` still needs: the parameter tables ([`parameters`]) and
+//! the checker ([`conform`]) over the shapes the operators declare.
 
 use crate::schema::PropDef;
 
@@ -35,12 +43,19 @@ use openusd::usd::{Prim, SchemaRegistry};
 /// `ty` is a typed schema, concrete or abstract, and a prim satisfies it by **being** it
 /// or deriving from it; an empty `ty` claims nothing about the prim's own type (an
 /// instance prim authors none — its type composes through its arc).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SlotSchema {
-    /// The typed schema — the class.
-    pub ty: &'static str,
+    /// The typed schema — the class. Empty claims nothing about the prim's own type.
+    pub ty: std::string::String,
     /// The applied API schemas — the interfaces. Empty when the port asks for none.
-    pub apis: &'static [&'static str],
+    pub apis: Vec<std::string::String>,
+}
+
+impl SlotSchema {
+    /// A class with no interfaces asked of it.
+    pub fn ty(ty: &str) -> Self {
+        Self { ty: ty.to_owned(), apis: Vec::new() }
+    }
 }
 
 /// **The shape of one port's payload** — what an operator reads or writes.
@@ -60,7 +75,12 @@ pub struct SlotSchema {
 /// the port's prim must be, and the composition around it says how many parts there are
 /// and how they nest. Nothing here describes a prim's attributes; a shape says what
 /// flows, and the one who reads the flow checks it.
-#[derive(Clone, Copy, Debug)]
+///
+/// **Owned, because a Rust type produces it** (D15): `rusd-script`'s `ShapeOf` walks
+/// the operator's own port types — `Prim<Cube>`, `Vec`-like runs, fixed arrays, named
+/// structs — and builds this description from them. A `&'static` table could only be
+/// written by hand, which is the second declaration D15 removes.
+#[derive(Clone, Debug, PartialEq)]
 pub enum Shape {
     /// One prim: the type it must be, and the API schemas it must have.
     Prim(SlotSchema),
@@ -69,45 +89,25 @@ pub enum Shape {
     /// **A struct**: named parts, each its own shape. On the wire a part is a child
     /// prim; a name ending in `*` is a prefix and matches every part that starts with
     /// it, whose shape must then be a [`Shape::List`].
-    Struct(&'static [Port]),
+    Struct(Vec<Port>),
     /// **A list**: any number of `shape`. The length is the data's, not the schema's.
-    List(&'static Shape),
+    List(Box<Shape>),
     /// **An array**: exactly `len` of `shape`.
-    Array { len: u32, of: &'static Shape },
+    Array { len: u32, of: Box<Shape> },
 }
 
 /// One named port of an operator, and the shape of what it carries.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Port {
     /// The port's own name — `domain`, `points`, `prototype`, `blocks`.
-    pub name: &'static str,
+    pub name: std::string::String,
     pub shape: Shape,
 }
 
-/// The ports `operator` reads.
-pub fn inputs(operator: &str) -> &'static [Port] {
-    match operator {
-        "RusdSamplePoints" => SAMPLE_POINTS_INPUTS,
-        "RusdInstances" => INSTANCES_INPUTS,
-        _ => &[],
+impl Port {
+    pub fn new(name: &str, shape: Shape) -> Self {
+        Self { name: name.to_owned(), shape }
     }
-}
-
-/// The parts `operator` writes under the prim it anchors — its output ports.
-pub fn outputs(operator: &str) -> &'static [Port] {
-    match operator {
-        "RusdSamplePoints" => SAMPLE_POINTS_OUTPUTS,
-        "RusdInstances" => INSTANCES_OUTPUTS,
-        "RusdScatter" => SCATTER_OUTPUTS,
-        "RusdGrid" => GRID_OUTPUTS,
-        "RusdStreetGrid" => STREET_GRID_OUTPUTS,
-        _ => &[],
-    }
-}
-
-/// One input port of `operator`, by name.
-pub fn input(operator: &str, name: &str) -> Option<&'static Port> {
-    inputs(operator).iter().find(|port| port.name == name)
 }
 
 /// Which part of a port's shape a wired prim failed.
@@ -115,11 +115,11 @@ pub fn input(operator: &str, name: &str) -> Option<&'static Port> {
 pub enum Miss {
     /// Its `typeName` is not `declared`, nor any schema derived from it.
     Type {
-        declared: &'static str,
+        declared: std::string::String,
         actual: std::string::String,
     },
     /// It does not have `missing` applied.
-    Api { missing: &'static str },
+    Api { missing: std::string::String },
     /// The structure is not what the shape says: a named part is missing, a run is the
     /// wrong length, or a part is not a prim at all.
     Shape { message: std::string::String },
@@ -135,6 +135,7 @@ impl Miss {
             Miss::Api { missing } => format!(
                 "declares `{missing}` applied, and neither the prim nor its type has it"
             ),
+
             Miss::Shape { message } => message.clone(),
         }
     }
@@ -152,18 +153,18 @@ pub fn unmet(
     registry: &SchemaRegistry,
 ) -> Option<Miss> {
     if !declared.ty.is_empty()
-        && !registry.is_a(&tf::Token::from(actual), &tf::Token::from(declared.ty))
+        && !registry.is_a(&tf::Token::from(actual), &tf::Token::from(declared.ty.as_str()))
     {
         return Some(Miss::Type {
-            declared: declared.ty,
+            declared: declared.ty.clone(),
             actual: actual.to_owned(),
         });
     }
     declared
         .apis
         .iter()
-        .find(|api| !applied.iter().any(|has| *has == **api))
-        .map(|missing| Miss::Api { missing })
+        .find(|api| !applied.iter().any(|has| has == api))
+        .map(|missing| Miss::Api { missing: missing.clone() })
 }
 
 /// **Does `prim`, and everything under it the shape names, hold what `shape` says?**
@@ -305,94 +306,13 @@ pub fn parameters(operator: &str) -> Option<&'static [PropDef]> {
 }
 
 // --- The prims the ports' shapes name -------------------------------------
-
-/// A point cloud — what a sampler writes and what an instances node copies along.
-static POINTS: SlotSchema = SlotSchema {
-    ty: "Points",
-    apis: &[],
-};
-/// Any prim USD can place: every geometry, light and camera derives from it.
-static XFORMABLE: SlotSchema = SlotSchema {
-    ty: "Xformable",
-    apis: &[],
-};
-/// A prim that authors **no type of its own**: an instance composes its type through
-/// its `reference` arc, so the layer it is written in holds nothing to compare.
-static ANY_PRIM: SlotSchema = SlotSchema {
-    ty: "",
-    apis: &[],
-};
-static CUBE: SlotSchema = SlotSchema {
-    ty: "Cube",
-    apis: &[],
-};
-static SPHERE: SlotSchema = SlotSchema {
-    ty: "Sphere",
-    apis: &[],
-};
-
-// --- What each operator reads and writes ----------------------------------
-
-/// **A sampler reads a `domain`** — the geometry it samples. `Gprim` is the class that
-/// covers a `Cube` and a `Mesh`; which of them it can draw from is settled where the
-/// geometry is read, because `Points` is a `Gprim` too and has neither a volume nor a
-/// surface. What it writes is one `points` prim: a point cloud.
-static SAMPLE_POINTS_INPUTS: &[Port] = &[Port {
-    name: "domain",
-    shape: Shape::Prim(SlotSchema {
-        ty: "Gprim",
-        apis: &[],
-    }),
-}];
-static SAMPLE_POINTS_OUTPUTS: &[Port] = &[Port {
-    name: "points",
-    shape: Shape::Prim(POINTS),
-}];
-
-/// **An instances node reads** the cloud it copies along and the prim it copies, and
-/// writes **a list** of instances — one per point, so how many is the data's to say.
-static INSTANCES_INPUTS: &[Port] = &[
-    Port {
-        name: "points",
-        shape: Shape::Prim(POINTS),
-    },
-    Port {
-        name: "prototype",
-        shape: Shape::Prim(XFORMABLE),
-    },
-];
-static INSTANCES_OUTPUTS: &[Port] = &[Port {
-    name: "i*",
-    shape: Shape::List(&Shape::Prim(ANY_PRIM)),
-}];
-
-/// **A scatter writes a list of spheres**, one per sample.
-static SCATTER_OUTPUTS: &[Port] = &[Port {
-    name: "i*",
-    shape: Shape::List(&Shape::Prim(SPHERE)),
-}];
-
-/// **A grid writes a list of spheres**, one per cell.
-static GRID_OUTPUTS: &[Port] = &[Port {
-    name: "c*",
-    shape: Shape::List(&Shape::Prim(SPHERE)),
-}];
-
-/// **A street grid writes a struct**: the ground, and a list of blocks each of which is
-/// itself a list of lots — a struct in a list in a struct.
-static STREET_GRID_OUTPUTS: &[Port] = &[
-    Port {
-        name: "Ground",
-        shape: Shape::Prim(CUBE),
-    },
-    Port {
-        name: "b*",
-        shape: Shape::List(&Shape::Struct(&[Port {
-            name: "lot*",
-            shape: Shape::List(&Shape::Prim(CUBE)),
-        }])),
-    },
-];
+//
+// **Gone with D15**: the port tables (`POINTS`, `XFORMABLE`, `SAMPLE_POINTS_INPUTS`,
+// `STREET_GRID_OUTPUTS`, …) were a second declaration of what each operator reads and
+// writes. They are now the Rust types of the operators' own ports in `rusd-script`
+// (`Prim<Points>`, `List<Prim<Cube>>`, a named struct), and `rusd_script::ops::{inputs,
+// outputs}` describes them for the cook. What a port asks for is still answered here,
+// by `unmet` and `conform` over the shape those types produce.
 
 static SCATTER: &[PropDef] = &[
     p("count", U64),
@@ -511,22 +431,22 @@ mod tests {
     #[test]
     fn a_slot_asks_for_a_type_and_its_interfaces() {
         let registry = usd_registry();
-        let bare = |ty: &'static str| SlotSchema { ty, apis: &[] };
+        let bare = |ty: &str| SlotSchema::ty(ty);
 
         // The class half: a subtype passes, a sibling does not.
         assert_eq!(unmet(&bare("Xformable"), "Mesh", &[], registry), None);
         assert_eq!(
             unmet(&bare("Xform"), "Mesh", &[], registry),
             Some(Miss::Type {
-                declared: "Xform",
+                declared: "Xform".to_owned(),
                 actual: "Mesh".to_owned()
             })
         );
 
         // The interface half: the same type, with and without the API schema.
         let bound = SlotSchema {
-            ty: "Xformable",
-            apis: &["MaterialBindingAPI"],
+            ty: "Xformable".to_owned(),
+            apis: vec!["MaterialBindingAPI".to_owned()],
         };
         assert_eq!(
             unmet(&bound, "Mesh", &["MaterialBindingAPI"], registry),
@@ -535,51 +455,16 @@ mod tests {
         assert_eq!(
             unmet(&bound, "Mesh", &[], registry),
             Some(Miss::Api {
-                missing: "MaterialBindingAPI"
+                missing: "MaterialBindingAPI".to_owned()
             })
         );
         // The type is settled first, so one diagnostic names one thing.
         assert_eq!(
             unmet(&bound, "Material", &["MaterialBindingAPI"], registry),
             Some(Miss::Type {
-                declared: "Xformable",
+                declared: "Xformable".to_owned(),
                 actual: "Material".to_owned()
             })
         );
-    }
-
-    /// **The operators' own schemas**, which is where the constraint lives: what each
-    /// port reads, and what shape its output takes. A grid reads nothing (it grows out
-    /// of its parameters) and writes a list of spheres; an instances node writes a list
-    /// of prims that carry no type of their own; a street grid writes a struct holding a
-    /// list of blocks, each of which is a list of lots.
-    #[test]
-    fn the_operators_declare_their_io() {
-        let prim_ty = |ports: &'static [Port], name: &str| match input_ty(ports, name) {
-            Some(ty) => ty,
-            None => "",
-        };
-        assert_eq!(prim_ty(inputs("RusdSamplePoints"), "domain"), "Gprim");
-        assert_eq!(prim_ty(inputs("RusdInstances"), "points"), "Points");
-        assert_eq!(prim_ty(inputs("RusdInstances"), "prototype"), "Xformable");
-        assert!(inputs("RusdGrid").is_empty());
-
-        // A list is a list, however deep it sits.
-        assert!(matches!(outputs("RusdInstances")[0].shape, Shape::List(_)));
-        let Shape::List(element) = &outputs("RusdStreetGrid")[1].shape else {
-            panic!("blocks are a list");
-        };
-        let Shape::Struct(lots) = **element else {
-            panic!("a block is a struct");
-        };
-        assert!(matches!(lots[0].shape, Shape::List(_)), "a block holds lots");
-    }
-
-    /// The `ty` an input port asks for, if it asks for one prim.
-    fn input_ty(ports: &'static [Port], name: &str) -> Option<&'static str> {
-        match ports.iter().find(|port| port.name == name)?.shape {
-            Shape::Prim(schema) => Some(schema.ty),
-            _ => None,
-        }
     }
 }

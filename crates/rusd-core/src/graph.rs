@@ -183,6 +183,29 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
                 )),
             }
         }
+        // **The declared wires** (`[operator.X.inputs]`, D15): the graph's data flow, by
+        // the operator's own port names. A Rust script writes these, so the wire it
+        // typed is the wire the document declares — instead of one the cook has to
+        // reconstruct from node order. `input` above is the one USD material a node
+        // references; these are the ports, and `slot_parameter` is which engine
+        // parameter each one fills.
+        if let Some(Item::Table(wires)) = t.get("inputs") {
+            for (slot, item) in wires.iter() {
+                let Some(value) = item.as_str() else { continue };
+                match slot_parameter(kind, slot) {
+                    Some(parameter) => {
+                        props.insert(parameter.to_owned(), Value::String(value.to_owned()));
+                        if !declared.iter().any(|(s, _)| s == slot) {
+                            declared.push((slot.to_owned(), value.to_owned()));
+                        }
+                    }
+                    None => diags.push(Diagnostic::warning(
+                        "W_GRAPH_INPUT",
+                        format!("operator `{name}` has no port `{slot}`; the wire was ignored"),
+                    )),
+                }
+            }
+        }
         prims.push(PrimBlock {
             path,
             // **A graph node is not a prim** (v1.9): nothing of it is authored, so it

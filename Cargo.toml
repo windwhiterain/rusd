@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/rusd-core",
     "crates/rusd-scene",
+    "crates/rusd-script",
     "crates/rusd-proc",
     "crates/rusd-render",
     "crates/rusd-agent",
@@ -15,6 +16,7 @@ members = [
 default-members = [
     "crates/rusd-core",
     "crates/rusd-scene",
+    "crates/rusd-script",
     "crates/rusd-proc",
     "crates/rusd-render",
     "crates/rusd-agent",
@@ -33,6 +35,7 @@ authors = ["Rusd contributors"]
 [workspace.dependencies]
 rusd-core = { path = "crates/rusd-core" }
 rusd-scene = { path = "crates/rusd-scene" }
+rusd-script = { path = "crates/rusd-script" }
 rusd-proc = { path = "crates/rusd-proc" }
 rusd-render = { path = "crates/rusd-render" }
 rusd-agent = { path = "crates/rusd-agent" }

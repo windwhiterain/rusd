@@ -2151,6 +2151,7 @@ dependencies = [
  "rusd-proc",
  "rusd-render",
  "rusd-scene",
+ "rusd-script",
  "rusd-usd",
  "serde_json",
 ]
@@ -2172,6 +2173,7 @@ dependencies = [
  "rand_core",
  "rusd-core",
  "rusd-scene",
+ "rusd-script",
 ]
 
 [[package]]
@@ -2193,6 +2195,16 @@ version = "0.0.1"
 dependencies = [
  "openusd",
  "rusd-core",
+]
+
+[[package]]
+name = "rusd-script"
+version = "0.0.1"
+dependencies = [
+ "openusd",
+ "rusd-core",
+ "rusd-scene",
+ "serde_json",
 ]
 
 [[package]]

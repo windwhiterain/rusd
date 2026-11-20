@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use openusd::sdf::{self, LayerOffset};
+use openusd::sdf::LayerOffset;
 use openusd::usd::{PrimPredicate, Stage};
 
 fn examples() -> PathBuf {
@@ -229,6 +229,68 @@ fn an_input_of_the_wrong_schema_is_reported() {
         seen.iter().any(|(code, _)| code == "E_SCHEMA"),
         "an input of the wrong schema is E_SCHEMA: {seen:?}"
     );
+}
+
+/// **A script's graph cooks, end to end** (SPEC D15): the operators are Rust functions,
+/// the graph is what their calls wrote, and the cook runs it without a diagnostic. The
+/// material layers are authored by the script too, so every wire's type is true by
+/// construction — nothing here is checked at runtime that rustc did not already check.
+#[test]
+fn a_scripts_graph_cooks_end_to_end() {
+    use rusd_script::graph::{Graph, out};
+    use rusd_script::ops::{self, InstancesIn, InstancesParams, SamplePointsIn, SamplePointsParams};
+
+    let dir = std::env::temp_dir().join(format!("rusd-script-cook-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_text = dir.to_string_lossy().replace('\\', "/");
+
+    // The material: a box to sample, and a box to copy. Authored, so typed by construction.
+    let mut volume = rusd_script::usd::Layer::new("volume.rusd");
+    let domain = volume.cube("/World/Volume", 6.0);
+    volume.write(&dir).unwrap();
+    let mut proto = rusd_script::usd::Layer::new("box.rusd");
+    let box_prim = proto.cube("/World/Prototypes/Box", 0.6);
+    proto.write(&dir).unwrap();
+
+    // The graph: two operator calls, the second wired to the first's output port.
+    let mut g = Graph::new();
+    g.default_prim("/World");
+    let cloud = ops::sample_points(
+        &mut g,
+        out("Samples", "samples.rusd:/World/Samples"),
+        SamplePointsIn::new(domain),
+        SamplePointsParams { count: 60, seed: 11 },
+    );
+    let _boxes = ops::instances(
+        &mut g,
+        out("Boxes", "boxes.rusd:/World/Boxes"),
+        InstancesIn::new(cloud.ports.points, box_prim),
+        InstancesParams { max_prims: 5000, seed: 11, ..Default::default() },
+    );
+    g.write(&dir.join("scene.ops.toml")).unwrap();
+
+    // Cook what the script wrote, exactly as the CLI would.
+    let text = std::fs::read_to_string(dir.join("scene.ops.toml")).unwrap();
+    let doc = rusd_core::syntax::parse_in(&text, Some(&dir_text)).unwrap();
+    let stage = rusd_scene::lower(&doc).unwrap();
+    let nodes = rusd_proc::nodes_from_doc(&doc, Some(&dir_text));
+    let mut engine = rusd_proc::default_registry();
+    engine.set_out_dir(Some(dir.join("out")));
+    let result = engine.cook(&stage, &nodes);
+    assert!(
+        result.diags.iter().all(|d| d.severity != rusd_core::Severity::Error),
+        "a script's graph cooks clean: {:?}",
+        result.diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(result.ops.len(), 2);
+    let boxes = result.ops.iter().find(|o| o.id == "/World/Boxes").unwrap();
+    let paths = prims_of(boxes);
+    assert_eq!(
+        paths.iter().filter(|p| is_instance(p, "/World/Boxes")).count(),
+        60,
+        "one instance per sampled point"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// **Every example graph cooks clean.**

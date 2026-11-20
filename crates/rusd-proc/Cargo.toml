@@ -10,6 +10,9 @@ authors.workspace = true
 [dependencies]
 rusd-core.workspace = true
 rusd-scene.workspace = true
+# D15: the operators are Rust functions here, and their declared I/O is built from
+# those functions' port types. The cook reads it from there — one declaration.
+rusd-script.workspace = true
 openusd.workspace = true
 rand = "0.10.4"
 rand_chacha = "0.10.0"
