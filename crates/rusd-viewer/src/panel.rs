@@ -437,16 +437,12 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
         ui.label("（尚无合成树）");
         return TreeAction::None;
     }
-    // The row to bring into view, taken so it is spent by this pass. Handed down as
-    // `&mut` and cleared by the row that uses it: the tree holds a layer twice (its own
-    // first-level row and every arc leaf that names it), and clearing is what keeps the
-    // second match from scrolling somewhere else afterwards.
     // **[v1.4] the whole body reads which rows are previews from the rows themselves.**
     // `row` returns a `TreeAction`, not a `TreeSelection`, so the click rule lives in
     // exactly one place: [`action_for`], over the flags `crate::tree::roots` set.
     let mut action = TreeAction::None;
-    egui::ScrollArea::vertical()
-        .id_salt("composition-tree")
+    let out = egui::ScrollArea::vertical()
+        .id_salt("composition-tree-rows")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for (root_index, root) in roots.iter().enumerate() {
@@ -464,6 +460,19 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
                 }
             }
         });
+    {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        static LAST: AtomicI32 = AtomicI32::new(i32::MIN);
+        let y = out.state.offset().y.round() as i32;
+        let last = LAST.swap(y, Ordering::Relaxed);
+        if last != i32::MIN && last != y {
+            eprintln!(
+                "TREE-SCROLL {last} -> {y} rows={} content_h={}",
+                roots.len(),
+                out.content_size.y
+            );
+        }
+    }
     action
 }
 

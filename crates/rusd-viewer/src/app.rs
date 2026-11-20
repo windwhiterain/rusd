@@ -1344,7 +1344,6 @@ impl Shell {
                 // leaves it entirely outside the frustum, which reads as "点了节点不显示".
                 // The server-snapshot path already re-arms the fit when the composition
                 // changes (`session.rs`); a local open never went through it.
-                self.model.rearm_first_fit();
                 self.adopt_scene(made);
                 self.model.preview = Some(id);
                 self.status = "本地打开完成".to_owned();
@@ -1400,7 +1399,6 @@ impl Shell {
                     diags: Vec::new(),
                     stage: Some(stage),
                 };
-                self.model.rearm_first_fit();
                 self.adopt_scene(made);
                 self.model.preview = Some(id.to_owned());
                 self.status = format!("本地打开 {}", local.display());
@@ -1759,6 +1757,12 @@ impl Shell {
         // the empty `new` never matched anything and the control caller waited forever
         // (the work happened, the click worked, only the answer was lost).
         self.waiting.push(Waiting::with(reply, Shape::Server, vec![OPEN_TAG]));
+        // **A document frames itself; a click does not** (the user: 我点 usd 文件还是会跳).
+        // Opening a document is the one moment the camera is allowed to move: the file
+        // may be anywhere and any size. Every later scene — a `preview{solo}`, a
+        // `preview{upto}`, a row that shows one path — keeps the camera the user is
+        // looking through, so the picture changes and the view does not.
+        self.model.rearm_first_fit();
         self.status = format!("open {path}: 请求中…");
         self.send_net(NetCommand::Call {
             tag: OPEN_TAG.to_owned(),
