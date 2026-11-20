@@ -2079,4 +2079,70 @@ mod tests {
         assert_eq!(mesh_signature(&a), mesh_signature(&moved), "where and what colour: no");
         assert_ne!(mesh_signature(&a), mesh_signature(&bigger), "a different box is different");
     }
+
+    /// **The instancing changed where the bytes come from, not the picture.**
+    ///
+    /// `rusd_render::render_with` is the untouched reference: it bakes world-space vertices
+    /// in f64, with its own vertex layout and its own shader, and never looked at an
+    /// instance record. Both paths are given the same scene, camera and config, and what
+    /// comes back has to agree — except within a pixel or two of a silhouette, where f32
+    /// world positions against f64 can fall on different sides of an edge.
+    #[test]
+    fn the_instanced_path_draws_what_the_baker_draws() {
+        let Some((device, queue)) = headless() else {
+            eprintln!("no DX12 adapter here; the reference-image test was skipped");
+            return;
+        };
+        let mut geo = scene();
+        let cam = Camera {
+            position: [0.0, -60.0, 8.0],
+            look_at: [0.0, 0.0, 0.0],
+            fov_deg: 40.0,
+        };
+        geo.camera = Some(cam);
+        let (w, h) = (160u32, 160u32);
+        let cfg = RenderConfig {
+            width: w,
+            height: h,
+            ambient: 1.0,
+            diffuse: 0.0,
+            background: [0.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        let baked = rusd_render::render_with(&geo, &cfg).expect("the baker draws the scene");
+
+        let mut vp = Viewport::new(device, queue, w, h);
+        vp.set_scene(&geo, Scope::Whole);
+        vp.render(&cam, geo.bounds, &cfg, None).expect("the viewport draws");
+        let (instanced, ids) = vp.grab().expect("grab");
+
+        assert_eq!(baked.beauty.len(), instanced.len());
+        let n = baked.beauty.len();
+        let (mut sum, mut worst, mut differing, mut ids_apart) = (0u64, 0u8, 0usize, 0usize);
+        for (k, (&a, &b)) in baked.beauty.iter().zip(&instanced).enumerate() {
+            let d = a.abs_diff(b);
+            sum += u64::from(d);
+            worst = worst.max(d);
+            differing += usize::from(d > 8);
+            // The id buffer is integers: an edge pixel is the only place they can disagree.
+            if let Some(&ref_id) = baked.ids.get(k / 4) {
+                ids_apart += usize::from(ref_id != ids[k / 4]);
+            }
+        }
+        let mean = sum as f64 / n as f64;
+        println!(
+            "vs rusd_render: mean |Δ| = {mean:.3}, worst = {worst}, pixels off by >8 = {:.2}%, ids apart = {:.2}%",
+            100.0 * differing as f64 / (n / 4) as f64,
+            100.0 * ids_apart as f64 / (n / 4) as f64
+        );
+        assert!(mean < 0.5, "the two renderers must agree on average: mean |Δ| = {mean}");
+        assert!(
+            differing * 100 < (n / 4),
+            "under 1% of pixels may sit on a silhouette differently"
+        );
+        assert!(
+            ids_apart * 100 < (n / 4),
+            "the prim-id pass must name the same prim at the same pixels"
+        );
+    }
 }
