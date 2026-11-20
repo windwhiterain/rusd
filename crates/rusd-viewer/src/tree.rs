@@ -794,11 +794,22 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
                 _ => continue,
             };
+            let schema = input
+                .structure
+                .iter()
+                .find(|(name, _)| name == &input.slot)
+                .and_then(|(_, schema)| schema.clone())
+                .filter(|s| !s.is_empty());
             children.push(TreeNode {
                 id,
                 kind: TreeNodeKind::Arc,
-                label: input.slot.clone(),
-                prim: prim.clone(),
+                // **The input row shows its schema** (v1.13): `input : Cube`, `input :
+                // Mesh`, `input : Xform` — the `typeName` of the prim it names, so the UI
+                // says what the operator takes, not only that it takes something.
+                label: match schema {
+                    Some(schema) => format!("{} : {schema}", input.slot),
+                    None => input.slot.clone(),
+                },                prim: prim.clone(),
                 op: false,
                 root: false,
                 session: false,
@@ -1021,11 +1032,15 @@ pub fn layer_row_label(tree: &CompositionTree, layer: &LayerNode) -> String {
         None => display_name_of(layer),
     };
     if layer.op {
-        format!("\u{2264} {title} {rank}")
+        // **The operator's schema** (v1.13) — `RusdSamplePoints`, `RusdInstances` — is part
+        // of what the row says: a reader has to be able to see which operator this is.
+        match &layer.op_name {
+            Some(schema) => format!("\u{2264} {title} [{schema} \u{00b7} op \u{00b7} {}/{}]", layer.strength, tree.layers.len()),
+            None => format!("\u{2264} {title} {rank}"),
+        }
     } else {
         format!("{title} {rank}")
-    }
-}
+    }}
 
 /// A layer row's dim second half: its display name when the description is the title,
 /// and a cook op's `{input} → {output}` after that.

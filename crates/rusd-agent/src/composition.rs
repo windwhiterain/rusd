@@ -121,14 +121,36 @@ fn declared_inputs(op: &CookOp, stage: &Stage) -> Vec<DeclaredInput> {
                 value: value.clone(),
                 asset: parsed.as_ref().and_then(|p| p.asset.clone()),
                 prim: prim.clone(),
-                // **The hierarchy is the set of declared slots themselves** (v1.13): the
-                // operator's schema is `{points, prototype}` and that set *is* its USD
-                // hierarchy — the names are the levels. What each names in the stage is the
-                // value the row stands for, reported as `value`.
-                structure: vec![(slot.clone(), None)],
-            }
+                // **The schema of the input** (v1.13): the `typeName` of the prim it names,
+                // read from the layer that authors it (or from the stage, for a prim of
+                // this one). The UI shows it beside the input's name.
+                structure: vec![(
+                    slot.clone(),
+                    schema_of(parsed.as_ref().and_then(|p| p.asset.as_deref()), prim.as_deref(), stage),
+                )],            }
         })
         .collect()
+}
+
+/// The `typeName` of the prim an input names, when the layer (or the stage) knows it.
+fn schema_of(asset: Option<&str>, prim: Option<&str>, stage: &Stage) -> Option<String> {
+    let prim = prim?;
+    let owned;
+    let stage = match asset {
+        Some(a) => {
+            owned = openusd::usd::Stage::open(a).ok();
+            match owned.as_ref() {
+                Some(s) => s,
+                None => stage,
+            }
+        }
+        None => stage,
+    };
+    sdf::path(prim)
+        .ok()
+        .and_then(|p| stage.prim(p).ok())
+        .and_then(|p| p.type_name().ok().flatten())
+        .map(|t| t.as_str().to_owned())
 }
 
 /// Every level of `prim` (its ancestors and itself) with the schema it composes to.
