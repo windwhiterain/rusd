@@ -23,6 +23,10 @@ pub struct CookNode {
     /// Anchor prim path.
     pub path: PrimPath,
     pub params: BTreeMap<String, Value>,
+    /// **The input slots the document declared** (v1.12), by their own names and values —
+    /// a list, because an operator may declare any number of them; `params` holds what the
+    /// engine reads, this holds what the document wrote.
+    pub inputs: Vec<(String, String)>,
     pub seed: u64,
     pub stage_seed: u64,
     /// Declared inputs: (prim path, attribute) read from the composed stage.
@@ -57,6 +61,10 @@ pub struct CookOp {
     pub generator: String,
     /// The `input_points` parameter, when the node reads input geometry.
     pub input: Option<String>,
+    /// **Every input the document declared for this node** (v1.12), by the document's own
+    /// slot names — `points`, `prototype`, `domain`, and whatever an operator names next.
+    /// A two-field `input`/`prototype` would report an op with one as complete.
+    pub inputs: Vec<(String, String)>,
     /// The node's current output layer identifier (changes on every rebuild).
     pub layer_id: String,
     /// The file the output layer was written to (v1.9). The layer is **not** in any
@@ -365,6 +373,7 @@ impl CookEngine {
                         Value::String(s) => Some(s.clone()),
                         _ => None,
                     }),
+                    inputs: node.inputs.clone(),
                     layer_id: entry.layer_id.clone(),
                     layer_path: entry.layer_path.to_string_lossy().into_owned(),
                     description: node.description.clone(),
@@ -617,6 +626,7 @@ pub fn nodes_from_doc(
             generator: prim.schema.clone(),
             path: prim.path.clone(),
             params: prim.props.clone(),
+            inputs: prim.inputs.clone(),
             seed,
             stage_seed,
             reads,

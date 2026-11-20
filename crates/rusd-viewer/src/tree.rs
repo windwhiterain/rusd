@@ -41,10 +41,21 @@ pub const METHOD_NOT_FOUND: i64 = -32601;
 /// The JSON-RPC code a server answers with when the params are wrong.
 pub const INVALID_PARAMS: i64 = -32602;
 
+/// One named input an operator declared, as the server reported it: the slot's own name
+/// (`points`, `prototype`, `domain`, …), what the document wrote, and the USD it points at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeclaredInput {
+    pub slot: String,
+    pub value: String,
+    /// The layer the slot names, when it names one (`box.rusd:/World/Prototypes/Box`).
+    pub asset: Option<String>,
+    /// The prim the slot points at — in that layer, or in this stack.
+    pub prim: Option<String>,
+}
+
 /// One layer of the authority stack.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LayerNode {
-    /// The layer identifier, which is also this node's id.
+pub struct LayerNode {    /// The layer identifier, which is also this node's id.
     pub id: String,
     /// `root` / `session` / `sublayer` / `reference` / `payload` / `inherit` /
     /// `specialize` / `variant`.
@@ -73,11 +84,10 @@ pub struct LayerNode {
     /// The subtitle prints [`PARAMETRIC`] for `None`, which is the contract's word
     /// for exactly that.
     pub input: Option<String>,
-    /// The **USD file that input names** (v1.12), when the operator declared
-    /// `asset:prim` rather than a prim in this stack: `terrain.rusd:/World/Terrain`
-    /// is an operator parameter, not a USD arc, so nothing in the composition graph
-    /// carried it. The row this makes names the file; clicking it opens that USD.
-    pub input_asset: Option<String>,
+    /// **Every named input** the operator declared (v1.12), by the document's own slot
+    /// names — `points`, `prototype`, `domain`, or however many an operator has. Each
+    /// names the USD it points at: a layer (`box.rusd`) or a prim of this stack.
+    pub inputs: Vec<DeclaredInput>,
     /// The op's **output layer** identifier, as the server joined it to this entry
     /// (`CookOp.layer_id == layers[].id`, v1.5.1).
     ///
@@ -299,10 +309,30 @@ impl CompositionTree {
                     // and nothing is guessed from its absence.
                     op_name: optional_string(l, "op_name"),
                     input: optional_string(l, "input"),
-                    // v1.12: the USD file the operator declared it reads. Optional: a
-                    // server that does not say so draws no such row, and nothing is
-                    // invented for it.
-                    input_asset: optional_string(l, "input_asset"),
+                    // v1.12: **every named input** the document declared for this operator.
+                    // A list, so three or n slots need no change here.
+                    inputs: l
+                        .get("inputs")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .map(|i| DeclaredInput {
+                                    slot: i
+                                        .get("slot")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                    value: i
+                                        .get("value")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                        .to_owned(),
+                                    asset: optional_string(i, "asset"),
+                                    prim: optional_string(i, "prim"),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     output: optional_string(l, "output"),
                     // v1.8: the op's anchor prim. Optional like its two neighbours above,
                     // and nothing is guessed from its absence.
@@ -711,31 +741,38 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         });
     }
 
-    // **The USD the operator declared is a node** (v1.12). The op row says what the
-    // document told it to read — `input = "terrain.rusd:/World/Terrain"` — and that
-    // declaration is what the composition graph was missing: a graph document is not
-    // USD, so its input reached no layer of the stage, and the material an op sampled had
-    // no row to click. The row here names **the file the operator declared** (its id is
-    // that file, so a click opens that USD), and it is a row, not an opinion: the stage is
-    // untouched.
-    if let (Some(asset), Some(input)) = (&layer.input_asset, &layer.input) {
-        let prim = input.rsplit_once(':').map(|(_, p)| p).unwrap_or(input.as_str());
-        children.push(TreeNode {
-            id: asset.clone(),
-            kind: TreeNodeKind::Arc,
-            label: format!(
-                "reference \u{2192} {}:{prim}",
-                crate::tree::strip_anon_prefix(asset)
-                    .rsplit(['/', '\\'])
-                    .next()
-                    .unwrap_or(asset.as_str())
+    // **Every input the operator declared, by its own name** (v1.12). An `instances` op
+    // has two (`points`, `prototype`) and a future one may have n; the rows are made from
+    // the list, never from a fixed pair of fields. A slot naming a layer is a `reference`
+    // row for that USD; a slot naming a prim of this stack is a row for that prim.
+    for input in &layer.inputs {
+        let (id, prim, label) = match (&input.asset, &input.prim) {
+            (Some(asset), Some(prim)) => (
+                asset.clone(),
+                None,
+                format!(
+                    "{} \u{2192} {}:{prim}",
+                    input.slot,
+                    strip_anon_prefix(asset).rsplit(['/', '\\']).next().unwrap_or(asset)
+                ),
             ),
-            prim: None,
+            (None, Some(prim)) => (
+                format!("prim:{prim}"),
+                Some(prim.clone()),
+                format!("{} \u{2192} {prim}", input.slot),
+            ),
+            _ => continue,
+        };
+        children.push(TreeNode {
+            id,
+            kind: TreeNodeKind::Arc,
+            label,
+            prim,
             op: false,
             root: false,
             session: false,
             secondary: None,
-            hover: Some(format!("文档声明的输入：{asset}（点开看这个 USD）")),
+            hover: Some(format!("文档声明的输入 {} = {}", input.slot, input.value)),
             children: Vec::new(),
         });
     }

@@ -128,6 +128,10 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
             continue;
         };
         let mut props: BTreeMap<String, Value> = BTreeMap::new();
+        // **The declaration as written** (v1.12): every slot the document named, by its own
+        // name, whatever the operator's mapping to engine parameters is — an operator with
+        // three inputs or n inputs needs no change here.
+        let mut declared: Vec<(String, String)> = Vec::new();
         // The operator's own parameters: every plain value that is not one of the graph's
         // own words. `operator`, `outputs`, `inputs` and `description` are the graph's.
         for (key, item) in t.iter() {
@@ -136,6 +140,11 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
                 "inputs" => {
                     let Some(inputs) = item.as_table() else { continue };
                     for (slot, value) in inputs.iter() {
+                        if let Some(v) = value.as_value().and_then(value_of) {
+                            if let Value::String(text) = &v {
+                                declared.push((slot.to_owned(), text.clone()));
+                            }
+                        }
                         let Some(parameter) = slot_parameter(kind, slot) else {
                             diags.push(Diagnostic::warning(
                                 "W_GRAPH_SLOT",
@@ -160,6 +169,7 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
             schema: schema.to_owned(),
             props,
             references: None,
+            inputs: declared,
         });
     }
 

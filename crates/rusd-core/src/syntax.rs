@@ -32,6 +32,12 @@ pub struct PrimBlock {
     /// attribute, so it never reaches the geometry layer. One string, split and
     /// resolved by `rusd_scene::reference` (asset half first, then prim half).
     pub references: Option<String>,
+    /// **The input slots this block declares** (v1.12), by the document's own names —
+    /// `inputs.points = "/World/Samples/points"`, `inputs.prototype = "box.rusd:/World/…"`.
+    /// `props` holds the engine parameters the slots map to; this holds the declaration
+    /// as written, so a reader can name it back, and it is a list because an operator may
+    /// declare **any number** of inputs. Empty for a `.rusd` document, which declares none.
+    pub inputs: Vec<(String, String)>,
 }
 
 /// A **layer annotation**: a document node that says something about a layer
@@ -371,6 +377,7 @@ fn walk_prim(
         schema,
         props,
         references,
+        inputs: Vec::new(),
     });
 }
 
