@@ -1757,12 +1757,6 @@ impl Shell {
         // the empty `new` never matched anything and the control caller waited forever
         // (the work happened, the click worked, only the answer was lost).
         self.waiting.push(Waiting::with(reply, Shape::Server, vec![OPEN_TAG]));
-        // **A document frames itself; a click does not** (the user: 我点 usd 文件还是会跳).
-        // Opening a document is the one moment the camera is allowed to move: the file
-        // may be anywhere and any size. Every later scene — a `preview{solo}`, a
-        // `preview{upto}`, a row that shows one path — keeps the camera the user is
-        // looking through, so the picture changes and the view does not.
-        self.model.rearm_first_fit();
         self.status = format!("open {path}: 请求中…");
         self.send_net(NetCommand::Call {
             tag: OPEN_TAG.to_owned(),

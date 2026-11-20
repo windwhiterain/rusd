@@ -205,19 +205,17 @@ pub fn apply_state_change(
 /// is fitted: the latch is re-armed instead and the next scene to arrive fits as a
 /// first one would.
 pub fn camera_for_state_change(
-    model: &mut ClientModel,
-    version: u64,
-    reason: &str,
-    aspect: f64,
+    _model: &mut ClientModel,
+    _version: u64,
+    _reason: &str,
+    _aspect: f64,
 ) -> Option<Orbit> {
-    if reason != "open" {
-        return None;
-    }
-    let bounds = on_screen(model)?;
-    if model.version == Some(version) {
-        return Some(fit_to_bounds(model, bounds, aspect));
-    }
-    model.rearm_first_fit();
+    // **Nothing refits** (the user: 「为什么不彻底删掉跳转？」 — so: 彻底). A scene change
+    // is another picture of the same window, and moving the camera under the user's hand
+    // is never what they asked for. The camera moves when the user moves it — dragging the
+    // view, or Fit / `ctl.py fit`. The one framing left is the very first scene of a
+    // connection, and only because the window has no camera of its own before that
+    // (`crate::view::camera_for_scene`).
     None
 }
 
