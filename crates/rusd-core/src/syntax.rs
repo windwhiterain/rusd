@@ -25,6 +25,15 @@ pub struct PrimBlock {
     /// opinion there is and would win over the arc, turning the prim into an
     /// empty `Xform` with the material's geometry lost.
     pub schema: String,
+    /// **The operator this node runs** (v1.14), when the node is a graph node rather
+    /// than a prim: `operator = "instances"` in a `.ops.toml`, spelled here by the
+    /// name the cook's registry knows it by (`RusdInstances`).
+    ///
+    /// A generator is an **operator**, not a schema: a USD layer's `typeName` is a
+    /// schema and nothing else, and a graph document authors no prims at all, so no
+    /// layer ever carries one of these names. `None` for a `.rusd` document, whose
+    /// nodes are prims and whose `schema` is what USD says the prim is.
+    pub operator: Option<String>,
     pub props: BTreeMap<String, Value>,
     /// `references = "asset:prim"` (v1.5.10): a **composition arc, not a
     /// property**. It names another layer and a prim inside it, whose spec
@@ -379,6 +388,7 @@ fn walk_prim(
     prims.push(PrimBlock {
         path,
         schema,
+        operator: None,
         props,
         references,
         inputs: Vec::new(),

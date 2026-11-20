@@ -10,7 +10,7 @@ use openusd::usd::Stage;
 use rusd_core::syntax::ParsedDocument;
 use rusd_core::{Diagnostic, Value};
 
-use crate::schema::{self, PropType, SchemaKind};
+use crate::schema::{self, PropType};
 
 /// Author the document's stage metadata and prims into the stage's root layer.
 fn author_base(stage: &Stage, doc: &ParsedDocument) -> Result<(), Vec<Diagnostic>> {
@@ -112,9 +112,10 @@ fn author_prims(
         let authored: &[rusd_core::syntax::PrimBlock] = if doc.graph { &[] } else { &doc.prims };
         for (index, prim) in authored.iter().enumerate() {
             let schema = schema::lookup(&prim.schema);
-            let custom = schema
-                .map(|s| s.kind == SchemaKind::Generator)
-                .unwrap_or(true);
+            // A prim whose type the registry does not name authors its attributes as
+            // **custom**: USD says nothing about them, so nothing may present them as
+            // the schema's own.
+            let custom = schema.is_none();
             // v1.5.10: a prim with no declared schema composes its type from the
             // layer its `references` names, so its own spec declares none.
             PrimSpec::new(d, prim.path.as_str(), Specifier::Def, prim.schema.clone())?;
@@ -128,13 +129,6 @@ fn author_prims(
                 author_reference(d, &prim.path, reference)?;
             }
             for (name, val) in &prim.props {
-                // v1.5.9: a generator node's `description` is metadata about the
-                // node, not geometry — the tree reports it beside the layer, and the
-                // layer itself must not gain an attribute nobody asked for.
-                if name == "description" && schema.is_some_and(|s| s.kind == SchemaKind::Generator)
-                {
-                    continue;
-                }
                 let ty = schema::prop_type(prim.schema.as_str(), name);
                 if let Some((sval, tname)) = to_usd(val, ty) {
                     let attr_path = format!("{}.{}", prim.path.as_str(), name);

@@ -35,9 +35,15 @@ use toml_edit::{DocumentMut, Item};
 
 use crate::{Diagnostic, Value, syntax::{ParsedDocument, PrimBlock}};
 
-/// What a graph operator is called in the schema registry.
-fn schema_for(operator: &str) -> Option<&'static str> {
-    match operator {
+/// What a graph operator is called in the cook's registry.
+///
+/// The document's word (`operator = "instances"`) and this name are the same
+/// vocabulary seen from two ends: the graph's, and the generator that runs it. Neither
+/// is a **schema** — a schema is what a USD layer's `typeName` names, and a graph node
+/// is not a prim — so the node carries this in [`PrimBlock::operator`](crate::syntax::PrimBlock)
+/// and leaves `schema` empty.
+fn operator_for(kind: &str) -> Option<&'static str> {
+    match kind {
         "sample_points" => Some("RusdSamplePoints"),
         "instances" => Some("RusdInstances"),
         "grid" => Some("RusdGrid"),
@@ -104,7 +110,7 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
             ));
             continue;
         };
-        let Some(schema) = schema_for(kind) else {
+        let Some(operator) = operator_for(kind) else {
             diags.push(Diagnostic::error(
                 "E_GRAPH",
                 format!("unknown operator `{kind}` (in `{name}`)"),
@@ -179,7 +185,10 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
         }
         prims.push(PrimBlock {
             path,
-            schema: schema.to_owned(),
+            // **A graph node is not a prim** (v1.9): nothing of it is authored, so it
+            // declares no USD type. The operator it runs is what the cook dispatches on.
+            schema: String::new(),
+            operator: Some(operator.to_owned()),
             props,
             references: None,
             inputs: declared,

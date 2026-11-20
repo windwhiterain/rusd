@@ -1,10 +1,16 @@
 //! Validation (SPEC §3): check a parsed document against the schema registry,
 //! producing stable-code JSON diagnostics. Errors (`E_*`) block lowering;
 //! warnings (`W_*`) are tolerated. This is the feedback half of the agent loop.
+//!
+//! Two vocabularies are checked here, and they never mix. A `.rusd` document's node
+//! is a **prim**, so its `schema` is looked up in the schema registry; a graph
+//! document's node is an **operator**, so its parameters are looked up in
+//! [`crate::operator`]. A generator is not a schema and a schema is not an operator.
 
-use rusd_core::syntax::ParsedDocument;
+use rusd_core::syntax::{ParsedDocument, PrimBlock};
 use rusd_core::{Diagnostic, PrimPath, Value};
 
+use crate::operator;
 use crate::reference::{self, AssetRefError};
 use crate::schema::{self, PropType};
 
@@ -63,6 +69,13 @@ pub fn validate(doc: &ParsedDocument) -> Vec<Diagnostic> {
         {
             diags.push(reference_diag(&e, prim.path.as_str(), raw));
         }
+        // **A graph node is an operator, not a prim** (v1.14): it declares no schema at
+        // all — a generator is not one — so its parameters are checked against the
+        // operator's own table, and nothing about it goes near the schema registry.
+        if let Some(operator) = &prim.operator {
+            check_operator(prim, operator, &mut diags);
+            continue;
+        }
         // A prim that declares no schema but names a `references` arc is not
         // missing one: its type composes from the layer the arc opens. There is no
         // registry entry to look up, and asking for the empty name would report
@@ -97,22 +110,6 @@ pub fn validate(doc: &ParsedDocument) -> Vec<Diagnostic> {
         }
 
         for (name, val) in &prim.props {
-            // v1.5.9: `description` on a generator node is node **metadata**, not a
-            // generator parameter — it is what the composition tree says about the
-            // layer that node writes, so it must not be a `W_UNKNOWN_PROP`.
-            if name == "description" && schema.kind == schema::SchemaKind::Generator {
-                if !matches!(val, Value::String(_)) {
-                    diags.push(
-                        Diagnostic::error(
-                            "E_TYPE",
-                            format!("expected string, got {}", val.type_name()),
-                        )
-                        .at_prim(prim.path.as_str())
-                        .at_property(name),
-                    );
-                }
-                continue;
-            }
             match schema::prop_type(prim.schema.as_str(), name) {
                 Some(ty) => {
                     if !type_ok(val, ty) {
@@ -140,9 +137,78 @@ pub fn validate(doc: &ParsedDocument) -> Vec<Diagnostic> {
     diags
 }
 
+/// **One graph node, checked against its operator's parameters** (v1.14).
+///
+/// A node is not a prim, so there is no schema to look up: the operator's table is the
+/// contract, `description` is what the tree says about the layer the node writes rather
+/// than something the operator reads, and a name the table does not hold is a parameter
+/// the operator does not take.
+fn check_operator(prim: &PrimBlock, operator: &str, diags: &mut Vec<Diagnostic>) {
+    let Some(params) = operator::parameters(operator) else {
+        diags.push(
+            Diagnostic::error("E_GRAPH", format!("unknown operator `{operator}`"))
+                .at_prim(prim.path.as_str()),
+        );
+        return;
+    };
+
+    for def in params.iter().filter(|d| d.required) {
+        if !prim.props.contains_key(def.name) {
+            diags.push(
+                Diagnostic::error(
+                    "E_REQUIRED",
+                    format!("missing required parameter '{}'", def.name),
+                )
+                .at_prim(prim.path.as_str())
+                .at_property(def.name),
+            );
+        }
+    }
+
+    for (name, val) in &prim.props {
+        // v1.5.9: `description` on a node is node **metadata**, not a parameter — it is
+        // what the composition tree says about the layer that node writes, so it must
+        // not be a `W_UNKNOWN_PROP`.
+        if name == "description" {
+            if !matches!(val, Value::String(_)) {
+                diags.push(
+                    Diagnostic::error(
+                        "E_TYPE",
+                        format!("expected string, got {}", val.type_name()),
+                    )
+                    .at_prim(prim.path.as_str())
+                    .at_property(name),
+                );
+            }
+            continue;
+        }
+        match params.iter().find(|d| d.name == name) {
+            Some(def) => {
+                if !type_ok(val, def.ty) {
+                    diags.push(
+                        Diagnostic::error(
+                            "E_TYPE",
+                            format!("expected {}, got {}", def.ty.name(), val.type_name()),
+                        )
+                        .at_prim(prim.path.as_str())
+                        .at_property(name),
+                    );
+                }
+            }
+            None => diags.push(
+                Diagnostic::warning(
+                    "W_UNKNOWN_PROP",
+                    format!("property '{name}' is not a parameter of `{operator}`"),
+                )
+                .at_prim(prim.path.as_str())
+                .at_property(name),
+            ),
+        }
+    }
+}
+
 /// Whether a value satisfies a property type (with surface coercion rules).
-fn type_ok(val: &Value, ty: PropType) -> bool {
-    use PropType::*;
+fn type_ok(val: &Value, ty: PropType) -> bool {    use PropType::*;
     match ty {
         Bool => matches!(val, Value::Bool(_)),
         I64 => matches!(val, Value::Int(_)),

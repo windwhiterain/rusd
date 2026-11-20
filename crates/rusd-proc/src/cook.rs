@@ -592,17 +592,17 @@ pub fn nodes_from_doc(
     // the only thing the single-input form has to reconstruct.
     let mut upstream_points: Option<String> = None;
     for prim in &doc.prims {
-        if let Some(points) = crate::deps::writes_for(prim.schema.as_str(), prim.path.as_str())
+        // **Only a graph node runs** (v1.14): a generator is an operator, and an
+        // operator is what a graph document names. A `.rusd` prim is USD — it carries a
+        // schema, and a schema is not something the cook can run.
+        let Some(operator) = prim.operator.clone() else {
+            continue;
+        };
+        if let Some(points) = crate::deps::writes_for(operator.as_str(), prim.path.as_str())
             .into_iter()
             .find(|p| p == "points" || p.ends_with("/points"))
         {
             upstream_points = Some(points);
-        }
-        let Some(schema) = rusd_scene::schema::lookup(&prim.schema) else {
-            continue;
-        };
-        if schema.kind != rusd_scene::schema::SchemaKind::Generator {
-            continue;
         }
         let seed = match prim.props.get("seed") {
             Some(Value::Int(i)) if *i >= 0 => *i as u64,
@@ -611,14 +611,14 @@ pub fn nodes_from_doc(
         let mut props = prim.props.clone();
         // The one USD input fills `prototype` on an instances node; the cloud it consumes
         // comes from the graph's data flow.
-        if matches!(prim.schema.as_str(), "RusdInstances" | "RusdScatter")
+        if matches!(operator.as_str(), "RusdInstances" | "RusdScatter")
             && !props.contains_key("input_points")
             && let Some(points) = &upstream_points
         {
             props.insert("input_points".to_owned(), Value::String(points.clone()));
         }
         let read_props = props.clone();
-        let reads = match prim.schema.as_str() {
+        let reads = match operator.as_str() {
             // D14 geometry-in: a scatter that reads a point cloud depends on that
             // prim's `points` (hashing their world-space values, see
             // `read_value_for_memo`) **and on its own anchor's world transform**,
@@ -657,7 +657,7 @@ pub fn nodes_from_doc(
             // in `deps`, because the two ops have to agree on the cloud path between
             // them (the sample op writes it, the instances op reads it).
             "RusdSamplePoints" | "RusdInstances" => {
-                crate::deps::reads_for(prim.schema.as_str(), &prim.props, prim.path.as_str())
+                crate::deps::reads_for(operator.as_str(), &prim.props, prim.path.as_str())
             }
             _ => Vec::new(),
         };
@@ -667,14 +667,14 @@ pub fn nodes_from_doc(
         };
         nodes.push(CookNode {
             id: prim.path.as_str().to_owned(),
-            generator: prim.schema.clone(),
+            generator: operator.clone(),
             path: prim.path.clone(),
             params: read_props.clone(),
             inputs: prim.inputs.clone(),
             seed,
             stage_seed,
             reads,
-            writes: crate::deps::writes_for(prim.schema.as_str(), prim.path.as_str()),
+            writes: crate::deps::writes_for(operator.as_str(), prim.path.as_str()),
             description: prim.props.get("description").and_then(|v| match v {
                 Value::String(s) => Some(s.clone()),
                 _ => None,
