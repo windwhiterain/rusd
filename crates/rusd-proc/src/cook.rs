@@ -409,7 +409,46 @@ impl CookEngine {
                 })
             })
             .collect();
+        // **What each operator declares it writes, against what it wrote.** The
+        // operator's output schema is its own — one `points` prim, a list of instances,
+        // a struct of ground and blocks — and the product is where it lands.
+        for op in &ops {
+            check_output(op, &mut diags);
+        }
         CookResult { stats, diags, ops }
+    }
+}
+
+/// **An operator's declared output, checked against the product it wrote.**
+///
+/// The declaration is the operator's own schema: which parts it writes and what shape
+/// each holds. A mismatch is the generator's bug rather than the document's, but it is
+/// reported against the node all the same — the document is what named the operator, and
+/// nothing else would tell the author that the operator did not do what it says.
+fn check_output(op: &CookOp, diags: &mut Vec<Diagnostic>) {
+    let ports = rusd_scene::operator::outputs(&op.generator);
+    if ports.is_empty() {
+        return;
+    }
+    let Ok(stage) = Stage::open(&op.layer_path) else {
+        return;
+    };
+    let Ok(prim) = stage.prim(op.id.as_str()) else {
+        return;
+    };
+    let shape = rusd_scene::operator::Shape::Struct(ports);
+    if let Err(miss) = rusd_scene::operator::conform(
+        &shape,
+        &prim,
+        rusd_scene::schema::usd_registry(),
+    ) {
+        diags.push(
+            Diagnostic::error(
+                "E_OUTPUT_SCHEMA",
+                format!("{} writes {}: {}", op.generator, op.id, miss.describe()),
+            )
+            .at_prim(&op.id),
+        );
     }
 }
 

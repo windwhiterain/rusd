@@ -27,8 +27,16 @@ fn doc_dir() -> String {
     examples().to_string_lossy().replace('\\', "/")
 }
 
+/// The cook writes its products into `examples/out`, and the arcs they author
+/// (`../volume.rusd`) only resolve from there — so the tests that cook take turns
+/// rather than racing each other over the same files. A product half-written by one
+/// test is read by another as a layer missing a part, which is a schema failure that
+/// says nothing about the code.
+static COOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Cook a document into `<examples>/out` and compose the stack a picture is made from.
 fn cook_example(name: &str) -> Vec<rusd_proc::CookOp> {
+    let _taking_turns = COOK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let dir = examples();
     let dir_text = doc_dir();
     let text = std::fs::read_to_string(dir.join(name)).unwrap();

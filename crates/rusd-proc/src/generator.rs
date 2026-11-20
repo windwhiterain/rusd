@@ -9,7 +9,7 @@ use openusd::tf;
 use openusd::usd::Stage;
 use rusd_core::{Diagnostic, PrimPath, Value};
 
-use rusd_scene::operator::Miss;
+use rusd_scene::operator::Shape;
 
 /// Read a composed `double` attribute, returning 0.0 when absent.
 pub fn read_attr_f64(stage: &Stage, prim: &str, attr: &str) -> f64 {
@@ -343,9 +343,14 @@ impl<'a> GenContext<'a> {
     /// `Xformable` without `MaterialBindingAPI` passes a slot that asks only for the class
     /// and fails one that asks for both.
     pub fn expect_slot(&mut self, raw: &str, operator: &str, slot: &str, base: &str) {
-        let Some(declared) = rusd_scene::operator::slot(operator, slot) else {
-            // A slot the operator does not declare asks nothing; the read that wanted it
+        let Some(port) = rusd_scene::operator::input(operator, slot) else {
+            // A port the operator does not declare asks nothing; the read that wanted it
             // is the one that reports.
+            return;
+        };
+        // A single prim is what a port's `Prim` shape asks for; a port that carries a
+        // struct or a run is checked where that run is read, not here.
+        let Shape::Prim(declared) = &port.shape else {
             return;
         };
         let wire = self.with_input(raw, |stage, path| {
@@ -374,20 +379,17 @@ impl<'a> GenContext<'a> {
             // which is a statement about the registry, not about the wire.
             return;
         }
-        let Some(miss) = rusd_scene::operator::unmet(&declared.schema, &actual, &applied, registry)
+        let Some(miss) = rusd_scene::operator::unmet(declared, &actual, &applied, registry)
         else {
             return;
         };
-        let message = match miss {
-            Miss::Type { declared, actual } => {
-                format!("operator declares `{slot}` as a `{declared}` but {raw} is a `{actual}`")
-            }
-            Miss::Api { missing } => format!(
-                "operator declares `{slot}` with `{missing}` but {raw} (`{actual}`) has it applied \
-                 neither by itself nor through its type"
-            ),
-        };
-        self.warn(Diagnostic::error("E_SCHEMA", message).at_prim(base));
+        self.warn(
+            Diagnostic::error(
+                "E_SCHEMA",
+                format!("operator's `{slot}` {} ({raw})", miss.describe()),
+            )
+            .at_prim(base),
+        );
     }
 
     /// Drain accumulated warnings (called by the engine after eval).
