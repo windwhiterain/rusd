@@ -748,10 +748,14 @@ fn structure_rows(structure: &[(String, Option<String>)]) -> Option<TreeNode> {
             .and_then(|(_, s)| s.clone())
             .filter(|s| !s.is_empty());
         let leaf = path.rsplit('/').next().unwrap_or(path);
-        // **The row is the USD path of that level**, spelled whole: `/World`,
-        // `/World/Samples`, `/World/Samples/points`. A path is how a prim is addressed, and
-        // the schema that level composes to is the row's tooltip.
-        let label = path.to_owned();
+        // **The row is the USD path of that level, and the schema it composes to**:
+        // `/World/Volume : Cube`, `/World/Samples/points : Points`. The path is how a prim is
+        // addressed; the schema is what the hierarchy *is* — one row carries both, so
+        // neither is left to a tooltip.
+        let label = match schema.as_deref().filter(|s| !s.is_empty()) {
+            Some(schema) => format!("{path} : {schema}"),
+            None => path.to_owned(),
+        };
         let children = structure
             .iter()
             .filter(|(p, _)| p.rsplit_once('/').map(|(parent, _)| parent == path).unwrap_or(false))
@@ -768,7 +772,7 @@ fn structure_rows(structure: &[(String, Option<String>)]) -> Option<TreeNode> {
             secondary: Some("render".to_owned()),
             hover: Some(match schema.as_deref().filter(|s| !s.is_empty()) {
                 Some(schema) => format!("{path} : {schema}"),
-                None => format!("{path} : {leaf} (no typeName)"),
+                None => format!("{path} (no typeName)"),
             }),
             children,
         }    }
