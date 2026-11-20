@@ -1205,6 +1205,9 @@ impl Shell {
         let Some(path) = selection.prim.clone() else {
             return;
         };
+        // **The clicked row is the selected one**: a `Render` row lit nothing before, so a
+        // click on an operator's `input` looked like it had not landed.
+        self.tree.selection = Some(selection);
         let shown = self.model.preview.clone();
         match self.tree.model.owner_of(&path) {
             Some(owner) if Some(owner.clone()) != shown => {
@@ -1254,6 +1257,16 @@ impl Shell {
         // marker belongs to the server-side preview path, and leaving it set here re-opened
         // the layer on every tree refresh — while the sync was rewriting the very file.
         self.pending_preview = None;
+        // **A different USD is a different picture** (v1.13): the selection and 「只看选中」
+        // name paths of the USD that was open, so they are cleared before another one is
+        // composed — otherwise the filter asks for a path this file does not have (the
+        // render after clicking terrain.rusd then a boxes row failed on
+        // `/World/Samples/points`).
+        if self.only_selected {
+            self.toggle_only_selected();
+        }
+        self.model.selection = None;
+        self.pending_render = None;
         match ask {
             Some(_) => self.show_layer_local(&id),
             None => {}

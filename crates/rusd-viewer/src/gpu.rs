@@ -674,6 +674,7 @@ impl Viewport {
             let mut moved = std::collections::BTreeMap::new();
             let mut vertex_at = 0u32;
             let mut index_at = 0u32;
+            let mut rebased: Vec<u32> = Vec::new();
             let mut slabs: Vec<(String, Slot)> = self
                 .slots
                 .iter()
@@ -683,7 +684,8 @@ impl Viewport {
             let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("viewer-compact"),
             });
-            if let (Some(from_v), Some(from_i)) = (&old_vertex, &old_index) {
+            if let Some(from_v) = &old_vertex {
+                let _ = &old_index;
                 for (path, slot) in slabs {
                     if slot.vcount > 0 {
                         encoder.copy_buffer_to_buffer(
@@ -694,20 +696,21 @@ impl Viewport {
                             u64::from(slot.vcount) * stride,
                         );
                     }
-                    if slot.icount > 0 {
-                        encoder.copy_buffer_to_buffer(
-                            from_i,
-                            u64::from(slot.istart) * 4,
-                            &new_index,
-                            u64::from(index_at) * 4,
-                            u64::from(slot.icount) * 4,
-                        );
+                    // **Rebase, do not copy**: the indices are absolute, so a slab that moves
+                    // from `slot.vstart` to `vertex_at` has every index shifted by the same
+                    // delta. Copying them raw drew triangles between prims.
+                    let delta = i64::from(vertex_at) - i64::from(slot.vstart);
+                    let mut slab_indices: Vec<u32> = Vec::with_capacity(slot.indices.len());
+                    for i in &slot.indices {
+                        slab_indices.push((i64::from(*i) + delta) as u32);
                     }
+                    rebased.extend(slab_indices.iter().copied());
                     moved.insert(
                         path,
                         Slot {
                             vstart: vertex_at,
                             istart: index_at,
+                            indices: slab_indices,
                             ..slot
                         },
                     );
@@ -716,6 +719,10 @@ impl Viewport {
                 }
             }
             self.queue.submit(Some(encoder.finish()));
+            if !rebased.is_empty() {
+                self.queue
+                    .write_buffer(&new_index, 0, bytemuck::cast_slice(&rebased));
+            }
             self.slots = moved;
             self.vertex_len = vertex_at;
             self.index_len = index_at;
@@ -809,6 +816,7 @@ impl Viewport {
                     istart,
                     icount,
                     shown: true,
+                    indices: indices.clone(),
                 },
             );
             self.rewritten += 1;
@@ -1450,6 +1458,11 @@ struct Slot {
     /// Whether this slab is drawn: a filter clears it without freeing the slab, so the
     /// prim's geometry is still there the moment it comes back.
     shown: bool,
+    /// The slab's indices **as baked** (absolute: `slab base + mesh index`). Kept on the
+    /// CPU because a compaction moves the slab's vertices to a new base, and an absolute
+    /// index that is not rebased points into somebody else's vertices — boxes joined by
+    /// long triangles was exactly that.
+    indices: Vec<u32>,
 }
 
 /// The vertices and indices one prim needs.
