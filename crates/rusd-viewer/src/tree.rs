@@ -824,32 +824,53 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         });
     }
 
-    // **The hierarchy the operator declares** (v1.13, the user's ruling): its inputs and
-    // outputs are USD named structures, drawn as the paths they are — `World / Samples /
-    // points` — and a click renders that path alone. The one external USD is a
-    // `reference → <file>:<prim>` row; everything else is a branch of this hierarchy.
+    // **Each declared input, by its name** (v1.12), followed by the USD structure it
+    // resolves to (v1.12): `domain → terrain.rusd:/World/Terrain`, `points →
+    // /World/Samples/points`, `prototype → box.rusd:/World/Prototypes/Box`. The name is
+    // the document's — it is what the operator's table says — and the right-hand side is
+    // the named structure, so both halves of the ruling are on the row.
+    //
+    // An input that names a prim of this stack also renders that path alone (`render`);
+    // one that names another layer is that layer's row, opened on click.
     for input in &layer.inputs {
-        if let (Some(asset), Some(prim)) = (&input.asset, &input.prim) {
-            children.push(TreeNode {
-                id: asset.clone(),
-                kind: TreeNodeKind::Arc,
-                label: format!(
-                    "reference \u{2192} {}:{prim}",
+        let (id, prim, label, render) = match (&input.asset, &input.prim) {
+            (Some(asset), Some(prim)) => (
+                asset.clone(),
+                None,
+                format!(
+                    "{} \u{2192} {}:{prim}",
+                    input.slot,
                     strip_anon_prefix(asset).rsplit(['/', '\\']).next().unwrap_or(asset)
                 ),
-                prim: None,
-                op: false,
-                root: false,
-                session: false,
-                secondary: None,
-                hover: Some(format!("文档声明的输入 {} = {}", input.slot, input.value)),
-                children: Vec::new(),
-            });
-        }
+                false,
+            ),
+            (None, Some(prim)) => (
+                format!("prim:{prim}"),
+                Some(prim.clone()),
+                format!("{} \u{2192} {prim}", input.slot),
+                true,
+            ),
+            _ => continue,
+        };
+        children.push(TreeNode {
+            id,
+            kind: TreeNodeKind::Arc,
+            label,
+            prim,
+            op: false,
+            root: false,
+            session: false,
+            secondary: render.then(|| "render".to_owned()),
+            hover: Some(format!("文档声明的输入 {} = {}", input.slot, input.value)),
+            children: Vec::new(),
+        });
     }
+
+    // **The hierarchy those names resolve into** (v1.13): the same structures, as the
+    // paths they are — `World / Samples / points` — because a name alone does not say
+    // what shape the operator reads and writes.
     let mut named: Vec<String> = layer.outputs.clone();
-    named.extend(
-        layer
+    named.extend(        layer
             .inputs
             .iter()
             .filter(|i| i.asset.is_none())
