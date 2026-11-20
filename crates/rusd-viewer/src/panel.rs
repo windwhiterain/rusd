@@ -153,15 +153,6 @@ pub struct TreePanel {
     /// panel sends — a click sends the row's own identifier — so a stale copy cannot
     /// make a click ask for the wrong prefix, only mis-colour one row for a pass.
     pub preview: Option<String>,
-    /// The layer row to bring into view on the next pass: a click on an arc's target-layer
-    /// leaf asks the tree to jump to that layer's own first-level row, which is a row a
-    /// reader may have scrolled far from (`TreePanel::scroll_target`).
-    ///
-    /// **Taken, not merely read**, at the start of the pass that draws ([`tree_panel`]),
-    /// and set again by a click during that pass: so a click schedules exactly one scroll
-    /// for the following frame, and a target the tree no longer holds just falls away
-    /// instead of pinning the view somewhere forever.
-    pub scroll_target: Option<String>,
     /// Whether a `composition_tree` request is **outstanding**.
     ///
     /// A `state_changed` now asks for the tree (a patch or an opinion can add or drop a
@@ -213,18 +204,6 @@ impl TreePanel {
     /// panel is then not left believing one is outstanding).
     pub fn note_asked(&mut self, outstanding: bool) {
         self.asking = outstanding;
-    }
-
-    /// Ask the tree to bring a **layer's own row** into view on the next pass.
-    ///
-    /// This is what makes a click on an arc's target-layer leaf land somewhere: the leaf
-    /// selects that layer and asks its detail, and the layer's first-level row may be
-    /// scrolled far away, so a `Select` of a `Layer` row also sets this (the shell does
-    /// it, once, in `on_tree_select`). Nothing here checks that the tree holds the id:
-    /// [`tree_panel`] takes the target at the top of a pass and a row that never matches
-    /// simply leaves it spent.
-    pub fn scroll_to(&mut self, id: impl Into<String>) {
-        self.scroll_target = Some(id.into());
     }
 
     /// Take a `comp_node{id}` answer.
@@ -462,7 +441,6 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
     // `&mut` and cleared by the row that uses it: the tree holds a layer twice (its own
     // first-level row and every arc leaf that names it), and clearing is what keeps the
     // second match from scrolling somewhere else afterwards.
-    let mut scroll_to = panel.scroll_target.take();
     // **[v1.4] the whole body reads which rows are previews from the rows themselves.**
     // `row` returns a `TreeAction`, not a `TreeSelection`, so the click rule lives in
     // exactly one place: [`action_for`], over the flags `crate::tree::roots` set.
@@ -480,7 +458,6 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
                         root_index,
                         panel.selection.as_ref(),
                         panel.preview.as_deref(),
-                        &mut scroll_to,
                     )
                 {
                     action = a;
@@ -526,12 +503,6 @@ fn at_depth(action: TreeAction, depth: usize) -> TreeAction {
 /// collapsed/expanded state between them: opening one would open the other, and a
 /// click on one would be read as a click on the other. `(id, root, depth)` is unique
 /// per row of a drawn tree, because a row's depth and its root each have one path.
-///
-/// `scroll_to` is the id the panel is bringing into view (v1.5.8). **Only the
-/// first-level row of that layer scrolls**: a layer is drawn once as its own root row
-/// and again as a leaf under every arc that reaches it, so `depth == 0` is what says
-/// which of them a reader means by "that layer's row". The row that scrolls clears the
-/// target, so the leaf's later match in the same pass has nothing left to do.
 fn row(
     ui: &mut egui::Ui,
     node: &TreeNode,
@@ -539,7 +510,6 @@ fn row(
     root: usize,
     selected: Option<&TreeSelection>,
     preview: Option<&str>,
-    scroll_to: &mut Option<String>,
 ) -> Option<TreeAction> {
     // **One click, one lit row.** Rows share ids on purpose — a layer's own row, the leaf
     // under every arc that reaches it, and (v1.9) the arc class that points at it all name
@@ -589,7 +559,6 @@ fn row(
     let click_action = action_for;
 
     // Whether this row is the one the panel was asked to bring into view.
-    let wants_scroll = depth == 0 && scroll_to.as_deref() == Some(node.id.as_str());
 
     let mut clicked: Option<TreeAction> = None;
     // **A row of a declared hierarchy is always drawn with what it holds** (v1.13):
@@ -607,10 +576,6 @@ fn row(
             let response = ui
                 .selectable_label(is_selected, text)
                 .on_hover_text(row_hover_text(node, true));
-            if wants_scroll {
-                response.scroll_to_me(Some(Align::Center));
-                *scroll_to = None;
-            }
             if response.clicked() {
                 // The same rule as every other row: a control layer row is a layer row.
                 clicked = Some(at_depth(click_action(node), depth));
@@ -622,7 +587,7 @@ fn row(
             subtitle(ui, node);
         });
         for child in &node.children {
-            if let Some(a) = row(ui, child, depth + 1, root, selected, preview, scroll_to) {
+            if let Some(a) = row(ui, child, depth + 1, root, selected, preview) {
                 clicked = Some(a);
             }
         }
@@ -632,10 +597,6 @@ fn row(
             let response = ui
                 .selectable_label(is_selected, text)
                 .on_hover_text(row_hover_text(node, is_preview_row(node)));
-            if wants_scroll {
-                response.scroll_to_me(Some(Align::Center));
-                *scroll_to = None;
-            }
             if response.clicked() {
                 clicked = Some(at_depth(click_action(node), depth));
             }
@@ -715,10 +676,6 @@ fn row(
             let response = ui
                 .selectable_label(is_selected, text)
                 .on_hover_text(row_hover_text(node, is_preview_row(node)));
-            if wants_scroll {
-                response.scroll_to_me(Some(Align::Center));
-                *scroll_to = None;
-            }
             if response.clicked() {
                 clicked = Some(at_depth(click_action(node), depth));
             }
@@ -726,7 +683,7 @@ fn row(
         });
         if open {
             for child in &node.children {
-                if let Some(a) = row(ui, child, depth + 1, root, selected, preview, scroll_to) {
+                if let Some(a) = row(ui, child, depth + 1, root, selected, preview) {
                     clicked = Some(a);
                 }
             }

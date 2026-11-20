@@ -1174,7 +1174,6 @@ impl Shell {
         // far out of sight, and an arc's target-layer leaf is a click on the layer, so
         // the panel brings the layer's own first-level row into view on the next pass.
         if sel.kind == crate::tree::TreeNodeKind::Layer {
-            self.tree.scroll_to(&sel.id);
         }
         self.tree.selection = Some(sel);
         self.request_repaint();
