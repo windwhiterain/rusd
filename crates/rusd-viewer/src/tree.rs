@@ -785,14 +785,28 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     // hierarchy the operator *declares* has exactly the number of entries its document's
     // inputs table has.
     if !layer.inputs.is_empty() {
-        // **An operator has one USD input, and that USD's hierarchy is its schema**
-        // (v1.13, the user's ruling). A same-stack prim the op also reads — the point
-        // cloud it instances, another operator's output — is not a second input: it lives
-        // in the same USD, so it is not part of the schema.
-        for input in layer.inputs.iter().filter(|i| i.asset.is_some()) {
-            if let Some(root) = structure_rows(&input.structure, &input.slot) {
-                children.push(root);
-            }
+        // **The operator's schema is its declared inputs** (v1.13): `{points, prototype}`
+        // for an `instances` op, `{domain}` for a sampler. A stage root (`/World`) or the
+        // prim inside a structure (`Box`) is not part of it — the schema is the set of
+        // things the operator declares it takes, and each row is one of them.
+        for input in &layer.inputs {
+            let (id, prim) = match (&input.asset, &input.prim) {
+                (Some(asset), _) => (asset.clone(), None),
+                (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
+                _ => continue,
+            };
+            children.push(TreeNode {
+                id,
+                kind: TreeNodeKind::Arc,
+                label: input.slot.clone(),
+                prim: prim.clone(),
+                op: false,
+                root: false,
+                session: false,
+                secondary: Some(if prim.is_some() { "render" } else { "open" }.to_owned()),
+                hover: Some(input.value.clone()),
+                children: Vec::new(),
+            });
         }
 
         return TreeNode {
@@ -1938,6 +1952,8 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
+
 
 
 
