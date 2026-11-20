@@ -153,17 +153,22 @@ fn author_inputs(
         // A **named structure** is an `Xform`: a container that carries no geometry of its
         // own (the entry names where the structure lives, the string attribute below says
         // which). A typeless `def` would be `unknown schema ''` to the reader.
-        PrimSpec::new(d, child.as_str(), Specifier::Def, "Xform")?;        // **The schema node names an input; it does not pull that USD in** (v1.13): 不同的东西
-        // 在各自的 USD。 It records the target as a string and draws nothing, so this file
-        // holds only what this operator computed.
+        PrimSpec::new(d, child.as_str(), Specifier::Def, "Xform")?;
+        // **The structure carries its own name, not a word of the document's** (v1.13, the
+        // user's ruling: 「USD 的 hierarchy 就是算子的 schema」): `domain` holds the USD its
+        // `domain` comes from, `prototype` the one its prototype comes from. `input` is the
+        // operator graph's word for “the one USD this node reads” — it is not part of any
+        // schema, so it is not a name a product should spell.
+        //
+        // The node names its target; it does not pull that USD in (不同的东西在各自的 USD):
+        // a string, no reference, so this file holds only what this operator computed.
         let mut target = AttributeSpec::new(
             d,
-            format!("{child}.input").as_str(),
+            format!("{child}.{slot}").as_str(),
             "string",
             Variability::Uniform,
             false,
-        )?;
-        target.set_default(SdfValue::String(value.clone()))?;
+        )?;        target.set_default(SdfValue::String(value.clone()))?;
     }
     Ok(())
 }
