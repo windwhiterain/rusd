@@ -12,7 +12,8 @@ Rusd = 面向 Agentic PCG 的 USD 方言 + 配套渲染器，纯 Rust 实现。
 1. **可编辑性**：agent 用最小 diff 精确编辑。每个 prim 一个区块，绝对路径寻址，规范化排序。
 2. **确定性**：同 seed + 同输入 ⇒ 同场景 ⇒ 同像素。RNG 流按路径键控，编辑别处不 reshuffle。
 3. **可反馈**：校验诊断、渲染结果（含 prim-id 分割 pass）全部机器可读，支撑自我纠正循环。
-4. **过程化第一公民**：generator 是 schema，展开是解释器行为；文件里永远存参数，不存烘焙结果。
+4. **过程化第一公民**：算子是 **Rust function**（D15），签名即 schema；展开是解释器行为；
+   文件里永远存参数，不存烘焙结果。
 
 贯穿性需求：**增量**（§6）。快速迭代是 agentic 编辑的生命线，管线每一层都必须可增量。
 
@@ -70,7 +71,9 @@ Rusd 专注 agent 优先的表层语法、过程化展开、增量前端与渲�
 > 没有算子。`.ops.toml` 是**算子图**：只有 `operator` 与它的参数，不作者任何 prim。
 > 生成器名是 **operator**，不是 schema——它只在算子图里被引用，任何 layer 都不会
 > 把它写成 `typeName`；schema 注册表对它一概不认（`schema::lookup("RusdInstances")`
-> 返回 `None`，算子表在 `rusd_scene::operator`）。
+> 返回 `None`）。**算子是 Rust function**（D15）：签名与端口表在 `rusd_script::ops`，
+> 参数表在 `rusd_scene::operator`。一个 Rust script 调用算子 function，同时生成这两套
+> 文件（`rusd script run`，docs/SCRIPT.md）——图与素材层都是脚本的产物。
 
 ## 3. 类型与 Schema
 
@@ -85,6 +88,11 @@ Rusd 专注 agent 优先的表层语法、过程化展开、增量前端与渲�
   `RusdStreetGrid, RusdBuilding, RusdBlockFill` + 通用 `RusdScatter`；后续 `RusdLSystem,
   RusdTerrain, RusdWfc`。参数与组合详见 `docs/GENERATORS.md`。
 - 未知 schema：警告 `W_UNKNOWN_SCHEMA`，按无类型 prim 保留（前向兼容，同 USD 精神）。
+- **类型校验在编译期（D15，v1.15）**：算子是 Rust function，端口的类型是 Rust 类型
+  （`Prim<Gprim>`、`List<Prim<Cube>>`、具名 struct），`IsA` 是 trait bound，由 USD 自己的
+  schema manifest 生成。Rust script 接错线**不编译**（rustc `E0277`，指向脚本那一行），
+  不是 cook 之后的 `E_SCHEMA`。运行时校验保留给手写 `.ops.toml`，其端口表从同一批 Rust
+  类型导出（`rusd_script::ops::{inputs, outputs}`）。详见 `docs/SCRIPT.md`。
 - **诊断**（JSON，code 稳定、一旦发布不复用）：
 
 ```json
@@ -206,6 +214,7 @@ parse (CST) → compose → validate → expand → render
 | --- | --- | --- |
 | `rusd-core` | 路径、类型化值、TOML profile 解析（toml_edit CST）、规范 writer、诊断 | M0–M1 |
 | `rusd-scene` | openusd Stage 薄适配层：TOML→Stage 下沉、schema 注册表、诊断映射、overlay/provenance | M2 |
+| `rusd-script` | 算子 = Rust function（签名即 schema）、Rust script 表面、图/USD 生成、脚本编译校验（D15） | v1.15 |
 | `rusd-proc` | generator 运行时、路径键控 RNG、展开缓存、预算 | M3 |
 | `rusd-render` | wgpu 渲染核心、passes、headless + viewport | M4 |
 | `rusd-cli` | `rusd` 二进制：fmt / validate / expand / render / serve / export | M1 起 |
@@ -246,6 +255,15 @@ parse (CST) → compose → validate → expand → render
   确定性：openusd 0.8 双端 pin、同 win-x64；只序列化命名 identifier（匿名 id 是进程计数器）；
   resolver identity 双端恒等；wire 用 usda/usdc 不用 usdz（zip 时间戳风险）。
   取代原 M4 的"进程内 winit + egui 热重载 viewer"，M4 重排为 M4'（见 ROADMAP）。
+
+- **D15**（2026-11-20）：**类型校验从运行时移到 Rust script；一个算子定义就是一个 Rust
+  function**（docs/SCRIPT.md）。算子的输入/输出端口是 Rust 类型（`Prim<T>`、`List<T>`、
+  `Arr<T,N>`、具名 struct），`IsA`/`HasAPI` 是 trait bound，由 `rusd-scene` 的 schema
+  manifest 经 `build.rs` 生成（与运行时 `UsdSchemaRegistry::IsA` 逐对一致，有测试钉死）。
+  Rust script 调用算子 function、造 Struct/Array/Vec，生成算子图（`.ops.toml`）与 USD
+  嵌套（`.rusd`）；`rusd script check|run` 把 rustc 诊断映射成 JSON（`E_SCRIPT_TYPE`）。
+  cook 的运行时端口表从这些 Rust 类型导出，手写静态表删除——一份声明，两个读者。
+  运行时校验保留给手写图。原 v1.14 的静态端口表关闭。
 
 开放：
 
