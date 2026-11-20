@@ -555,7 +555,11 @@ fn row(
     let wants_scroll = depth == 0 && scroll_to.as_deref() == Some(node.id.as_str());
 
     let mut clicked: Option<TreeAction> = None;
-    if is_preview_row(node) {
+    // **A row of a declared hierarchy is always drawn with what it holds** (v1.13):
+    // `points` / `prototype` and the path levels under them are one structure, and a
+    // collapsed level is a level the reader cannot see in the tree. Collapsing is the
+    // twisty of a *layer* row, which is what `is_preview_row` is about; these are not.
+    if is_preview_row(node) || node.secondary.is_some() {
         // **A control row is a control, not a twisty.** Its click previews; if it also
         // collapsed its subtree, one click would mean two things and the user could not
         // expand without changing what the viewport composes. A control layer's children
