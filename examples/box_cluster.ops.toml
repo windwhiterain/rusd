@@ -13,7 +13,7 @@ up_axis = "Z"
 [operator.Samples]
 operator    = "sample_points"
 description = "在 Volume 盒内均匀采 60 个点（第一阶段）"
-output      = "/World/Samples"
+output      = "samples.rusd:/World/Samples"
 input       = "volume.rusd:/World/Volume"
 count = 60
 seed  = 11
@@ -21,7 +21,7 @@ seed  = 11
 [operator.Boxes]
 operator    = "instances"
 description = "每个点放一个 box，得到一簇 box（原型来自素材层）"
-output      = "/World/Boxes"
+output      = "boxes.rusd:/World/Boxes"
 input       = "box.rusd:/World/Prototypes/Box"
 max_prims = 5000
 seed      = 11

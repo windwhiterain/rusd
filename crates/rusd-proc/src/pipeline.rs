@@ -147,28 +147,21 @@ fn author_inputs(
     d: &mut dyn sdf::AbstractData,
     base: &str,
     inputs: &[(String, String)],
-    doc_dir: Option<&str>,
 ) -> AuthResult {
     for (slot, value) in inputs {
         let child = format!("{base}/{slot}");
         PrimSpec::new(d, child.as_str(), Specifier::Def, "")?;
-        let Ok(reference) = rusd_scene::reference::parse(value, doc_dir) else {
-            continue;
-        };
-        let Some(asset) = authored_asset(value) else {
-            continue;
-        };
-        let path = reference.path.clone();
-        let op = sdf::ReferenceListOp::explicit([sdf::Reference {
-            asset_path: asset,
-            prim_path: path,
-            ..Default::default()
-        }]);
-        d.set_field(
-            &sdf::path(&child)?,
-            sdf::FieldKey::References.as_str(),
-            SdfValue::ReferenceListOp(op),
-        );
+        // **The schema node names an input; it does not pull that USD in** (v1.13): 不同的东西
+        // 在各自的 USD。 It records the target as a string and draws nothing, so this file
+        // holds only what this operator computed.
+        let mut target = AttributeSpec::new(
+            d,
+            format!("{child}.input").as_str(),
+            "string",
+            Variability::Uniform,
+            false,
+        )?;
+        target.set_default(SdfValue::String(value.clone()))?;
     }
     Ok(())
 }
@@ -243,7 +236,7 @@ impl Generator for RusdSamplePoints {
                 let d = l.data_mut();
                 PrimSpec::new(d, base.as_str(), Specifier::Def, "Xform")?;
                 author_cloud(d, &cloud, &local)?;
-                author_inputs(d, &base, &ctx_inputs, ctx_doc_dir)?;
+                author_inputs(d, &base, &ctx_inputs)?;
                 Ok(())
             })
             .map_err(|e| vec![Diagnostic::error("E_GEN", e.to_string()).at_prim(&base)])?;
@@ -382,7 +375,7 @@ impl Generator for RusdInstances {
                     let s = sample_dist(&mut rng, scale_dist.as_ref(), 1.0);
                     author_reference(d, &pp, &proto_asset, &proto_path, to_local(inv, *world), s)?;
                 }
-                author_inputs(d, &base, &ctx_inputs, ctx_doc_dir)?;
+                author_inputs(d, &base, &ctx_inputs)?;
                 Ok(())
             })
             .map_err(|e| vec![Diagnostic::error("E_GEN", e.to_string()).at_prim(&base)])?;
@@ -392,4 +385,6 @@ impl Generator for RusdInstances {
         Ok(layer)
     }
 }
+
+
 

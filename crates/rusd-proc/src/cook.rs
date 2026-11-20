@@ -41,6 +41,9 @@ pub struct CookNode {
     /// The directory of the document that named this node, which a relative asset
     /// parameter resolves against (v1.5.8). `None` for a document opened from text.
     pub doc_dir: Option<String>,
+    /// **The USD file the document says this node writes** (v1.13), when its `output` names
+    /// one: `output = "samples.rusd:/World/Samples"` → `out/samples.rusd`.
+    pub output_file: Option<String>,
 }
 
 /// Per-pass counters proving incrementality.
@@ -77,6 +80,8 @@ pub struct CookOp {
     /// **The named prim paths this node's output authors** (v1.13), from
     /// [`CookNode::writes`]: the output half of the hierarchy the operator declares.
     pub writes: Vec<String>,
+    /// The USD file the document says this node writes (v1.13), carried to the [`CookOp`].
+    pub output_file: Option<String>,
 }
 
 /// Result of a cook pass: counters plus diagnostics (warnings/errors).
@@ -271,15 +276,16 @@ impl CookEngine {
                         }
                         None => std::env::temp_dir(),
                     };
-                    let path = dir.join(format!(
-                        "rusd_op_{}_{}.rusd",
-                        std::process::id(),
-                        // A **process-wide** counter, not this engine's: two cooks in one
-                        // process (two sessions in a server, two tests in one binary) each
-                        // start at zero otherwise, and the second overwrites the first's
-                        // products — which reads as "input_points authors no points".
-                        NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    ));
+                    let path = dir.join(match &node.output_file {
+                        // **The document names the file** (v1.13): one USD per operator,
+                        // written where the stack reads it.
+                        Some(file) => file.clone(),
+                        None => format!(
+                            "rusd_op_{}_{}.rusd",
+                            std::process::id(),
+                            NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        ),
+                    });
                     // **Written as a `.rusd` document** (v1.9: 全用 `.rusd`). The layer's
                     // prims, their references and their values — the type of every value
                     // coming back from the schema table, not from its shape. The reference
@@ -379,6 +385,7 @@ impl CookEngine {
                     }),
                     inputs: node.inputs.clone(),
                     writes: node.writes.clone(),
+                    output_file: node.output_file.clone(),
                     layer_id: entry.layer_id.clone(),
                     layer_path: entry.layer_path.to_string_lossy().into_owned(),
                     description: node.description.clone(),
@@ -662,6 +669,7 @@ pub fn nodes_from_doc(
                 _ => None,
             }),
             doc_dir: doc_dir.map(str::to_owned),
+            output_file: prim.output_file.clone(),
         });
     }
     nodes

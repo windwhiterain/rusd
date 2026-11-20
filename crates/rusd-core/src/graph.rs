@@ -118,10 +118,19 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
             ));
             continue;
         };
-        let Ok(path) = crate::PrimPath::parse(output) else {
+        let Ok(path) = crate::PrimPath::parse(match output.rfind(':') {
+            Some(i) if output[i + 1..].starts_with('/') => &output[i + 1..],
+            _ => output,
+        }) else {
             diags.push(Diagnostic::error("E_NAME", format!("not a prim path: {output}")));
             continue;
         };
+        // **The output may name its file** (`samples.rusd:/World/Samples`): one USD writen
+        // per operator, named by the document instead of by a throwaway counter.
+        let output_file = output
+            .rfind(':')
+            .filter(|i| output[i + 1..].starts_with('/') && *i > 0)
+            .map(|i| output[..i].to_owned());
         let mut props: BTreeMap<String, Value> = BTreeMap::new();
         // **One USD input, one USD output** (v1.13): `input = "<file>.rusd:/World/…"` is the
         // single USD this operator references. It is not a table: a node has one input.
@@ -163,6 +172,7 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
             props,
             references: None,
             inputs: declared,
+            output_file,
         });
     }
 

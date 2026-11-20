@@ -38,6 +38,10 @@ pub struct PrimBlock {
     /// as written, so a reader can name it back, and it is a list because an operator may
     /// declare **any number** of inputs. Empty for a `.rusd` document, which declares none.
     pub inputs: Vec<(String, String)>,
+    /// **The USD file this operator writes** (v1.13), when its `output` names one:
+    /// `output = "samples.rusd:/World/Samples"` writes `out/samples.rusd`. `None` keeps the
+    /// engine's own throwaway name.
+    pub output_file: Option<String>,
 }
 
 /// A **layer annotation**: a document node that says something about a layer
@@ -378,6 +382,7 @@ fn walk_prim(
         props,
         references,
         inputs: Vec::new(),
+        output_file: None,
     });
 }
 
