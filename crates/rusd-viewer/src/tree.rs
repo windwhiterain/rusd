@@ -783,9 +783,28 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     // inputs table has.
     if !layer.inputs.is_empty() {
         for input in &layer.inputs {
-            if let Some(root) = structure_rows(&input.structure) {
-                children.push(root);
-            }
+            let (id, prim) = match (&input.asset, &input.prim) {
+                (Some(asset), _) => (asset.clone(), None),
+                (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
+                _ => continue,
+            };
+            // **The row is the input, and the hierarchy it names hangs under it** (v1.13):
+            // `points` / `prototype` / `domain` is what the document calls it — that is how
+            // a reader finds an input — and what it reads is the USD hierarchy, one row per
+            // level, each labelled by the schema that level composes to.
+            let structure = structure_rows(&input.structure).into_iter().collect();
+            children.push(TreeNode {
+                id,
+                kind: TreeNodeKind::Arc,
+                label: input.slot.clone(),
+                prim: prim.clone(),
+                op: false,
+                root: false,
+                session: false,
+                secondary: Some(if prim.is_some() { "render" } else { "open" }.to_owned()),
+                hover: Some(input.value.clone()),
+                children: structure,
+            });
         }
 
         return TreeNode {
@@ -1931,6 +1950,7 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
 
 
