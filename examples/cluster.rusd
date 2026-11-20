@@ -1,0 +1,383 @@
+# rusd 0.1 — a layer as a document (written by `rusd`, v1.9)
+# Values only: the type of every key here comes from the schema table.
+
+[World]
+schema = ""
+
+[World.Boxes]
+schema = "Xform"
+
+[World.Boxes.i000000]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.8868734836578369, -2.1689884662628174, 18.043567657470703]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000001]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.053251266479492, -2.5527186393737793, 17.80611228942871]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000002]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [0.32537904381752014, -2.5752925872802734, 19.50988006591797]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000003]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.03440583124756813, -1.1437653303146362, 18.410348892211914]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000004]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.9701969027519226, -2.8895316123962402, 20.571897506713867]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000005]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-2.7583932876586914, 2.9555604457855225, 18.81998634338379]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000006]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [1.407212734222412, -0.70256507396698, 21.109495162963867]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000007]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.2782839834690094, 1.5648328065872192, 17.3275089263916]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000008]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-1.4813177585601807, -1.2263104915618896, 21.145475387573242]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000009]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [0.41930073499679565, -0.6490865349769592, 22.91912078857422]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000010]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.585411310195923, 0.934035062789917, 18.478200912475586]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000011]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.37085863947868347, 0.5419912934303284, 17.367000579833984]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000012]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [1.8194137811660767, -1.5112868547439575, 21.222110748291016]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000013]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-2.3994929790496826, -0.9970179200172424, 18.91698455810547]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000014]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [1.4317817687988281, 0.36955663561820984, 19.492034912109375]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000015]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-1.907017469406128, 2.580749750137329, 21.02275848388672]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000016]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-2.6274778842926025, -2.312842607498169, 18.21512794494629]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000017]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-2.191859483718872, -2.4331393241882324, 17.644113540649414]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000018]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.4765133559703827, -0.6329076886177063, 22.379077911376953]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000019]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-1.663001537322998, 2.5356407165527344, 17.992124557495117]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000020]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.6144964694976807, -0.642997682094574, 19.51361846923828]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000021]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [0.01024715881794691, -2.2051126956939697, 22.870670318603516]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000022]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-1.4325156211853027, -1.265354037284851, 19.647747039794922]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000023]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-1.8255412578582764, 0.7816951274871826, 17.61432456970215]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000024]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [1.9887117147445679, 2.688525915145874, 17.009990692138672]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000025]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [0.7473521828651428, 2.5040206909179688, 18.6685733795166]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000026]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.156440019607544, 1.083857774734497, 18.93228530883789]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000027]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-2.973095417022705, 1.0562348365783691, 19.7817440032959]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000028]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.4914236068725586, 0.7465799450874329, 20.595970153808594]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000029]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-1.662908673286438, -1.226520299911499, 18.039962768554688]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000030]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.0864102840423584, 0.6262286305427551, 17.423181533813477]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000031]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [1.4394780397415161, -0.788868248462677, 22.366138458251953]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000032]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.9721378087997437, 0.08533817529678345, 20.425125122070313]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000033]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [0.0635131448507309, -1.8664026260375977, 20.341623306274414]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000034]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [1.4876976013183594, 1.313930630683899, 17.928936004638672]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000035]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.1404783725738525, -2.5505361557006836, 17.843957901000977]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000036]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [0.8751392364501953, -0.978325605392456, 21.067590713500977]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000037]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-1.0648525953292847, 2.856428861618042, 19.034088134765625]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000038]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-2.7469072341918945, -2.0529189109802246, 17.338207244873047]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000039]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.078970193862915, -1.0386123657226563, 17.584388732910156]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000040]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [0.2443050742149353, 2.8303887844085693, 17.1368350982666]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000041]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.9790537357330322, 1.7626489400863647, 18.210826873779297]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000042]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.2150404453277588, -2.546816825866699, 19.971172332763672]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000043]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-2.4180164337158203, 0.67734295129776, 19.092880249023438]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000044]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.2780802249908447, 0.19135062396526337, 17.645076751708984]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000045]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.11522449553012848, -1.8412293195724487, 21.105424880981445]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000046]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [0.8897318243980408, 0.2758413553237915, 20.807571411132813]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000047]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [1.9099634885787964, -1.7406128644943237, 18.6171932220459]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000048]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.107546329498291, 1.032332181930542, 21.235919952392578]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000049]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.35714784264564514, 2.599458932876587, 19.050201416015625]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000050]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.2285120487213135, -2.5678110122680664, 17.22894859313965]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000051]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-1.2032026052474976, -0.5172984600067139, 22.64466667175293]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000052]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.248514413833618, -1.3879873752593994, 19.876070022583008]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000053]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [0.43015727400779724, 2.3921725749969482, 18.421220779418945]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000054]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [2.47039794921875, 1.4209582805633545, 17.418987274169922]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000055]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.021416082978248596, 0.08846794068813324, 21.786720275878906]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000056]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-1.2949292659759521, -0.8018109202384949, 22.17819595336914]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000057]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [0.4302121698856354, -0.43178582191467285, 18.096363067626953]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000058]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [1.7761824131011963, 0.4297269582748413, 17.756362915039063]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Boxes.i000059]
+schema = "Cube"
+"size" = 0.6
+"xformOp:translate" = [-0.7964945435523987, -2.0209670066833496, 22.963563919067383]
+"xformOpOrder" = ["xformOp:translate"]
+
+[World.Samples]
+schema = "Xform"
+
+[World.Samples.points]
+schema = "Points"
+"points" = [[-0.8868734836578369, -2.1689884662628174, 18.043567657470703], [2.053251266479492, -2.5527186393737793, 17.80611228942871], [0.32537904381752014, -2.5752925872802734, 19.50988006591797], [-0.03440583124756813, -1.1437653303146362, 18.410348892211914], [-0.9701969027519226, -2.8895316123962402, 20.571897506713867], [-2.7583932876586914, 2.9555604457855225, 18.81998634338379], [1.407212734222412, -0.70256507396698, 21.109495162963867], [-0.2782839834690094, 1.5648328065872192, 17.3275089263916], [-1.4813177585601807, -1.2263104915618896, 21.145475387573242], [0.41930073499679565, -0.6490865349769592, 22.91912078857422], [2.585411310195923, 0.934035062789917, 18.478200912475586], [-0.37085863947868347, 0.5419912934303284, 17.367000579833984], [1.8194137811660767, -1.5112868547439575, 21.222110748291016], [-2.3994929790496826, -0.9970179200172424, 18.91698455810547], [1.4317817687988281, 0.36955663561820984, 19.492034912109375], [-1.907017469406128, 2.580749750137329, 21.02275848388672], [-2.6274778842926025, -2.312842607498169, 18.21512794494629], [-2.191859483718872, -2.4331393241882324, 17.644113540649414], [-0.4765133559703827, -0.6329076886177063, 22.379077911376953], [-1.663001537322998, 2.5356407165527344, 17.992124557495117], [2.6144964694976807, -0.642997682094574, 19.51361846923828], [0.01024715881794691, -2.2051126956939697, 22.870670318603516], [-1.4325156211853027, -1.265354037284851, 19.647747039794922], [-1.8255412578582764, 0.7816951274871826, 17.61432456970215], [1.9887117147445679, 2.688525915145874, 17.009990692138672], [0.7473521828651428, 2.5040206909179688, 18.6685733795166], [2.156440019607544, 1.083857774734497, 18.93228530883789], [-2.973095417022705, 1.0562348365783691, 19.7817440032959], [2.4914236068725586, 0.7465799450874329, 20.595970153808594], [-1.662908673286438, -1.226520299911499, 18.039962768554688], [2.0864102840423584, 0.6262286305427551, 17.423181533813477], [1.4394780397415161, -0.788868248462677, 22.366138458251953], [-0.9721378087997437, 0.08533817529678345, 20.425125122070313], [0.0635131448507309, -1.8664026260375977, 20.341623306274414], [1.4876976013183594, 1.313930630683899, 17.928936004638672], [2.1404783725738525, -2.5505361557006836, 17.843957901000977], [0.8751392364501953, -0.978325605392456, 21.067590713500977], [-1.0648525953292847, 2.856428861618042, 19.034088134765625], [-2.7469072341918945, -2.0529189109802246, 17.338207244873047], [2.078970193862915, -1.0386123657226563, 17.584388732910156], [0.2443050742149353, 2.8303887844085693, 17.1368350982666], [2.9790537357330322, 1.7626489400863647, 18.210826873779297], [-0.2150404453277588, -2.546816825866699, 19.971172332763672], [-2.4180164337158203, 0.67734295129776, 19.092880249023438], [2.2780802249908447, 0.19135062396526337, 17.645076751708984], [-0.11522449553012848, -1.8412293195724487, 21.105424880981445], [0.8897318243980408, 0.2758413553237915, 20.807571411132813], [1.9099634885787964, -1.7406128644943237, 18.6171932220459], [2.107546329498291, 1.032332181930542, 21.235919952392578], [-0.35714784264564514, 2.599458932876587, 19.050201416015625], [2.2285120487213135, -2.5678110122680664, 17.22894859313965], [-1.2032026052474976, -0.5172984600067139, 22.64466667175293], [2.248514413833618, -1.3879873752593994, 19.876070022583008], [0.43015727400779724, 2.3921725749969482, 18.421220779418945], [2.47039794921875, 1.4209582805633545, 17.418987274169922], [-0.021416082978248596, 0.08846794068813324, 21.786720275878906], [-1.2949292659759521, -0.8018109202384949, 22.17819595336914], [0.4302121698856354, -0.43178582191467285, 18.096363067626953], [1.7761824131011963, 0.4297269582748413, 17.756362915039063], [-0.7964945435523987, -2.0209670066833496, 22.963563919067383]]
+"visibility" = "invisible"
+
+[World.Volume]
+schema = "Cube"
+"size" = 6.0
+"xformOp:translate" = [0.0, 0.0, 20.0]
+"xformOpOrder" = ["xformOp:translate"]
+"visibility" = "invisible"

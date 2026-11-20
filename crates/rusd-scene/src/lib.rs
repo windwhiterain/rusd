@@ -6,8 +6,11 @@
 //! - [`adapter`]: lower a parsed document into a composed openusd Stage (D3),
 //!   query it, map composition diagnostics to Rusd JSON, and edit non-destructively
 //!   via the session [`Overlay`] (provenance + undo).
+//! - [`document`]: a layer as a `.rusd` document, and back (v1.9) — what a cooking
+//!   product is written as and re-read from.
 
 pub mod adapter;
+pub mod document;
 pub mod geometry;
 pub mod reference;
 pub mod schema;

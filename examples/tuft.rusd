@@ -1,0 +1,17 @@
+# 素材层：**一丛 tuft**（一个球），一个物体一个 USD。
+#
+# 被 `prototype = "tuft.rusd:/World/Prototypes/Tuft"` 的 reference 弧打开：
+# 跟 box.rusd 同一个机制，只是另一个物体、另一个文件。
+
+[stage]
+default_prim = "/World"
+
+[World]
+schema = "Xform"
+
+[World.Prototypes]
+schema = "Xform"
+
+[World.Prototypes.Tuft]
+schema = "Sphere"
+radius = 0.35

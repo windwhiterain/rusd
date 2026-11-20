@@ -90,6 +90,10 @@ pub struct ProtocolClient {
     writer: TcpStream,
     /// Complete lines from the reader thread, or the reason it stopped.
     lines: std::sync::mpsc::Receiver<Result<String, String>>,
+    /// Whether the reader thread has ended — i.e. the connection is gone. Shared with
+    /// that thread, which sets it the moment the peer closes the socket, so a request
+    /// can tell "no reply yet" from "nobody will ever reply".
+    dead: std::sync::Arc<std::sync::atomic::AtomicBool>,
     next_id: u64,
     /// Notifications that arrived while a request was waiting for its reply
     /// ([`ProtocolClient::take_early`]).
@@ -139,14 +143,19 @@ impl ProtocolClient {
                 .map_err(|e| vec![diag("E_CONNECT", format!("{addr}: {e}"))])?,
         );
         let (tx, lines) = std::sync::mpsc::channel();
+        let dead = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_dead = dead.clone();
         // The reader thread: blocks on the socket for as long as it takes, and hands
-        // over whole lines. A connection that closes ends it with one final error.
+        // over whole lines. A connection that closes ends it with one final error — and
+        // marks the client dead, which is what lets the next request reconnect instead
+        // of writing into a socket nobody reads.
         std::thread::spawn(move || {
             let mut reader = reader;
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
                     Ok(0) => {
+                        reader_dead.store(true, std::sync::atomic::Ordering::SeqCst);
                         let _ = tx.send(Err("the server closed the connection".to_owned()));
                         return;
                     }
@@ -156,6 +165,7 @@ impl ProtocolClient {
                         }
                     }
                     Err(e) => {
+                        reader_dead.store(true, std::sync::atomic::Ordering::SeqCst);
                         let _ = tx.send(Err(format!("read failed: {e}")));
                         return;
                     }
@@ -165,6 +175,7 @@ impl ProtocolClient {
         let mut client = Self {
             writer: stream,
             lines,
+            dead,
             next_id: 1,
             early: Vec::new(),
             addr: addr.to_owned(),
@@ -197,6 +208,30 @@ impl ProtocolClient {
         Ok((client, early))
     }
 
+    /// Whether the connection is up. False once the reader thread has ended — the peer
+    /// closed the socket, or the read failed — and true again after a reconnect.
+    pub fn is_connected(&self) -> bool {
+        !self.dead.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Re-open the connection to the address this client was built for, redo the
+    /// handshake, and take the new socket. Notifications that arrived while a request
+    /// waited are kept: they belong to the caller's view, not to the socket.
+    ///
+    /// This is what makes a viewer survive its server: without it a dead connection was
+    /// discovered only as a request that never answered, and the interface sat on
+    /// 「请求中」 forever.
+    pub fn reconnect(&mut self) -> Result<(), Vec<Diagnostic>> {
+        let addr = self.addr.clone();
+        let (fresh, _early) = Self::open_within(&addr, GREETING_DEADLINE)?;
+        self.writer = fresh.writer;
+        self.lines = fresh.lines;
+        self.dead = fresh.dead;
+        self.next_id = fresh.next_id;
+        self.reply_deadline = fresh.reply_deadline;
+        Ok(())
+    }
+
     /// Send one line and wait for the reply to its `id`, keeping any notification
     /// that arrives first. There is no deadline: use [`ProtocolClient::call_within`]
     /// unless the caller owns a thread it may park forever.
@@ -215,14 +250,26 @@ impl ProtocolClient {
     /// slow and a client that is wedged, and the network thread must tell them
     /// apart — it is the thread everything else waits behind.
     fn call_within(&mut self, line: &str, by: std::time::Instant) -> Result<Call, Vec<Diagnostic>> {
+        // **A dead connection is refused here, not silently re-opened** (v1.9): the
+        // worker owns reconnection — it retries every round and announces `Reconnected`
+        // once — so that one place decides when the wire is back, and the shell hears
+        // about it instead of finding out through a request that happened to work.
+        if !self.is_connected() {
+            return Err(vec![diag(
+                "E_IO",
+                format!("{}: the connection is down; reconnecting", self.addr),
+            )]);
+        }
         let id = parse_id(line)
             .ok_or_else(|| vec![diag("E_WIRE", "a request line with no id".to_owned())])?;
-        self.writer
-            .write_all(line.as_bytes())
-            .map_err(|e| vec![diag("E_IO", format!("{}: write failed: {e}", self.addr))])?;
-        self.writer
-            .flush()
-            .map_err(|e| vec![diag("E_IO", format!("{}: flush failed: {e}", self.addr))])?;
+        if let Err(e) = self.writer.write_all(line.as_bytes()).and_then(|_| self.writer.flush()) {
+            // The write failed: the socket is gone. Report it; the worker re-opens it and
+            // announces a `Reconnected` when a server answers again.
+            return Err(vec![diag(
+                "E_IO",
+                format!("{}: write failed: {e}", self.addr),
+            )]);
+        }
         let mut early = Vec::new();
         loop {
             let left = by.saturating_duration_since(std::time::Instant::now());
@@ -463,6 +510,13 @@ pub enum NetCommand {
         method: String,
         params: serde_json::Value,
     },
+    /// Sync one layer file into the local cache and answer with its path (v1.9).
+    ///
+    /// The worker does the whole exchange — the block manifest, the blocks this cache
+    /// lacks, the reassembly — because it is the thread that owns the connection, and
+    /// because the answer the caller needs is a *file*, not a message. Nothing of the
+    /// layer's geometry ever crosses the wire.
+    SyncLayer { tag: String, path: String },
 }
 
 /// What the network thread reports back.
@@ -487,6 +541,11 @@ pub enum NetEvent {
     },
     /// The connection is over (the server closed it, or IO broke).
     Closed(Vec<Diagnostic>),
+    /// The connection was **re-opened after it died** (v1.9): the worker keeps trying,
+    /// so a server that restarts mid-session comes back without a viewer restart. The
+    /// document is *not* open on the new connection — the shell re-sends `open` — so
+    /// this is "the wire is back", not "the scene is back".
+    Reconnected { addr: String },
     /// `hello`+`subscribe` succeeded: the client knows it is live.
     Live { addr: String },
 }
@@ -534,7 +593,28 @@ impl NetWorker {
             // what lets the commands be drained every round; the socket itself is
             // read on the reader thread and is never truncated by this.
             wake();
+            let mut announced_down = false;
             loop {
+                // **A dead connection is re-opened here** (v1.9). The reader thread sets
+                // the client's `dead` flag the moment the socket ends, and this round
+                // notices it: the viewer keeps trying while the server is away, and says
+                // so when it is back. Without this the only recovery was restarting the
+                // program, and every click in the meantime sat on 「请求中」.
+                if !client.is_connected() {
+                    match client.reconnect() {
+                        Ok(()) => {
+                            announced_down = false;
+                            let _ = ev_tx.send(NetEvent::Reconnected {
+                                addr: client.addr.clone(),
+                            });
+                            wake();
+                        }
+                        // Still away: the next round tries again. The shell was told
+                        // `Closed` when it first died and stays that way until this
+                        // succeeds.
+                        Err(_) => {}
+                    }
+                }
                 // Commands first: a gizmo drag's samples are drained in order, so
                 // the last position sent is the last one the server hears.
                 let mut sent_any = false;
@@ -576,9 +656,17 @@ impl NetWorker {
                                     });
                                 }
                                 Err(diags) => {
-                                    let _ = ev_tx.send(NetEvent::Closed(diags));
-                                    wake();
-                                    return;
+                                    // The connection died under a request (v1.9). Say so once,
+                                    // then **stay in the loop**: the top of every round
+                                    // re-opens the socket, so a server that restarts is picked
+                                    // up without restarting the viewer. Returning here is what
+                                    // used to leave the window dead for good.
+                                    if !announced_down {
+                                        announced_down = true;
+                                        let _ = ev_tx.send(NetEvent::Closed(diags));
+                                        wake();
+                                    }
+                                    continue;
                                 }
                             }
                             // A snapshot that raced the request is delivered
@@ -587,6 +675,72 @@ impl NetWorker {
                             for n in client.take_early() {
                                 let _ = ev_tx.send(NetEvent::Notification(n));
                             }
+                            continue;
+                        }
+                        NetCommand::SyncLayer { tag, path } => {
+                            // **The layer as blocks, into the local cache** (v1.9): the
+                            // manifest, the blocks this cache lacks, the reassembly — all
+                            // here, and the answer is a file path.
+                            let cache = crate::cache::LayerCache::new(
+                                crate::cache::LayerCache::default_dir(),
+                            );
+                            let result = (|| -> Result<serde_json::Value, String> {
+                                let m = client
+                                    .request("layer_blocks", serde_json::json!({ "path": path }))
+                                    .map_err(|d| join_codes(&d))?
+                                    .map_err(|e| e.message)?;
+                                let blocks: Vec<crate::cache::BlockRef> = m
+                                    .get("blocks")
+                                    .and_then(|b| b.as_array())
+                                    .map(|a| {
+                                        a.iter()
+                                            .map(|b| crate::cache::BlockRef {
+                                                key: b
+                                                    .get("key")
+                                                    .and_then(|k| k.as_str())
+                                                    .unwrap_or("")
+                                                    .to_owned(),
+                                                hash: b
+                                                    .get("hash")
+                                                    .and_then(|k| k.as_str())
+                                                    .unwrap_or("")
+                                                    .to_owned(),
+                                            })
+                                            .collect()
+                                    })
+                                    .unwrap_or_default();
+                                let want = cache.missing(&path, &blocks);
+                                let mut fetched = std::collections::BTreeMap::new();
+                                if !want.is_empty() {
+                                    let t = client
+                                        .request(
+                                            "layer_block_text",
+                                            serde_json::json!({ "path": path, "blocks": want }),
+                                        )
+                                        .map_err(|d| join_codes(&d))?
+                                        .map_err(|e| e.message)?;
+                                    if let Some(a) = t.get("blocks").and_then(|b| b.as_array()) {
+                                        for (i, text) in want.iter().zip(a.iter()) {
+                                            if let Some(s) = text.as_str() {
+                                                fetched.insert(*i, s.to_owned());
+                                            }
+                                        }
+                                    }
+                                }
+                                let local = cache.store(&path, &blocks, &fetched)?;
+                                Ok(serde_json::json!({
+                                    "local": local.to_string_lossy(),
+                                    "blocks": blocks.len(),
+                                    "fetched": fetched.len(),
+                                }))
+                            })();
+                            let _ = ev_tx.send(NetEvent::Reply {
+                                tag,
+                                result: result.map_err(|message| protocol::RpcError {
+                                    code: crate::control::NOT_CONNECTED,
+                                    message,
+                                }),
+                            });
                             continue;
                         }
                         NetCommand::Opinion(ops) => ("opinion", client.opinion(&ops)),
@@ -657,9 +811,14 @@ impl NetWorker {
                         continue;
                     }
                     Err(diags) => {
-                        let _ = ev_tx.send(NetEvent::Closed(diags));
-                        wake();
-                        return;
+                        // A read that ends the connection: same rule as above — announce
+                        // it once and let the next round re-open it.
+                        if !announced_down {
+                            announced_down = true;
+                            let _ = ev_tx.send(NetEvent::Closed(diags));
+                            wake();
+                        }
+                        continue;
                     }
                 }
                 wake();
@@ -702,6 +861,8 @@ impl Drop for NetWorker {
     }
 }
 
+use rusd_render::render::RenderOutput;
+
 /// What the UI asks the render thread to do.
 pub enum RenderCommand {
     /// A new scene: bake and upload (the camera is not part of it).
@@ -739,6 +900,18 @@ pub enum RenderCommand {
     },
     /// Resize the render targets.
     Resize { width: u32, height: u32 },
+    /// Copy the last frame back to the CPU — asked for by a `capture` (a PNG to write) or
+    /// a selection's outline, and by nothing else (v1.10: a displayed frame is never
+    /// read back).
+    Grab {
+        reply: std::sync::mpsc::Sender<Result<(Vec<u8>, Vec<u32>), Vec<Diagnostic>>>,
+    },
+    /// One pixel's prim id, read back as **one texel** (a pick on a click).
+    Pick {
+        x: u32,
+        y: u32,
+        reply: std::sync::mpsc::Sender<Result<u32, Vec<Diagnostic>>>,
+    },
 }
 
 /// One finished frame, as the UI needs it.
@@ -749,12 +922,28 @@ pub struct Frame {
     pub seq: u64,
     pub width: u32,
     pub height: u32,
-    /// RGBA8, gamma-encoded (sRGB target), with the selection outline drawn.
+    /// RGBA8, gamma-encoded (sRGB target). **Present only when the CPU asked for it**
+    /// (a `capture`): a frame is displayed straight from [`Frame::view`], so the common
+    /// frame carries no pixels at all.
     pub beauty: Vec<u8>,
-    /// Per-pixel prim ids, for a local pick.
+    /// Per-pixel prim ids — likewise only on request (a pick reads one texel instead).
     pub ids: Vec<u32>,
-    /// id → prim path.
-    pub paths: Vec<String>,
+    /// The GPU texture this frame was drawn into. The UI registers it once as an egui
+    /// texture and paints it, so no bytes cross the bus to be shown (v1.10).
+    pub view: wgpu::TextureView,
+    /// Which generation of render targets `view` belongs to (a resize makes a new one).
+    pub generation: u64,
+    /// id → prim path, shared with the render thread's own list (a frame must not clone
+    /// thousands of strings to hand over a list that has not changed).
+    pub paths: std::sync::Arc<Vec<String>>,
+    /// **What the last scene update actually sent to the GPU**: how many prim slabs were
+    /// re-baked and rewritten, and how many slabs are live. A camera move rewrites 0; a
+    /// drag rewrites 1; a fresh snapshot rewrites only the prims whose geometry moved.
+    /// Carried so "只把变化的部分传给 GPU" is a number, not a promise.
+    pub rewritten: usize,
+    pub slabs: usize,
+    /// How many draw runs those slabs left (contiguous slabs merge).
+    pub draws: usize,
     /// How long this frame took to draw and read back.
     pub millis: f64,
     /// The camera this frame was **drawn with**. Carried because it is the only
@@ -920,6 +1109,16 @@ impl RenderWorker {
                             viewport.resize(width, height);
                             dirty = true;
                         }
+                        // **A readback is not a frame** (v1.10): the textures already hold
+                        // the picture on screen, so these answer out of them and leave
+                        // `dirty` alone — an idle viewer stays still while a capture or a
+                        // pick takes its bytes.
+                        RenderCommand::Grab { reply } => {
+                            let _ = reply.send(viewport.grab());
+                        }
+                        RenderCommand::Pick { x, y, reply } => {
+                            let _ = reply.send(viewport.pick(x, y));
+                        }
                     }
                 }
                 // A batch that changed nothing (a timeout with no work) draws
@@ -939,19 +1138,12 @@ impl RenderWorker {
                     ..Default::default()
                 };
                 let started = std::time::Instant::now();
-                match viewport.render(&o.camera(), bounds, &cfg) {
-                    Ok(mut out) => {
-                        if let Some(sel) = &selection {
-                            annotate::apply_selection(
-                                &mut out,
-                                &[Selection {
-                                    path: sel.clone(),
-                                    color: [255, 60, 60],
-                                    mode: SelectMode::Both,
-                                }],
-                                &style,
-                            );
-                        }
+                // The outline is drawn by the GPU from the id buffer, so a selection no
+                // longer costs a read-back (v1.10): the render thread only has to say
+                // **which** id to outline.
+                let selected_id = selection.as_deref().and_then(|path| viewport.id_of(path));
+                match viewport.render(&o.camera(), bounds, &cfg, selected_id) {
+                    Ok(out) => {
                         seq += 1;
                         let camera = o.camera();
                         if let Ok(mut log) = p.lock() {
@@ -966,7 +1158,12 @@ impl RenderWorker {
                             height: out.height,
                             beauty: out.beauty,
                             ids: out.ids,
-                            paths: out.paths,
+                            view: viewport.beauty_view().clone(),
+                            generation: viewport.generation(),
+                            paths: viewport.paths_arc(),
+                            rewritten: viewport.rewritten,
+                            slabs: viewport.slots_live,
+                            draws: viewport.draws_count(),
                             millis: started.elapsed().as_secs_f64() * 1000.0,
                             camera,
                         });
@@ -1002,6 +1199,23 @@ impl RenderWorker {
     /// coalesces).
     pub fn send(&self, cmd: RenderCommand) {
         let _ = self.cmds.send(cmd);
+    }
+
+    /// The frame on screen, as bytes: what a `capture` writes to a PNG and what a
+    /// selection's outline is drawn on. Blocks the caller for the length of one copy
+    /// (~a few ms) and asks for **nothing** beyond that — the render thread does not
+    /// redraw to answer (v1.10).
+    pub fn grab(&self) -> Option<(Vec<u8>, Vec<u32>)> {
+        let (tx, rx) = channel();
+        self.send(RenderCommand::Grab { reply: tx });
+        rx.recv_timeout(Duration::from_secs(10)).ok()?.ok()
+    }
+
+    /// The prim id at one pixel of the frame on screen: one texel, not a buffer.
+    pub fn pick(&self, x: u32, y: u32) -> Option<u32> {
+        let (tx, rx) = channel();
+        self.send(RenderCommand::Pick { x, y, reply: tx });
+        rx.recv_timeout(Duration::from_secs(10)).ok()?.ok()
     }
 
     /// The newest finished frame, if one arrived since the last call.

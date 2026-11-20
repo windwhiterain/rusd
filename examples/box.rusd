@@ -1,0 +1,18 @@
+# 素材层：**一个 box**，一个物体一个 USD。
+#
+# 被 `prototype = "box.rusd:/World/Prototypes/Box"` 的 reference 弧打开：素材被实例化
+# 就该是 reference（跨资产引用），不是 sublayer。实例只带自己的 translate/scale，
+# 类型与几何全部从这里合成。
+
+[stage]
+default_prim = "/World"
+
+[World]
+schema = "Xform"
+
+[World.Prototypes]
+schema = "Xform"
+
+[World.Prototypes.Box]
+schema = "Cube"
+size = 0.6

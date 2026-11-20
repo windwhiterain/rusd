@@ -347,8 +347,17 @@ impl ClientModel {
                 self.last_reason = None;
                 match MadeScene::from_snapshot(snap, self.aspect) {
                     Ok(made) => {
+                        // **A new composition is a new scene, so it frames itself** (v1.9):
+                        // clicking a row swaps the picture for that layer's own, which can sit
+                        // anywhere and be any size — without a fit the camera stays where the
+                        // previous composition put it, and the layer the user just asked for
+                        // is off-screen. "点了什么都没有" was exactly that.
+                        let changed = self.preview != snap.upto;
                         self.preview = snap.upto.clone();
                         self.adopt(&made);
+                        if changed {
+                            self.rearm_first_fit();
+                        }
                         Effect::NewScene(Box::new(made))
                     }
                     Err(diags) => {

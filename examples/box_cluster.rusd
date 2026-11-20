@@ -23,7 +23,7 @@ position = [14.0, -18.0, 12.0]
 schema = "Camera"
 
 [World.Volume]
-references = "volume.usda:/World/Volume"
+references = "volume.rusd:/World/Volume"
 
 [World.Samples]
 count = 60
@@ -36,17 +36,17 @@ seed = 11
 description = "每个点放一个 box，得到一簇 box（原型来自素材层）"
 input_points = "/World/Samples/points"
 max_prims = 5000
-prototype = "prototypes.usda:/World/Prototypes/Box"
+prototype = "box.rusd:/World/Prototypes/Box"
 schema = "RusdInstances"
 seed = 11
 
 [doc.material]
 description = "可实例化的 box 素材（由 reference 弧打开）"
-layer = "prototypes.usda"
+layer = "box.rusd"
 
 [doc.volume]
 description = "第一阶段的采样域：一个 Cube 素材（由 prim 级 reference 弧打开）"
-layer = "volume.usda"
+layer = "volume.rusd"
 
 [doc.root]
 description = "box_cluster.rusd：第一阶段的作者层"

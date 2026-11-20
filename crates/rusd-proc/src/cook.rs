@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
-use openusd::sdf::LayerOffset;
+use openusd::sdf::{self, LayerOffset};
 use openusd::usd::Stage;
 use rusd_core::{Diagnostic, PrimPath, Value};
 
@@ -49,6 +49,7 @@ pub struct CookStats {
 
 /// One cooked node's output, as the composition tree reports it (PROTOCOL
 /// v1.5.1): which generator ran, what geometry it read, and the layer it authored.
+#[derive(Clone, Debug)]
 pub struct CookOp {
     /// Stable node id (the generator prim path string).
     pub id: String,
@@ -58,6 +59,9 @@ pub struct CookOp {
     pub input: Option<String>,
     /// The node's current output layer identifier (changes on every rebuild).
     pub layer_id: String,
+    /// The file the output layer was written to (v1.9). The layer is **not** in any
+    /// stack: a composition reads this file when it needs the op's prims.
+    pub layer_path: String,
     /// The node's `description`, when the document gives it one (v1.5.9). Node
     /// metadata: the tree carries it on the op row, and it is never authored into
     /// the layer.
@@ -73,15 +77,61 @@ pub struct CookResult {
     pub ops: Vec<CookOp>,
 }
 
+#[derive(Clone)]
 struct MemoEntry {
     key: u64,
     layer_id: String,
+    /// The file this pass's output layer was written to.
+    ///
+    /// **The cook never inserts its layers into a live stack** (v1.9, the user's rule:
+    /// 哪里都不许插入): a picture is composed by building its own stack from these
+    /// files and throwing it away. That is also the only way it can work —
+    /// `sdf::Layer` is not `Clone` and `Stage::insert_layer` takes it by value, so a
+    /// layer that has been inserted once cannot be inserted again; a file can be read
+    /// as often as a composition asks.
+    layer_path: std::path::PathBuf,
+}
+
+/// The stage a node reads: the document, then the layers the earlier nodes wrote,
+/// weakest first. Built for one node and dropped with the pass — v1.9 inserts nothing
+/// into anything that outlives the cook (哪里都不许插入), and `sdf::Layer` is not
+/// `Clone`, so the only way a later node sees an earlier one's prims is to read that
+/// layer back from the file the cook wrote.
+///
+/// **The document is not in this stack** (v1.9): a graph document is not USD, so it
+/// authors no layer. What a node reads is what earlier nodes wrote.
+fn cook_stack(doc: &Stage, produced: &[std::path::PathBuf]) -> Result<Stage, String> {
+    let mut builder = rusd_scene::document::stage_builder();
+    if let Some(session) = doc.session_layer().map(|l| l.identifier().to_owned()) {
+        builder = builder.session_layer(session);
+    }
+    let stack = builder
+        .in_memory("rusd_cook_stack.rusd")
+        .map_err(|e| e.to_string())?;
+    let root = stack.root_layer().identifier().to_owned();
+    for path in produced {
+        // A product is a `.rusd` document now (v1.9): parsed, lowered, and handed
+        // back as the layer `lower` authored under the file's own name.
+        let layer = rusd_scene::document::layer_from_file(path)?;
+        stack
+            .insert_layer(&root, 0, layer, LayerOffset::IDENTITY)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(stack)
 }
 
 /// The cook engine: a generator registry plus per-node memo across passes.
+/// How many product files this **process** has written, so two cooks in one process never
+/// mint the same path (see the `format!` in [`CookEngine::cook`]).
+static NEXT_FILE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 #[derive(Default)]
 pub struct CookEngine {
     generators: HashMap<String, Box<dyn Generator>>,
+    /// Where this pass writes its products. `None` is the system temp directory; a caller
+    /// that knows the document's directory sets `<doc_dir>/out`, so a product sits beside
+    /// the materials it names and its arcs can be **relative** (v1.9).
+    out_dir: Option<std::path::PathBuf>,
     memo: HashMap<String, MemoEntry>,
 }
 
@@ -90,24 +140,81 @@ impl CookEngine {
         Self::default()
     }
 
+    /// Write this pass's products into `dir` (created when the first one is written).
+    pub fn set_out_dir(&mut self, dir: Option<std::path::PathBuf>) {
+        self.out_dir = dir;
+    }
+
     /// Register a generator type by name.
     pub fn register(&mut self, g: Box<dyn Generator>) {
         self.generators.insert(g.name().to_owned(), g);
     }
 
-    /// Cook all nodes in dependency order, reusing memoized outputs whose
-    /// content key is unchanged. Inserts new output layers and mutes superseded ones.
-    pub fn cook(&mut self, stage: &Stage, root_id: &str, nodes: &[CookNode]) -> CookResult {
+    /// Cook all nodes in dependency order, reusing memoized outputs whose content key is
+    /// unchanged, and write each new output layer to its own file.
+    ///
+    /// **Nothing is inserted anywhere** (v1.9: 哪里都不许插入): the products are files, and
+    /// the stack a picture is made from is built by the caller ([`CookResult::ops`] names
+    /// every file). That is also why there is no root-layer argument any more — a cook
+    /// that inserts nothing has no stack to insert into.
+    pub fn cook(&mut self, stage: &Stage, nodes: &[CookNode]) -> CookResult {
         let deps = derive_deps(nodes);
         let order = topo_order(nodes, &deps);
         let by_id: HashMap<&str, &CookNode> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
         let mut stats = CookStats::default();
         let mut diags = Vec::new();
+        // The layers earlier nodes produced, in cook order. A node reads the composed
+        // stage, and with nothing inserted anywhere (v1.9) that stage has to be built
+        // again for every node: the document plus the files written so far. It is a
+        // **throwaway stack** — built here, dropped at the end of the pass, never the
+        // one a picture is made from.
+        let mut produced: Vec<std::path::PathBuf> = Vec::new();
+        // The layer ids the earlier products were written under, which is how a later
+        // generator names them, paired with the file that now holds them.
+        let mut produced_ids: Vec<(String, String)> = Vec::new();
+        // Each earlier product's **anchor prim** and the file that holds it. A generator
+        // that instances another op's product names it as `@<stack>@</World/Boxes>` — a
+        // same-stack reference — and with the products in files, "the stack" is what has
+        // to become the file (see the rewrite below).
+        let mut produced_anchors: Vec<(String, String)> = Vec::new();
 
         for id in &order {
             let node = by_id[id.as_str()];
-            let key = memo_key(stage, node);
-            if self.memo.get(id.as_str()).map(|m| m.key) == Some(key) {
+            // The stack this node reads: the document plus the layers the earlier nodes
+            // wrote. It is built **before** the memo key, because the key is a hash of
+            // this node's read values, and a read of another op's output only exists in
+            // that stack — with nothing inserted into the document (v1.9), `/World/Boxes`
+            // is a prim in a file, not in the document's stage. Keying on the document
+            // stage alone made `Clusters` look like "the input is missing", so its
+            // product came out as 40 empty shells instead of 40×60 boxes.
+            let stack = match cook_stack(stage, &produced) {
+                Ok(stack) => stack,
+                Err(e) => {
+                    diags.push(Diagnostic::error("E_COOK", e).at_prim(node.path.as_str()));
+                    continue;
+                }
+            };
+            let key = memo_key(&stack, node);
+            let stack_root_id = Some(stack.root_layer().identifier().to_owned());
+            // A memo is only a hit while the product it names is still on disk: the output
+            // **is** the file (v1.9), so a cleaned `out/` has to cook again rather than
+            // compose a stack out of paths that are gone. Cloned out of the map because the
+            // pushes below take the engine mutably.
+            let hit = self
+                .memo
+                .get(id.as_str())
+                .filter(|m| m.key == key && m.layer_path.is_file())
+                .cloned();
+            if let Some(entry) = hit {
+                produced.push(entry.layer_path.clone());
+                produced_ids.push((
+                    entry.layer_id.clone(),
+                    entry.layer_path.to_string_lossy().replace('\\', "/"),
+                ));
+                produced_anchors.push((
+                    node.path.as_str().to_owned(),
+                    entry.layer_path.to_string_lossy().replace('\\', "/"),
+                ));
                 stats.reused += 1;
                 continue;
             }
@@ -123,7 +230,7 @@ impl CookEngine {
                 continue;
             };
             let mut ctx = GenContext::new(
-                stage,
+                &stack,
                 &node.path,
                 &node.params,
                 node.seed,
@@ -134,18 +241,113 @@ impl CookEngine {
                 Ok(layer) => {
                     diags.extend(ctx.take_warnings());
                     let lid = layer.identifier().to_owned();
-                    if let Err(e) = stage.insert_layer(root_id, 0, layer, LayerOffset::IDENTITY) {
+                    // **Not inserted anywhere** (v1.9, the user's rule: 哪里都不许插入).
+                    // The output layer is written to a file and its path is what travels;
+                    // [`Self::cook`]'s caller composes a stack from these files when a
+                    // picture is asked for. Nothing the document owns is touched, and no
+                    // long-lived stack carries a generator's output.
+                    let dir = match &self.out_dir {
+                        Some(dir) => {
+                            if let Err(e) = std::fs::create_dir_all(dir) {
+                                diags.push(Diagnostic::error(
+                                    "E_COOK",
+                                    format!("cannot create {}: {e}", dir.display()),
+                                ));
+                                continue;
+                            }
+                            dir.clone()
+                        }
+                        None => std::env::temp_dir(),
+                    };
+                    let path = dir.join(format!(
+                        "rusd_op_{}_{}.rusd",
+                        std::process::id(),
+                        // A **process-wide** counter, not this engine's: two cooks in one
+                        // process (two sessions in a server, two tests in one binary) each
+                        // start at zero otherwise, and the second overwrites the first's
+                        // products — which reads as "input_points authors no points".
+                        NEXT_FILE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ));
+                    // **Written as a `.rusd` document** (v1.9: 全用 `.rusd`). The layer's
+                    // prims, their references and their values — the type of every value
+                    // coming back from the schema table, not from its shape. The reference
+                    // rewriting that used to be a text substitution on `usda` bytes is the
+                    // writer's own now: a generator names the throwaway stack it read a
+                    // prototype from, and what the reference has to name instead is the
+                    // file that holds that prim.
+                    let rewrite = |asset: &str, prim: &str| -> Option<String> {
+                        // A **bare file name** (v1.9): products live together in `out/`, so an
+                        // arc is "the file next to me" and the same directory works wherever
+                        // it is copied — server, cache, another machine.
+                        let name = |file: &str| {
+                            file.rsplit(['/', '\\'])
+                                .next()
+                                .unwrap_or(file)
+                                .to_owned()
+                        };
+                        for (id, file) in &produced_ids {
+                            if asset == id {
+                                return Some(name(file));
+                            }
+                        }
+                        if let Some(anchor) = &stack_root_id
+                            && asset == anchor.as_str()
+                        {
+                            for (p, file) in &produced_anchors {
+                                if p == prim {
+                                    return Some(name(file));
+                                }
+                            }
+                            // A same-stack reference to a prim **the document itself**
+                            // authors (`prototype = "/World/Prototypes/Pine"`): no product
+                            // holds it, and the document's layer is in every stack this
+                            // product composes into — so the reference is internal, and an
+                            // empty asset is USD's spelling for that. Left as the stack id
+                            // it would name a throwaway stack that no longer exists.
+                            return Some(String::new());
+                        }
+                        None
+                    };
+                    let written = rusd_scene::document::layer_to_document(&layer, &rewrite)
+                        .and_then(|rendered| {
+                            for name in &rendered.skipped {
+                                diags.push(
+                                    Diagnostic::warning(
+                                        "W_RUSD_WRITE",
+                                        format!(
+                                            "'{name}' has no type in the schema table, so the \
+                                             .rusd product does not carry it"
+                                        ),
+                                    )
+                                    .at_prim(node.path.as_str()),
+                                );
+                            }
+                            std::fs::write(&path, rendered.text)
+                                .map_err(|e| format!("cannot write {}: {e}", path.display()))
+                        });
+                    if let Err(e) = written {
                         diags.push(
-                            Diagnostic::error("E_COOK", e.to_string()).at_prim(node.path.as_str()),
+                            Diagnostic::error("E_COOK", e).at_prim(node.path.as_str()),
                         );
                         continue;
                     }
-                    if let Some(old) = self
-                        .memo
-                        .insert(id.clone(), MemoEntry { key, layer_id: lid })
-                    {
-                        stage.mute_layer(&old.layer_id);
-                    }
+                    self.memo.insert(
+                        id.clone(),
+                        MemoEntry {
+                            key,
+                            layer_id: lid.clone(),
+                            layer_path: path.clone(),
+                        },
+                    );
+                    produced_ids.push((
+                        lid,
+                        path.to_string_lossy().replace('\\', "/"),
+                    ));
+                    produced_anchors.push((
+                        node.path.as_str().to_owned(),
+                        path.to_string_lossy().replace('\\', "/"),
+                    ));
+                    produced.push(path);
                     stats.cooked += 1;
                 }
                 Err(d) => diags.extend(d),
@@ -164,12 +366,110 @@ impl CookEngine {
                         _ => None,
                     }),
                     layer_id: entry.layer_id.clone(),
+                    layer_path: entry.layer_path.to_string_lossy().into_owned(),
                     description: node.description.clone(),
                 })
             })
             .collect();
         CookResult { stats, diags, ops }
     }
+}
+
+/// Build the stack a picture is made from: the document's root layer, then the products
+/// this pass wrote, weakest first — so the last op is the strongest, which is what "later
+/// cooks override earlier" means (v1.9: 哪里都不许插入, so the picture is assembled here
+/// and dropped when it has been read).
+///
+/// `sdf::Layer` is neither `Clone` nor reusable (`insert_layer` takes it by value), so
+/// every layer is **re-read**: the document's from its own bytes, each product from the
+/// file the cook wrote. The ops' `layer_id`s are refreshed to the identifiers the new
+/// stack gives them — a `.rusd` opened by its format is named by its path, and the stack
+/// settles that spelling (`\\?\C:\…` vs `C:/…` are one file written by two hands).
+pub fn compose_stack(doc: &Stage, ops: &mut [CookOp]) -> Result<Stage, Vec<Diagnostic>> {
+    let mut builder = Stage::builder();
+    if let Some(session) = doc.session_layer().map(|l| l.identifier().to_owned()) {
+        builder = builder.session_layer(session);
+    }
+    let composed = builder
+        .in_memory("rusd_composed.rusd")
+        .map_err(|e| vec![Diagnostic::error("E_COMPOSE", e.to_string())])?;
+    let root = composed.root_layer().identifier().to_owned();
+    // **The document is not a layer** (v1.9): a graph document is not USD, so nothing of it
+    // is composed. The stage metadata it declares (`defaultPrim`, `upAxis`,
+    // `metersPerUnit`) is stage metadata — it belongs to this stack, not to a layer — so it
+    // is copied onto the stack's own root, and the picture is made of the products alone.
+    copy_stage_metadata(&composed, &root, doc);
+    for op in ops.iter_mut() {
+        let path = std::path::Path::new(&op.layer_path);
+        let layer = rusd_scene::document::layer_from_file(path)
+            .map_err(|e| vec![Diagnostic::error("E_COOK", e)])?;
+        let written = layer.identifier().to_owned();
+        composed
+            .insert_layer(&root, 0, layer, LayerOffset::IDENTITY)
+            .map_err(|e| vec![Diagnostic::error("E_COMPOSE", e.to_string())])?;
+        op.layer_id = composed
+            .layer_stack()
+            .into_iter()
+            .find(|id| same_file(id, &written))
+            .unwrap_or(written);
+    }
+    Ok(composed)
+}
+
+/// A layer re-read from its own bytes, for the reason [`compose_stack`] gives.
+
+/// Copy the stage metadata a document declares onto the stack that is being built.
+///
+/// `defaultPrim`, `upAxis` and `metersPerUnit` are properties of a **stage**, not of a
+/// layer: a graph document declares them without being one, so they are written where
+/// they belong.
+fn copy_stage_metadata(composed: &Stage, root: &str, doc: &Stage) {
+    use openusd::sdf::AbstractData;
+    let Some(mut layer) = composed.layer_mut(root) else {
+        return;
+    };
+    let source = doc.root_layer();
+    let data = source.data();
+    let pseudo = sdf::Path::abs_root();
+    let mut copy: Vec<(String, sdf::Value)> = Vec::new();
+    for name in ["defaultPrim", "upAxis", "metersPerUnit"] {
+        if let Ok(Some(value)) = data.try_field(&pseudo, name) {
+            copy.push((name.to_owned(), value.into_owned()));
+        }
+    }
+    let _ = layer.edit(|l| {
+        let d = l.data_mut();
+        for (name, value) in copy {
+            d.set_field(&pseudo, &name, value);
+        }
+        Ok(())
+    });
+}
+fn reload(layer: &sdf::Layer) -> Result<sdf::Layer, Vec<Diagnostic>> {
+    let format = sdf::LayerRegistry::find_by_id("usda")
+        .ok_or_else(|| vec![Diagnostic::error("E_COMPOSE", "the usda format is not registered")])?;
+    let written = format
+        .write_bytes(layer.data())
+        .map_err(|e| vec![Diagnostic::error("E_COMPOSE", format!("usda write failed: {e}"))])?;
+    let tag = layer
+        .identifier()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("rusd_root.rusd")
+        .to_owned();
+    sdf::Layer::from_bytes(tag, written.bytes)
+        .map_err(|e| vec![Diagnostic::error("E_COMPOSE", e.to_string())])
+}
+
+/// Whether two spellings name one file (the one comparison a path deserves).
+fn same_file(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        s.strip_prefix(r"\\?\")
+            .unwrap_or(s)
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+    }
+    a == b || norm(a) == norm(b)
 }
 
 /// Dependency edges: B depends on A iff B reads a prim that A writes.

@@ -14,13 +14,47 @@ use crate::schema::{self, PropType, SchemaKind};
 
 /// Author the document's stage metadata and prims into the stage's root layer.
 fn author_base(stage: &Stage, doc: &ParsedDocument) -> Result<(), Vec<Diagnostic>> {
+    let root_id = stage.root_layer().identifier().to_owned();
+    let mut root = stage.layer_mut(&root_id).expect("root layer exists");
+    // A document's diagnostics are richer than the single `AuthoringError` an edit can
+    // carry, so the edit is the mechanism and this is the answer: the first failure is the
+    // document's own, and the edit's error is only the fact that it stopped.
+    let mut failure: Option<Vec<Diagnostic>> = None;
+    let edited = root.edit(|l| match author_into(l.data_mut(), doc) {
+        Ok(()) => Ok(()),
+        Err(diags) => {
+            failure = Some(diags);
+            Err(openusd::sdf::AuthoringError::InvalidPath {
+                path: sdf::Path::abs_root(),
+                reason: "the document could not be authored into this layer",
+            })
+        }
+    });
+    match failure {
+        Some(diags) => Err(diags),
+        None => edited
+            .map(|_| ())
+            .map_err(|e| vec![Diagnostic::error("E_LOWER", e.to_string())]),
+    }
+}
+
+/// Author a parsed document into **any** layer's data (v1.9).
+///
+/// This is the one definition of what a `.rusd` document means, and it has two callers
+/// that must not drift: [`lower`], which authors it into a stage's root layer, and
+/// [`crate::document`]'s decoder, which the registered `.rusd` file format calls when
+/// the composition opens a document as a layer. One function, so a document reads the
+/// same whether it is the root of a stage or a layer an arc reached.
+pub(crate) fn author_into(
+    d: &mut dyn sdf::AbstractData,
+    doc: &ParsedDocument,
+) -> Result<(), Vec<Diagnostic>> {
     let default_prim = stage_string(doc, "default_prim").unwrap_or_else(|| "World".to_owned());
     let meters = match doc.stage.get("meters_per_unit") {
         Some(Value::Float(f)) => *f,
         Some(Value::Int(i)) => *i as f64,
         _ => 1.0,
     };
-    let root_id = stage.root_layer().identifier().to_owned();
     // Every `references` value resolved **before** the layer is edited: a missing
     // layer is a diagnostic about a document, not an authoring failure, and the
     // edit closure can only carry an `AuthoringError`. Frame the answer to the same
@@ -43,19 +77,40 @@ fn author_base(stage: &Stage, doc: &ParsedDocument) -> Result<(), Vec<Diagnostic
     if !unresolved.is_empty() {
         return Err(unresolved);
     }
-    let mut root = stage.layer_mut(&root_id).expect("root layer exists");
-    root.edit(|l| {
-        let d = l.data_mut();
+    author_prims(d, doc, &default_prim, meters, &references)
+        .map_err(|e| vec![Diagnostic::error("E_LOWER", e.to_string())])
+}
+
+/// The authoring proper: stage metadata, then every prim.
+fn author_prims(
+    d: &mut dyn sdf::AbstractData,
+    doc: &ParsedDocument,
+    default_prim: &str,
+    meters: f64,
+    references: &[Option<crate::reference::AssetRef>],
+) -> Result<(), openusd::sdf::AuthoringError> {
+    {
         let pseudo = sdf::Path::abs_root();
+        // A layer read from a file has a pseudo-root spec from its reader; a `Data` the
+        // decoder builds starts empty, so it gets one here. Either way the metadata below
+        // has a spec to sit on.
+        if d.spec_type(&pseudo).is_none() {
+            d.create_spec(pseudo.clone(), sdf::SpecType::PseudoRoot);
+        }
         d.set_field(
             &pseudo,
             "defaultPrim",
-            SdfValue::Token(default_prim.clone().into()),
+            SdfValue::Token(default_prim.to_owned().into()),
         );
         d.set_field(&pseudo, "upAxis", SdfValue::Token("Z".into()));
         d.set_field(&pseudo, "metersPerUnit", SdfValue::Double(meters));
 
-        for (index, prim) in doc.prims.iter().enumerate() {
+        // **A graph document authors no prims** (v1.9): the document is an operator graph,
+        // not USD. Its prims are the operators the cook runs — the picture is made from the
+        // layers those operators write, not from the document. Only the stage metadata just
+        // above is authored.
+        let authored: &[rusd_core::syntax::PrimBlock] = if doc.graph { &[] } else { &doc.prims };
+        for (index, prim) in authored.iter().enumerate() {
             let schema = schema::lookup(&prim.schema);
             let custom = schema
                 .map(|s| s.kind == SchemaKind::Generator)
@@ -80,9 +135,7 @@ fn author_base(stage: &Stage, doc: &ParsedDocument) -> Result<(), Vec<Diagnostic
                 {
                     continue;
                 }
-                let ty = schema
-                    .and_then(|s| s.props.iter().find(|p| p.name == name))
-                    .map(|p| p.ty);
+                let ty = schema::prop_type(prim.schema.as_str(), name);
                 if let Some((sval, tname)) = to_usd(val, ty) {
                     let attr_path = format!("{}.{}", prim.path.as_str(), name);
                     let mut attr = AttributeSpec::new(
@@ -97,9 +150,7 @@ fn author_base(stage: &Stage, doc: &ParsedDocument) -> Result<(), Vec<Diagnostic
             }
         }
         Ok(())
-    })
-    .map_err(|e| vec![Diagnostic::error("E_LOWER", e.to_string())])?;
-    Ok(())
+    }
 }
 
 /// Author one prim's `references` arc (v1.5.10) onto its own spec: the layer the
@@ -117,7 +168,14 @@ fn author_reference(
 ) -> Result<(), openusd::sdf::AuthoringError> {
     let path = sdf::path(prim.as_str())?;
     let op = sdf::ReferenceListOp::explicit([sdf::Reference {
-        asset_path: reference.asset.clone().unwrap_or_default(),
+        // **As authored** (v1.9): a relative `../box.rusd` stays relative, so the layer
+        // resolves from wherever the file is read — the record can be copied to another
+        // machine and still open.
+        asset_path: reference
+            .authored
+            .clone()
+            .or_else(|| reference.asset.clone())
+            .unwrap_or_default(),
         prim_path: reference.path.clone(),
         ..Default::default()
     }]);
@@ -131,8 +189,8 @@ fn author_reference(
 
 /// Lower a parsed document into a composed openusd Stage (anonymous root layer).
 pub fn lower(doc: &ParsedDocument) -> Result<Stage, Vec<Diagnostic>> {
-    let stage = Stage::builder()
-        .in_memory("rusd_root.usda")
+    let stage = crate::document::stage_builder()
+        .in_memory("rusd_root.rusd")
         .map_err(|e| vec![Diagnostic::error("E_OPEN", e.to_string())])?;
     author_base(&stage, doc)?;
     Ok(stage)
@@ -152,9 +210,12 @@ pub fn lower_with_session(doc: &ParsedDocument) -> Result<Stage, Vec<Diagnostic>
     let session_path = new_session_file();
     std::fs::write(&session_path, "#usda 1.0\n")
         .map_err(|e| vec![Diagnostic::error("E_SESSION", e.to_string())])?;
-    let stage = Stage::builder()
+    // The session layer is the one layer the engine really does read from disk before
+    // there is any document to compile, so it keeps the `usda` spelling: it is a scratch
+    // file nothing names, and its row in the tree is labelled `session`, not by its path.
+    let stage = crate::document::stage_builder()
         .session_layer(session_path.to_str().expect("session path utf8"))
-        .in_memory("rusd_root.usda")
+        .in_memory("rusd_root.rusd")
         .map_err(|e| vec![Diagnostic::error("E_OPEN", e.to_string())])?;
     author_base(&stage, doc)?;
     Ok(stage)
@@ -386,6 +447,10 @@ fn to_usd(val: &Value, ty: Option<PropType>) -> Option<(SdfValue, &'static str)>
     match val {
         Value::Bool(b) => Some((SdfValue::Bool(*b), "bool")),
         Value::Int(i) => match ty {
+            // A `f64` property written as a whole number (`size = 6`) is still an
+            // `f64` in the document's terms: the schema says so, and `int64` would be
+            // a different type (v1.9 — the type comes from the schema, not the literal).
+            Some(F64) => Some((SdfValue::Double(*i as f64), "double")),
             Some(U64) => Some((SdfValue::Uint64(*i as u64), "uint64")),
             _ => Some((SdfValue::Int64(*i), "int64")),
         },
@@ -435,7 +500,7 @@ fn array_to_usd(items: &[Value], ty: Option<PropType>) -> Option<(SdfValue, &'st
     // one point, written as `[x, y, z]` (or `vec3`). This must be tested **before**
     // the flat-number path, which would otherwise try to read the nested arrays as
     // numbers and give up.
-    if ty == Some(Vec3Array) {
+    if ty == Some(Vec3Array) || ty == Some(Color3Array) {
         let mut points = Vec::with_capacity(items.len());
         for item in items {
             let v = match item {
@@ -448,7 +513,25 @@ fn array_to_usd(items: &[Value], ty: Option<PropType>) -> Option<(SdfValue, &'st
             };
             points.push(vec3f(&v));
         }
-        return Some((SdfValue::Vec3fVec(points), "point3f[]"));
+        let tname = if ty == Some(Color3Array) {
+            "color3f[]"
+        } else {
+            "point3f[]"
+        };
+        return Some((SdfValue::Vec3fVec(points), tname));
+    }
+    // `token[]`: `xformOpOrder`. Tested before the string-array fallback below so a
+    // schema type decides it rather than the shape of the value (v1.9).
+    if ty == Some(TokenArray) {
+        let toks: Option<Vec<openusd::tf::Token>> = items
+            .iter()
+            .map(|v| match v {
+                Value::String(s) => Some(s.clone().into()),
+                Value::Token(t) => Some(t.clone().into()),
+                _ => None,
+            })
+            .collect();
+        return toks.map(|v| (SdfValue::TokenVec(v), "token[]"));
     }
     // `int[]`: a mesh's face counts and vertex indices. Before the generic number
     // path as well — that one writes `int64[]` for integer lists, which the USD
@@ -469,6 +552,12 @@ fn array_to_usd(items: &[Value], ty: Option<PropType>) -> Option<(SdfValue, &'st
                 return Some((
                     SdfValue::Vec3f(gf::vec3f(nums[0] as f32, nums[1] as f32, nums[2] as f32)),
                     "vector3f",
+                ));
+            }
+            Some(Point3f) if nums.len() == 3 => {
+                return Some((
+                    SdfValue::Vec3f(gf::vec3f(nums[0] as f32, nums[1] as f32, nums[2] as f32)),
+                    "point3f",
                 ));
             }
             Some(Color3f) if nums.len() == 3 => {

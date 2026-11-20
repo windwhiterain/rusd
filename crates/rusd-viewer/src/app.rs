@@ -151,6 +151,9 @@ const CAPTURE_TAG: &str = "capture";
 /// `preview{upto}` (v1.4). Its answer is `{version}`, which the *notification* is the
 /// authority for: the prefix itself arrives as a `stage_snapshot` carrying `upto`.
 const PREVIEW_TAG: &str = "preview";
+/// The layer table (`layer_files`) and one layer's sync (`SyncLayer`), v1.9.
+const FILES_TAG: &str = "files";
+const SYNC_TAG: &str = "sync";
 /// `open{path}` (v1.7): the control channel's document open, answered under this tag so
 /// the request's own reply is the one a script gets.
 const OPEN_TAG: &str = "open";
@@ -204,8 +207,18 @@ pub struct Shell {
     /// lives in a struct this thread cannot reach.
     geometry: rusd_scene::geometry::SceneGeometry,
 
-    /// The frame on screen, with its texture.
-    frame: Option<(crate::net::Frame, egui::TextureHandle)>,
+    /// The frame on screen, with the texture it is drawn from.
+    ///
+    /// The texture is the **render thread's own GPU view** (`register_native_texture`),
+    /// so showing a frame costs no copy (v1.10); a frame whose pixels had to be touched
+    /// on the CPU (a selection's outline) carries its bytes and is uploaded instead, and
+    /// `cpu_tex` keeps that handle alive.
+    frame: Option<(crate::net::Frame, egui::TextureId)>,
+    /// The egui texture registered over the render thread's beauty view, with the target
+    /// generation it belongs to (a resize makes a new view, so a new registration).
+    gpu_tex: Option<(egui::TextureId, u64)>,
+    /// The upload of a frame that carried its own bytes (the annotated ones).
+    cpu_tex: Option<egui::TextureHandle>,
     /// The render size the texture was made at, so a resize forces a new one.
     tex_size: (u32, u32),
     /// The viewport's geometry — the one place its rect, scale and texel size come
@@ -275,6 +288,23 @@ pub struct Shell {
     fps: f64,
     last_frame_at: Instant,
     offline_usdc: Option<String>,
+    /// `layer id → the file on the server` (v1.9): what a click composes **locally**, from
+    /// the copy the cache already holds. Refreshed with the tree, so a re-cook shows up as a
+    /// new file name without the click ever asking the server for geometry.
+    layer_files: std::collections::BTreeMap<String, String>,
+    /// A local open in flight (v1.9): the geometry comes back from a **worker thread**, so a
+    /// 2400-prim product no longer freezes the window and the control channel while it is
+    /// opened. `Stage` itself is `!Send`, so the worker hands over the geometry alone.
+    opening: Option<(String, std::sync::mpsc::Receiver<Result<rusd_scene::SceneGeometry, String>>)>,
+    /// The layer a click asked to see while its local copy was **not yet on disk**. The
+    /// click sends a `SyncLayer` for it; when that sync lands, this is the layer to open
+    /// again, so the first click after an `open` is not a click that only syncs and shows
+    /// nothing (`点了节点不显示` on a fresh document). One slot: a second click replaces it.
+    want_open: Option<String>,
+    /// A click whose layer id a rebuild replaced: the row it was (by position among the
+    /// preview rows) and the ask it wanted, so the tree that follows re-sends it with the
+    /// id the new stack minted (v1.9).
+    pending_preview: Option<(usize, String)>,
     /// The `host:port` this viewer was told to connect to (`--connect`), kept for the
     /// control channel's `state`: the address the viewer is *aimed* at, which is what a
     /// script needs to tell "the server is not up" from "this viewer is not aimed at it".
@@ -568,6 +598,8 @@ impl Shell {
                 diags: Vec::new(),
             },
             frame: None,
+            gpu_tex: None,
+            cpu_tex: None,
             // A placeholder until the first layout: the whole window as the rect.
             // It is replaced by `publish_viewport` before anything is drawn, and the
             // render thread's first `Resize` comes from there.
@@ -595,6 +627,10 @@ impl Shell {
             fps: 0.0,
             last_frame_at: Instant::now(),
             offline_usdc: args.usdc.clone(),
+            layer_files: std::collections::BTreeMap::new(),
+            opening: None,
+            want_open: None,
+            pending_preview: None,
             connect: args.connect.clone(),
             // The socket, when one was asked for, is opened by `App` before the window
             // exists (`--control`), and its address is handed in here: nothing about the
@@ -627,6 +663,19 @@ impl Shell {
         for e in self.net.drain() {
             match e {
                 NetEvent::Notification(n) => self.on_notification(n),
+                NetEvent::Reconnected { addr } => {
+                    // The wire is back (v1.9). The **server** owns the document, so the
+                    // viewer needs to know nothing about it: `subscribe` was redone by
+                    // the worker, and the server answers a new subscriber with the
+                    // current scene — the snapshot arrives on its own, and the tree is
+                    // asked for again. If the server itself was restarted it has no
+                    // scene, and it says exactly that; re-opening the document is then
+                    // the user's act, not a path this window remembered.
+                    self.model.mark_live();
+                    self.status = format!("reconnected to {addr}");
+                    self.ask_tree();
+                    self.request_repaint();
+                }
                 NetEvent::Live { addr: _ } => {
                     // `hello` + `subscribe` succeeded: the connection is what the
                     // status bar must now say. Without this the view kept
@@ -920,6 +969,28 @@ impl Shell {
             TREE_TAG => {
                 self.tree.apply_tree(reply);
                 self.status = self.tree.model.status_zh();
+                // **The layer table follows the tree** (v1.9): a re-cook mints new product
+                // files, so the table is re-read with every tree and the files whose blocks
+                // moved are synced. A click then costs nothing — it composes from the cache.
+                self.net.send(NetCommand::Call {
+                    tag: FILES_TAG.to_owned(),
+                    method: "layer_files".to_owned(),
+                    params: serde_json::json!({}),
+                });
+                // A click whose layer id died with a rebuild is re-asked here, for the row in
+                // the same position (v1.9): the ids move, the rows do not, so the picture
+                // follows the click instead of waiting for a second one.
+                if let Some((index, ask)) = self.pending_preview.take() {
+                    let rows = self.preview_rows();
+                    if let Some(node) = rows.get(index) {
+                        let id = node.id.clone();
+                        if ask == "solo" {
+                            self.ask_solo(id);
+                        } else {
+                            self.ask_preview(Some(id));
+                        }
+                    }
+                }
                 // A reason that arrived while this read was in flight was coalesced, not
                 // queued: one more read answers all of them (a gizmo drag sends opinions
                 // at ≤ 30 Hz, and each one is a reason).
@@ -956,14 +1027,25 @@ impl Shell {
                     // snapshot rather than the request), or a `solo` a server from before
                     // v1.8 does not have. The second reads as a version note, because a
                     // material row's click is the only thing that can send it.
-                    self.status = if message.contains("solo") {
-                        format!(
+                    //
+                    // **A stop the server no longer has falls back to the whole picture**
+                    // (v1.9): a rebuild mints new layer ids, so an id the viewer still holds
+                    // stops naming a layer — and a click or a reconnect then left the bar
+                    // reporting a refusal while the viewport sat on the last frame.
+                    if message.contains("not an opened layer") {
+                        // The row's id is from before a cook (v1.9): re-read the tree and, once
+                        // it lands, ask again for the row in the same position — the ids move,
+                        // the rows do not.
+                        self.status = "这一行的层已重建，正在取新的…".to_owned();
+                        self.ask_tree();
+                    } else if message.contains("solo") {
+                        self.status = format!(
                             "preview{{solo}}：服务器无此参数（server 版本）——{message} \
                              (code {code})"
-                        )
+                        );
                     } else {
-                        format!("preview failed: {message} (code {code})")
-                    };
+                        self.status = format!("preview failed: {message} (code {code})");
+                    }
                 }
             },
             CAPTURE_TAG => match reply {
@@ -978,6 +1060,80 @@ impl Shell {
                 },
                 Err((code, message)) => {
                     self.status = format!("capture failed: {message} (code {code})");
+                }
+            },
+            FILES_TAG => {
+                // `layer_files` answered: remember `id → file`, and sync the ones whose blocks
+                // the cache lacks. The manifest is a few hundred bytes per layer; the blocks
+                // that travel are the ones that actually moved.
+                self.layer_files.clear();
+                if let Ok(value) = reply {
+                    for entry in value
+                        .get("layers")
+                        .and_then(|l| l.as_array())
+                        .into_iter()
+                        .flatten()
+                    {
+                        let (Some(id), Some(file)) = (
+                            entry.get("id").and_then(|v| v.as_str()),
+                            entry.get("file").and_then(|v| v.as_str()),
+                        ) else {
+                            continue;
+                        };
+                        self.layer_files.insert(id.to_owned(), file.to_owned());
+                        self.net.send(NetCommand::SyncLayer {
+                            tag: SYNC_TAG.to_owned(),
+                            path: file.to_owned(),
+                        });
+                    }
+                }
+            }
+            SYNC_TAG => match reply {
+                Ok(value) => {
+                    self.status = format!(
+                        "已同步 {} 块（本次取 {}）→ {}",
+                        value.get("blocks").and_then(|v| v.as_u64()).unwrap_or(0),
+                        value.get("fetched").and_then(|v| v.as_u64()).unwrap_or(0),
+                        value
+                            .get("local")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
+                    );
+                    // **A click waiting on this sync is answered now** (v1.9): it asked for a
+                    // layer whose local copy was not written yet, and a sync alone shows
+                    // nothing. Re-tried only when the file is there, so a sync that could
+                    // not produce it does not loop.
+                    if let Some(id) = self.want_open.take() {
+                        let there = self
+                            .layer_files
+                            .get(&id)
+                            .map(|remote| {
+                                crate::cache::LayerCache::new(
+                                    crate::cache::LayerCache::default_dir(),
+                                )
+                                .local_path(remote)
+                                .is_file()
+                            })
+                            .unwrap_or(false);
+                        if there {
+                            self.show_layer_local(&id);
+                        }
+                    }
+                }
+                Err((code, message)) => {
+                    self.want_open = None;
+                    self.status = format!("同步失败：{message} (code {code})");
+                }
+            },
+            OPEN_TAG => match reply {
+                // The status line is the one thing a lost waiter could leave behind (v1.9):
+                // the open whose reply this is may have had its waiter dropped when the
+                // connection died, and then the line sat on 「请求中…」 while the scene was
+                // already there. The answer says where the viewer is now, not where the
+                // request was.
+                Ok(_) => self.status = self.tree.model.status_zh(),
+                Err((code, message)) => {
+                    self.status = format!("open failed: {message} (code {code})")
                 }
             },
             other => self.status = format!("a reply with an unknown tag {other:?}"),
@@ -1051,12 +1207,176 @@ impl Shell {
         ask: Option<crate::panel::LayerAsk>,
     ) {
         let id = selection.id.clone();
+        // **Remember which row this was, by position among the preview rows** (v1.9): a
+        // rebuild mints new layer ids, so the id in hand dies with the pass — but the rows
+        // themselves are in the same order, so a refused id is re-asked for the row in that
+        // position instead of making the user click twice.
+        if let Some(ask) = &ask {
+            let rows = self.preview_rows();
+            let index = rows.iter().position(|n| n.id == id);
+            let word = match ask {
+                crate::panel::LayerAsk::Upto => "upto",
+                crate::panel::LayerAsk::Solo => "solo",
+            };
+            self.pending_preview = index.map(|i| (i, word.to_owned()));
+        }
         self.on_tree_select(selection);
+        // **This click is answered locally** (v1.9), so no pending retry is left behind: that
+        // marker belongs to the server-side preview path, and leaving it set here re-opened
+        // the layer on every tree refresh — while the sync was rewriting the very file.
+        self.pending_preview = None;
         match ask {
-            Some(crate::panel::LayerAsk::Upto) => self.ask_preview(Some(id)),
-            Some(crate::panel::LayerAsk::Solo) => self.ask_solo(id),
+            Some(_) => self.show_layer_local(&id),
             None => {}
         }
+    }
+
+    /// Show one layer from the **local** copy: open the file the cache holds and adopt it.
+    fn show_layer_local(&mut self, id: &str) {
+        let Some(remote) = self.layer_files.get(id).cloned() else {
+            self.status = format!("这一层没有文件（内存层）：{id}");
+            return;
+        };
+        let local = crate::cache::LayerCache::new(crate::cache::LayerCache::default_dir())
+            .local_path(&remote);
+        if !local.is_file() {
+            // The sync about to run is for **this** click: when it lands, open the layer
+            // (the `SYNC_TAG` arm), or a click made while the first sync is still writing
+            // the file would only ever sync and never show anything.
+            self.status = format!("本地还没有这一层，正在同步：{}", local.display());
+            self.want_open = Some(id.to_owned());
+            self.net.send(NetCommand::SyncLayer {
+                tag: SYNC_TAG.to_owned(),
+                path: remote,
+            });
+            return;
+        }
+        let opened = local.to_string_lossy().replace('\\', "/");
+        // **Opened on a worker thread** (v1.9): `Stage` is `!Send`, so the thread opens the
+        // file, extracts, and hands the geometry back; the window keeps drawing and the
+        // control channel keeps answering while a 2400-prim product is read.
+        self.status = format!("正在本地打开 {}…", local.display());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path_for_thread = opened.clone();
+        // Every remote layer this session knows, so the product's arcs can be pointed at the
+        // copies the cache holds (v1.9): a product names its materials by the **server's**
+        // paths, and those do not exist here.
+        let _known: usize = self.layer_files.len();
+        std::thread::spawn(move || {
+            rusd_scene::document::install();
+            // **Nothing is rewritten** (v1.9): the product's arcs are relative (`../box.rusd`,
+            // `rusd_op_…_2.rusd`), and the cache mirrors the layout, so the file opens as it
+            // is. A resolver is still installed for a path this machine happens to lack a
+            // byte-identical copy of.
+            let resolver = crate::cache::CacheResolver::new(crate::cache::LayerCache::default_dir());
+            let opened = openusd::usd::Stage::builder()
+                .resolver(resolver)
+                .open(path_for_thread.as_str());
+            let result = match opened {
+                Ok(stage) => Ok(rusd_scene::geometry::extract(&stage)),
+                Err(e) => Err(format!("本地打开失败：{e}")),
+            };
+            let _ = tx.send(result);
+        });
+        self.opening = Some((id.to_owned(), rx));
+    }
+
+    /// Take a local open that finished, if one did. Called once a frame.
+    fn poll_local_open(&mut self) {
+        let Some((id, rx)) = &self.opening else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(geometry)) => {
+                let id = id.clone();
+                let bounds = geometry.bounds;
+                let made = crate::session::MadeScene {
+                    version: self.model.version.unwrap_or(0),
+                    geometry,
+                    bounds,
+                    diags: Vec::new(),
+                    stage: None,
+                };
+                // **The file the click opened is a new document, so it frames itself**
+                // (v1.9). The layer can sit anywhere and be any size — a point cloud at
+                // z≈0 after a box cluster at z≈20 — and keeping the previous framing
+                // leaves it entirely outside the frustum, which reads as "点了节点不显示".
+                // The server-snapshot path already re-arms the fit when the composition
+                // changes (`session.rs`); a local open never went through it.
+                self.model.rearm_first_fit();
+                self.adopt_scene(made);
+                self.model.preview = Some(id);
+                self.status = "本地打开完成".to_owned();
+                self.opening = None;
+                self.request_repaint();
+            }
+            Ok(Err(message)) => {
+                self.status = message;
+                self.opening = None;
+                self.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // **The worker is still reading the file, and nothing else will wake the
+                // window.** An idle egui app draws no frame until an input arrives, and this
+                // loop installs no egui repaint callback, so `request_repaint_after` alone
+                // would schedule a frame nothing ever wakes for (measured: the status sat at
+                // 「正在本地打开…」 for fifteen silent seconds). The pair `request_repaint`
+                // is the only thing that actually draws — the same pair every other wake in
+                // this shell uses — so a local open keeps painting until its geometry lands.
+                self.request_repaint();
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.status = "本地打开失败：线程结束".to_owned();
+                self.opening = None;
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn show_layer_local_blocking(&mut self, id: &str) {
+        let Some(remote) = self.layer_files.get(id).cloned() else {
+            return;
+        };
+        let local = crate::cache::LayerCache::new(crate::cache::LayerCache::default_dir())
+            .local_path(&remote);
+        let opened = local.to_string_lossy().replace('\\', "/");
+        // The viewer reads `.rusd` layers itself now, so it needs the document decoder
+        // registered in **this** process (v1.9): the format is openusd's, the meaning is
+        // rusd-scene's, and one call installs it.
+        rusd_scene::document::install();
+        match openusd::usd::Stage::open(opened.as_str()) {
+            Ok(stage) => {
+                let geometry = rusd_scene::geometry::extract(&stage);
+                let bounds = geometry.bounds;
+                let made = crate::session::MadeScene {
+                    version: self.model.version.unwrap_or(0),
+                    geometry,
+                    bounds,
+                    diags: Vec::new(),
+                    stage: Some(stage),
+                };
+                self.model.rearm_first_fit();
+                self.adopt_scene(made);
+                self.model.preview = Some(id.to_owned());
+                self.status = format!("本地打开 {}", local.display());
+                self.request_repaint();
+            }
+            Err(e) => self.status = format!("本地打开失败：{e}"),
+        }
+    }
+
+    /// The rows a click composes something for, in the order the panel draws them.
+    fn preview_rows(&self) -> Vec<crate::tree::TreeNode> {
+        crate::panel::rows(&self.tree)
+            .into_iter()
+            .map(|(_, node)| node)
+            .filter(|node| {
+                matches!(
+                    crate::panel::action_for(node),
+                    crate::panel::TreeAction::Layer { ask: Some(_), .. }
+                )
+            })
+            .collect()
     }
 
     /// Take the capture the user just framed: the frame's own beauty image, a mask
@@ -1075,12 +1395,20 @@ impl Shell {
             return;
         };
         let frame_size = (frame.width, frame.height);
+        let (frame_width, frame_height, camera_json) =
+            (frame.width, frame.height, crate::capture::camera_json_of(&frame.camera));
         let Some(sel) = crate::panel::mask_rect(self.viewport.rect(), start, end, frame_size)
         else {
             self.status = "capture: 选区为空".to_owned();
             return;
         };
-        let image_png = match crate::capture::encode_png(frame.width, frame.height, &frame.beauty) {
+        // A capture is the one thing that needs the pixels on the CPU (v1.10), so the
+        // frame is read back here — once, on the GPU's own copy of the picture on screen.
+        let Some((beauty, _ids)) = self.render.grab() else {
+            self.status = "capture: 显卡没有交回像素".to_owned();
+            return;
+        };
+        let image_png = match crate::capture::encode_png(frame_width, frame_height, &beauty) {
             Ok(bytes) => bytes,
             Err(e) => {
                 self.status = format!("capture: 编码 PNG 失败：{e}");
@@ -1088,14 +1416,14 @@ impl Shell {
             }
         };
         let mask = crate::capture::mask_rgba(frame_size, sel);
-        let mask_png = match crate::capture::encode_png(frame.width, frame.height, &mask) {
+        let mask_png = match crate::capture::encode_png(frame_width, frame_height, &mask) {
             Ok(bytes) => bytes,
             Err(e) => {
                 self.status = format!("capture: 编码 mask 失败：{e}");
                 return;
             }
         };
-        let camera = crate::capture::camera_json_of(&frame.camera);
+        let camera = camera_json;
         let params = crate::capture::capture_params(
             camera,
             &image_png,
@@ -1112,8 +1440,8 @@ impl Shell {
         self.capture_start = None;
         self.status = format!(
             "capture 已发送（{}×{} 帧，选区 {}×{}）",
-            frame.width,
-            frame.height,
+            frame_width,
+            frame_height,
             sel.width(),
             sel.height()
         );
@@ -1141,13 +1469,32 @@ impl Shell {
         }
         self.last_frame_at = now;
 
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [frame.width as usize, frame.height as usize],
-            &frame.beauty,
-        );
-        let texture = self
-            .egui_ctx
-            .load_texture("viewport", image, egui::TextureOptions::LINEAR);
+        let texture = if frame.beauty.is_empty() {
+            // **The picture is already on the GPU** (v1.10): register the render thread's
+            // own beauty view as an egui texture and paint it. No copy, no upload, and the
+            // registration is done once per target generation (a resize is the only thing
+            // that makes a new view).
+            match self.register_view(&frame) {
+                Some(id) => id,
+                None => {
+                    // No render state to register with (a headless build): fall back to
+                    // showing nothing rather than a texture that does not exist.
+                    self.frames_received += 1;
+                    return;
+                }
+            }
+        } else {
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [frame.width as usize, frame.height as usize],
+                &frame.beauty,
+            );
+            self.cpu_tex = Some(self.egui_ctx.load_texture(
+                "viewport-cpu",
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+            self.cpu_tex.as_ref().expect("just set").id()
+        };
         self.tex_size = (frame.width, frame.height);
         self.frames_received += 1;
         self.frame = Some((frame, texture));
@@ -1160,6 +1507,30 @@ impl Shell {
         // the new frame on screen, and it is the difference the debug overlay shows
         // as `shown == received` instead of `shown < received`.
         self.request_repaint();
+    }
+
+    /// Paint the viewport from the frame's texture, GPU view or upload alike.
+    fn viewport_image(texture: egui::TextureId, size: egui::Vec2, uv: egui::Rect) -> egui::Image<'static> {
+        egui::Image::new(egui::load::SizedTexture::new(texture, size)).uv(uv)
+    }
+
+    /// Register the render thread's beauty view with egui, once per target generation.
+    fn register_view(&mut self, frame: &crate::net::Frame) -> Option<egui::TextureId> {
+        let state = self.painter.render_state()?;
+        if let Some((id, generation)) = self.gpu_tex {
+            if generation == frame.generation {
+                return Some(id);
+            }
+            state.renderer.write().free_texture(&id);
+            self.gpu_tex = None;
+        }
+        let id = state.renderer.write().register_native_texture(
+            &state.device,
+            &frame.view,
+            wgpu::FilterMode::Linear,
+        );
+        self.gpu_tex = Some((id, frame.generation));
+        Some(id)
     }
 
     /// Ask the render thread for a frame with the current camera and selection.
@@ -1296,7 +1667,8 @@ impl Shell {
             "tree": tree,
             "orbit": self.orbit.map(orbit_json),
             "frame": self.frame.as_ref().map(|(f, _)| {
-                json!({ "seq": f.seq, "width": f.width, "height": f.height })
+                json!({ "seq": f.seq, "width": f.width, "height": f.height, "millis": f.millis,
+                        "rewritten": f.rewritten, "slabs": f.slabs, "draws": f.draws })
             }),
             "status": self.status,
         })
@@ -1335,7 +1707,11 @@ impl Shell {
         if let Err(e) = self.need_server() {
             return Some(Err(e));
         }
-        self.waiting.push(Waiting::new(reply, Shape::Server));
+        // The waiter owes the tag this request sends: `note_control_result` answers a
+        // waiter whose `awaiting` holds the tag that just landed, so a waiter built with
+        // the empty `new` never matched anything and the control caller waited forever
+        // (the work happened, the click worked, only the answer was lost).
+        self.waiting.push(Waiting::with(reply, Shape::Server, vec![OPEN_TAG]));
         self.status = format!("open {path}: 请求中…");
         self.send_net(NetCommand::Call {
             tag: OPEN_TAG.to_owned(),
@@ -1385,7 +1761,7 @@ impl Shell {
         if let Err(e) = self.need_server() {
             return Some(Err(e));
         }
-        self.waiting.push(Waiting::new(reply, Shape::Server));
+        self.waiting.push(Waiting::with(reply, Shape::Server, vec![PREVIEW_TAG]));
         self.send_net(NetCommand::Call {
             tag: PREVIEW_TAG.to_owned(),
             method: "preview".to_owned(),
@@ -1486,14 +1862,13 @@ impl Shell {
             kind: row.kind.as_str().to_owned(),
             action: action_word(&action),
         };
-        // Which reply tags that click will owe. A `Layer` arm asks its layer's `comp_node`
-        // detail, and when the row names a composition it asks for that too — one preview
-        // tag whichever form (both are the `preview` method). A plain `Select` asks its
-        // detail alone; whether it has a prim node at all was settled above.
-        let owed = match &action {
-            crate::panel::TreeAction::Layer { ask: Some(_), .. } => vec![NODE_TAG, PREVIEW_TAG],
-            _ => vec![NODE_TAG],
-        };
+        // Which reply tags that click will owe. A row's click asks its `comp_node`
+        // detail, and that is **all** it can owe: the composition half of a layer click is
+        // served locally now (v1.9 — `show_layer_local` opens the cached file and mutes
+        // nothing on the server), so a `PREVIEW_TAG` in this list would be a reply no
+        // request was sent for and the waiter would never be answered. A plain `Select`
+        // asks its detail alone; whether it has a prim node at all was settled above.
+        let owed = vec![NODE_TAG];
         // The replier is in hand **before** the click runs: `on_tree_*` sends its request
         // on the spot, and that request's reply is what this one waits for.
         self.waiting.push(Waiting::with(reply, shape, owed));
@@ -1580,7 +1955,7 @@ impl Shell {
                          output), so there is no per-layer detail to show",
             })));
         };
-        self.waiting.push(Waiting::new(reply, shape));
+        self.waiting.push(Waiting::with(reply, shape, vec![NODE_TAG]));
         self.select_path(&path);
         self.ask_node(&node_id);
         let _ = node_id;
@@ -1727,13 +2102,23 @@ impl Shell {
                 "capture: no frame yet (ask again once the viewport has drawn one)".to_owned(),
             )));
         };
-        let png = match crate::capture::encode_png(frame.width, frame.height, &frame.beauty) {
-            Ok(bytes) => bytes,
-            Err(e) => {
+        let png = {
+            // The pixels come from the render thread on request (v1.10); the frame that is
+            // on screen is the one in its textures, so what is read back is what is shown.
+            let Some((beauty, _ids)) = self.render.grab() else {
                 return Some(Err((
                     crate::control::NOT_READY,
-                    format!("capture: PNG encoding failed: {e}"),
+                    "capture: the GPU did not hand back the frame".to_owned(),
                 )));
+            };
+            match crate::capture::encode_png(frame.width, frame.height, &beauty) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return Some(Err((
+                        crate::control::NOT_READY,
+                        format!("capture: PNG encoding failed: {e}"),
+                    )));
+                }
             }
         };
         let written = std::path::Path::new(&path);
@@ -2015,9 +2400,8 @@ impl Shell {
                     // The frame was rendered at `size.texels()`; paint it into
                     // `size.rect()` with the whole texture, so one texel is one
                     // device pixel whatever the scale.
-                    egui::Image::new(texture)
+                    Self::viewport_image(*texture, size.rect().size(), size.uv())
                         .fit_to_exact_size(size.rect().size())
-                        .uv(size.uv())
                         .paint_at(ui, size.rect());
                 }
                 None => {
@@ -2244,10 +2628,19 @@ impl Shell {
         let Some((frame, _)) = &self.frame else {
             return;
         };
+        // **One texel, not a frame** (v1.10): the id buffer stays on the GPU and the
+        // render thread answers with the pixel under the pointer.
+        let Some(id) = self.render.pick(w, h) else {
+            return;
+        };
+        let picked = if id == 0 {
+            None
+        } else {
+            frame.paths.get((id - 1) as usize).cloned()
+        };
         let before = self.model.selection.clone();
-        let sel = self
-            .model
-            .pick_with(&frame.ids, &frame.paths, frame.width, frame.height, w, h);
+        self.model.selection = picked;
+        let sel = self.model.selection.clone();
         if sel != before {
             self.status = self.model.status_line();
             self.ask_render();
@@ -2718,6 +3111,7 @@ impl Shell {
     }
 
     fn paint(&mut self) {
+        self.poll_local_open();
         let raw = self.egui_state.take_egui_input(&self.window);
         let raw = self.correct_screen_space(raw);
         let ctx = self.egui_ctx.clone();
@@ -2744,6 +3138,14 @@ impl Shell {
             vec![],
             &self.window,
         );
+        // **A pass that applied nothing must not panic on the way out** (v1.9).
+        // `epaint::TexturesDelta` asserts on drop that every delta was applied, and a
+        // pass whose surface is not presentable (the window occluded, the swapchain lost,
+        // the first frame still warming up) returns from `paint_and_update_textures`
+        // without taking them. The panic then killed the whole viewer — from the outside,
+        // a script's next call found the control port refused and every row after it went
+        // unmeasured. Clearing what the pass did not take is what the assertion asks for.
+        textures.clear();
     }
 }
 

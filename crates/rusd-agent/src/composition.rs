@@ -118,13 +118,34 @@ struct LayerEntry {
 /// the root's stack, so a superseded output layer of an earlier pass is not
 /// listed.
 pub fn cook_output_layers(stage: &Stage) -> Vec<String> {
-    let root_id = stage.root_layer().identifier().to_owned();
-    let mut ids = stage.sub_layers(&root_id);
-    // `sub_layers` lists the parent first.
-    if ids.first().is_some_and(|id| *id == root_id) {
-        ids.remove(0);
+    // The cook inserts its output layers under the **session** layer (v1.9: the
+    // document's root layer is the user's authored file and is never written), so the
+    // op layers are the session's sublayers, newest first. A stage built before that
+    // change kept them under the root, and that spelling is still read when the
+    // session holds none.
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(session) = stage.session_layer() {
+        let session_id = session.identifier().to_owned();
+        ids = stage.sub_layers(&session_id);
+        if ids.first().is_some_and(|id| *id == session_id) {
+            ids.remove(0);
+        }
+        ids.reverse();
     }
-    ids.reverse();
+    if ids.is_empty() {
+        let root_id = stage.root_layer().identifier().to_owned();
+        ids = stage.sub_layers(&root_id);
+        // `sub_layers` lists the parent first.
+        if ids.first().is_some_and(|id| *id == root_id) {
+            ids.remove(0);
+        }
+        ids.reverse();
+        // The stack a picture is made from carries the **document's** root layer as a
+        // sublayer (v1.9: the cook writes its layers to files, nothing is inserted),
+        // and that layer is the stop family's `root` — not a cook output. It is the
+        // weakest sublayer, so it is the first after the reversal.
+        ids.retain(|id| layer_basename(id) != "rusd_root.rusd");
+    }
     ids
 }
 
@@ -132,8 +153,20 @@ pub fn cook_output_layers(stage: &Stage) -> Vec<String> {
 /// annotation (`layer = "prototypes.usda"`) names a layer the stage spells as an
 /// absolute resolved path. An anonymous identifier (`anon:7:rusd_instances.usda`)
 /// has no separator in it, so its whole spelling is its name.
-fn layer_basename(id: &str) -> &str {
-    id.rsplit(['/', '\\']).next().unwrap_or(id)
+pub(crate) fn layer_basename(id: &str) -> &str {
+    let mut name = id.rsplit(['/', '\\']).next().unwrap_or(id);
+    // A layer opened from another layer's bytes is tagged with that layer's own
+    // identifier, and an anonymous layer's identifier is itself `anon:<n>:<file>` — so a
+    // file name can carry a nested tag (`anon:31468:anon:31132:rusd_root.rusd`). The name
+    // is what follows the last such tag, or `rusd_root.rusd` never matches and the layer
+    // it names is treated as a cook output (v1.9).
+    while let Some(rest) = name.strip_prefix("anon:") {
+        match rest.split_once(':') {
+            Some((_, tail)) if !tail.is_empty() => name = tail,
+            _ => break,
+        }
+    }
+    name
 }
 
 struct ArcEntry {
@@ -205,16 +238,40 @@ impl CompositionTree {
 
         // Strength order: the root layer stack first (session layers, then the
         // root layer and its sublayers), then everything an arc opened.
-        let mut order: Vec<String> = Vec::new();
-        for id in stage
-            .layer_stack()
-            .into_iter()
-            .chain(stage.layer_identifiers())
-        {
-            if !order.contains(&id) {
-                order.push(id);
+        let order: Vec<String> = {
+            let mut order: Vec<String> = Vec::new();
+            for id in stage
+                .layer_stack()
+                .into_iter()
+                .chain(stage.layer_identifiers())
+            {
+                if !order.contains(&id) {
+                    order.push(id);
+                }
             }
-        }
+            // **The wrappers are not part of the graph** (v1.9: 这个工具的文档是合成图).
+            // `rusd_composed.rusd` is the stack a snapshot is read from and
+            // `rusd_cook_stack.rusd` the one a cook reads; both are how a picture is
+            // assembled, not nodes the document authored, so neither gets a row. The
+            // document's own lowered layer is not a row either — the composed root row
+            // *is* the document in this view. A **product** is a row, and it is a file
+            // now, so it is matched by the cook's own list below rather than by its name:
+            // the earlier rule dropped every path-spelled `rusd_op_*` from the order, which
+            // after v1.9 is the products themselves (their rows and the arcs that leave
+            // them both vanished).
+            order.retain(|id| {
+                // **The engine's own layers are not rows** (v1.9): the assembly's root
+                // (`rusd_composed.rusd`), the cook's throwaway stack, and the layer the
+                // document lowers into are all how a picture is *built* — none of them is a
+                // layer the document or an operator authored. `rusd_root.rusd` is not even a
+                // real layer any more: a graph document is not USD.
+                let base = layer_basename(id);
+                base != "rusd_composed.rusd"
+                    && base != "rusd_cook_stack.rusd"
+                    && base != "rusd_root.rusd"
+            });
+            order
+        };
         let scans: Vec<LayerScan> = order
             .iter()
             .map(|id| LayerScan {
@@ -244,15 +301,6 @@ impl CompositionTree {
             .iter()
             .enumerate()
             .map(|(strength, scan)| {
-                let kind = if Some(&scan.id) == session_id.as_ref() {
-                    "session"
-                } else if scan.id == root_id {
-                    "root"
-                } else if let Some(kind) = arc_kind.get(scan.id.as_str()) {
-                    kind
-                } else {
-                    "sublayer"
-                };
                 // The join: the cook names its output layers, and this layer's
                 // identifier is the key. That join is also the op test (v1.5.8): a
                 // layer the cook wrote is an op, and nothing else is — a
@@ -260,6 +308,21 @@ impl CompositionTree {
                 // because it sits in the stage.
                 let joined = ops.iter().find(|o| o.layer_id == scan.id);
                 let op = joined.is_some();
+                let kind = if Some(&scan.id) == session_id.as_ref() {
+                    "session"
+                } else if scan.id == root_id {
+                    "root"
+                } else if op {
+                    // **A product is an op, not a layer of anybody's stack** (v1.9):
+                    // the root does not reference the geometry it cooked, and a cooked
+                    // product is not a `sublayer` of the assembly either — it is the
+                    // layer the document's generator node wrote.
+                    "op"
+                } else if let Some(kind) = arc_kind.get(scan.id.as_str()) {
+                    kind
+                } else {
+                    "sublayer"
+                };
                 // A description comes from the generator node for an op, and from a
                 // document annotation for every other layer. An op's own node is the
                 // authority; an annotation is what is left.
@@ -495,6 +558,10 @@ impl CompositionTree {
 /// only to pick one kind for a layer several arcs reach.
 fn arc_rank(kind: &str) -> usize {
     match kind {
+        // A cook product is not a layer-stack edge at all: it is what the generator a
+        // document prim declares produced. It ranks with the stack edges because that is
+        // where it sits in the picture, not because it is one.
+        "generates" => 0,
         "sublayer" => 0,
         "inherit" => 1,
         "variant" => 2,
@@ -876,12 +943,31 @@ fn scan_arcs(stage: &Stage, scans: &[LayerScan]) -> Vec<ArcEntry> {
                         continue;
                     };
                     for asset in paths {
+                        let target = resolve_target(scans, &asset);
+                        // **USD graph, and no edge of the tool's own making** (v1.9). The
+                        // composed root is how a picture is assembled, not a node the
+                        // document wrote: its sublayers are the document's lowered layer
+                        // (that row *is* the root) and the cook's products, and the boxes
+                        // in those products are what the document's generator nodes
+                        // instantiated — they are the op rows beside the root, not
+                        // references it makes. Drawing them as arcs said the root
+                        // referenced the geometry it cooked (the user's question: root
+                        // 为什么要 reference？不就是实例化出来的 boxes 吗).
+                        if target.ends_with("rusd_root.rusd")
+                            || target
+                                .rsplit(['/', '\\'])
+                                .next()
+                                .is_some_and(|base| base.starts_with("rusd_op_"))
+                        {
+                            continue;
+                        }
+                        let kind = "sublayer";
                         arcs.push(ArcEntry {
                             id: format!("arc:{}", arcs.len()),
-                            kind: "sublayer",
+                            kind,
                             source_layer: scan.id.clone(),
                             source_prim: "/".to_owned(),
-                            target_layer: resolve_target(scans, &asset),
+                            target_layer: target,
                             target_prim: "/".to_owned(),
                         });
                     }
@@ -981,10 +1067,19 @@ fn scan_arcs(stage: &Stage, scans: &[LayerScan]) -> Vec<ArcEntry> {
 /// The layer an asset path names: the opened layer with that exact identifier,
 /// else one the resolver spelled differently, else the path as authored.
 fn resolve_target(scans: &[LayerScan], asset: &str) -> String {
-    if let Some(scan) = scans.iter().find(|s| s.id == asset) {
+    // Spelling-insensitive: a layer's identifier and an arc's authored asset path are the
+    // same file written by two hands — the stage holds the resolved spelling
+    // (`\\?\C:\…\prototypes.rusd`) and the document the one it authored
+    // (`C:/…/prototypes.rusd`). Compared as strings, they never match, and every material
+    // layer then lost its arc: the row fell back to `sublayer` and the edge pointed at a
+    // layer that is not in the list (v1.9).
+    if let Some(scan) = scans.iter().find(|s| same_file(&s.id, asset)) {
         return scan.id.clone();
     }
-    if let Some(scan) = scans.iter().find(|s| s.resolved.as_deref() == Some(asset)) {
+    if let Some(scan) = scans
+        .iter()
+        .find(|s| s.resolved.as_deref().is_some_and(|r| same_file(r, asset)))
+    {
         return scan.id.clone();
     }
     let file = file_name(asset);
@@ -996,6 +1091,17 @@ fn resolve_target(scans: &[LayerScan], asset: &str) -> String {
         }
     }
     asset.to_owned()
+}
+
+/// Whether two spellings name one file: `\\?\` dropped, separators unified, case folded.
+fn same_file(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        s.strip_prefix(r"\\?\")
+            .unwrap_or(s)
+            .replace('\\', "/")
+            .to_ascii_lowercase()
+    }
+    a == b || norm(a) == norm(b)
 }
 
 fn file_name(path: &str) -> &str {

@@ -432,6 +432,17 @@ struct Session {
     session_name: String,
     version: u64,
     stage: Option<Stage>,
+    /// The **document's own** stack (v1.9): what `rusd_scene::lower_with_session`
+    /// returned, kept so a re-cook reads the document rather than the picture. The
+    /// cook inserts nothing into it, and neither does anything else.
+    doc_stage: Option<Stage>,
+    /// The document root layer's identifier. [`stage`](Self::stage)'s root is the
+    /// composed stack's own (`rusd_composed.rusd`), so the row the tree calls 「root」
+    /// — and the layer a stop never mutes — is this one.
+    doc_root: String,
+    /// The path the document was opened from, so the operator graph that belongs to it
+    /// (the generator prims themselves) can be found.
+    doc_path: Option<String>,
     session_id: Option<String>,
     cook: CookEngine,
     /// The ops of the latest cook pass (PROTOCOL v1.5.1), in cook order, each
@@ -504,6 +515,15 @@ struct Session {
     /// Kept per pass beside [`cook_ops`](Self::cook_ops) and refreshed with it, so a
     /// rebuilt cook cannot leave a stale dependency behind.
     reads_by_node: BTreeMap<String, Vec<(String, String)>>,
+    /// The **assets each node declares** (today: the `prototype` parameter), by node
+    /// id, as file names — `prototypes.usda` for
+    /// `prototype = "prototypes.usda:/World/Prototypes/Box"`.
+    ///
+    /// Kept beside [`reads_by_node`](Self::reads_by_node) because a declaration is not
+    /// a read: the prim path a read carries is inside the asset, which the stop's stage
+    /// does not author, so the layer is matched by name instead. Refreshed with the
+    /// cook for the same reason.
+    assets_by_node: BTreeMap<String, Vec<String>>,
 }
 
 /// What one mutation made available to its subscribers, held until the
@@ -540,10 +560,14 @@ impl Session {
             session_name,
             version: 0,
             stage: None,
+            doc_stage: None,
+            doc_root: String::new(),
+            doc_path: None,
             session_id: None,
             cook: rusd_proc::default_registry(),
             cook_ops: Vec::new(),
             reads_by_node: BTreeMap::new(),
+            assets_by_node: BTreeMap::new(),
             ops: Vec::new(),
             undo: Vec::new(),
             redo: Vec::new(),
@@ -691,11 +715,19 @@ impl Session {
             "opinion" => self.opinion(&params),
             "composition_tree" => self.composition_tree(&params),
             "layer" => self.layer(&params),
+            // **The wire carries files, not geometry** (v1.9): the layers of the current
+            // stack as `(id, file)`, and the blocks of a file a client does not have yet.
+            // A client opens the file itself and composes locally, so a click costs a few
+            // ids and a re-cook costs the blocks that changed.
+            "layer_files" => self.layer_files(),
+            "layer_blocks" => self.layer_blocks(&params),
+            "layer_block_text" => self.layer_block_text(&params),
             "comp_node" => self.comp_node(&params),
             "capture" => self.captures.capture(&params),
             "capture_get" => self.captures.get(&params),
             "capture_list" => self.captures.list(&params),
             "open" => self.open(&params),
+
             "patch" => self.patch(&params),
             "undo" => self.undo(),
             "redo" => self.redo(),
@@ -782,7 +814,7 @@ impl Session {
             let root_id = stage.root_layer().identifier().to_owned();
             let ops = crate::composition::cook_output_layers(&stage);
             let ordered = self.strength_order();
-            if !ordered.contains(id) {
+            if !ordered.iter().any(|open| same_identifier(open, id)) {
                 return Err(self.unknown_preview(id, &ops, &root_id, &ordered));
             }
             self.preview.insert(conn, Preview::Solo(id.clone()));
@@ -810,17 +842,24 @@ impl Session {
                 self.preview.remove(&conn);
                 Ok(json!({ "upto": Value::Null }))
             }
-            Some(id) if id == root_id => {
+            Some(id) if same_identifier(&id, &root_id) => {
                 self.preview.insert(conn, Preview::Root);
                 Ok(json!({ "upto": id, "root": true }))
             }
             Some(id) => {
                 // A cook output layer keeps the position spelling, which is what
-                // survives a rebuild; any other layer is named outright.
-                let state = match ops.iter().position(|layer| *layer == id) {
+                // survives a rebuild; any other layer is named outright. The id is
+                // **translated to this stage's spelling** (v1.9): a client hands back
+                // the id it was given, and a path has more than one spelling, so the
+                // stop is stored under the layer's own id rather than the caller's.
+                let state = match ops.iter().position(|layer| same_identifier(layer, &id)) {
                     Some(position) => Preview::Op(position),
-                    None if ordered.contains(&id) => Preview::Layer(id.clone()),
-                    None => return Err(self.unknown_preview(&id, &ops, &root_id, &ordered)),
+                    None => match ordered.iter().find(|open| same_identifier(open, &id)) {
+                        Some(own) => Preview::Layer(own.clone()),
+                        None => {
+                            return Err(self.unknown_preview(&id, &ops, &root_id, &ordered));
+                        }
+                    },
                 };
                 let reply = match &state {
                     Preview::Op(position) => json!({ "upto": id, "op_index": position }),
@@ -1068,15 +1107,80 @@ impl Session {
 
     // --- agent tools, with the mutation pipeline hung off them -------------
 
-    fn open(&mut self, p: &Value) -> Result<Value, (i64, String)> {
-        let result = self.agent.call("open", p).map_err(server_error)?;
+
+    /// **The layers of the current stack as files** (v1.9): `(id, file)` for everything a
+    /// picture is made from, so a client can open them itself instead of being handed a
+    /// flattened copy. In-memory layers (the session, the assembly's root) are reported with
+    /// `file: null` — there is no file, they are not part of what a client composes.
+    fn layer_files(&self) -> Result<Value, (i64, String)> {
+        let Some(stage) = self.stage.as_ref() else {
+            return Err(server_error("no scene open".into()));
+        };
+        let mut out = Vec::new();
+        for id in crate::composition::cook_output_layers(stage)
+            .into_iter()
+            .chain(stage.layer_identifiers())
+        {
+            let file = stage
+                .layer(&id)
+                .and_then(|l| l.resolved_path().map(str::to_owned))
+                .or_else(|| {
+                    // An anonymous identifier is a layer that lives only in memory.
+                    None
+                });
+            if out.iter().any(|e: &Value| e["id"] == json!(id)) {
+                continue;
+            }
+            out.push(json!({ "id": id, "file": file }));
+        }
+        Ok(json!({ "layers": out }))
+    }
+
+    /// **A layer's blocks, as the incremental parser sees them** (v1.9): the table keys and
+    /// their text hashes, a few hundred bytes for a whole product. A client compares this
+    /// with what it holds and asks only for the blocks whose hash moved — the unit is a
+    /// `.rusd` table, the same one [`rusd_core::incremental::IncrementalParser`] re-parses,
+    /// not an arbitrary byte range.
+    fn layer_blocks(&self, p: &Value) -> Result<Value, (i64, String)> {
+        let path = file_param(p)?;
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| server_error(format!("cannot read {path}: {e}")))?;
+        let blocks: Vec<Value> = rusd_core::incremental::text_blocks(&text)
+            .into_iter()
+            .map(|b| json!({ "key": b.key, "hash": format!("{:016x}", hash_block(b.text.as_bytes())) }))
+            .collect();
+        Ok(json!({ "path": path, "blocks": blocks }))
+    }
+
+    /// The text of the blocks a client asked for, by index into `layer_blocks`.
+    fn layer_block_text(&self, p: &Value) -> Result<Value, (i64, String)> {
+        let path = file_param(p)?;
+        let want: Vec<usize> = p
+            .get("blocks")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_u64).map(|n| n as usize).collect())
+            .unwrap_or_default();
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| server_error(format!("cannot read {path}: {e}")))?;
+        let blocks = rusd_core::incremental::text_blocks(&text);
+        let mut out = Vec::new();
+        for index in want {
+            out.push(json!(blocks.get(index).map(|b| b.text.clone())));
+        }
+        Ok(json!({ "path": path, "blocks": out }))
+    }
+
+    fn open(&mut self, p: &Value) -> Result<Value, (i64, String)> {        let result = self.agent.call("open", p).map_err(server_error)?;
         self.ops.clear();
         self.undo.clear();
         self.redo.clear();
         // Hot reload follows a document opened by path; a document handed in as
         // `content` has no file to watch.
         match p.get("path").and_then(Value::as_str) {
-            Some(path) => self.watch_doc(path),
+            Some(path) => {
+                self.doc_path = Some(path.to_owned());
+                self.watch_doc(path)
+            },
             None => {
                 self.watch = None;
                 self.reload_due = None;
@@ -1156,12 +1260,25 @@ impl Session {
         // The tree describes the stage that was just dropped: a later
         // `comp_node` must not answer out of it.
         self.tree = None;
-        // A different root layer means the memoized cook layers are not in this
-        // stage: a memo hit would skip the insert and leave a hole, so the
-        // content-hash cache starts over with the stage. Its op list goes with it
-        // — those `layer_id`s name layers this rebuild will not reuse.
-        self.cook = rusd_proc::default_registry();
+        // **The engine survives the rebuild** (v1.9). Its memo is keyed by each node's
+        // inputs, and a product is a **file**, so a mutation that touches one operator
+        // leaves the other products exactly where they were — same file, same blocks, and
+        // the wire then carries only the table that moved (the user's rule: 服务器只给
+        // 变化的块). Dropping the engine here minted four new files on every open/patch,
+        // which made every viewer re-sync four whole layers for a one-table edit. Only the
+        // op list goes: those `layer_id`s name layers this pass may not reuse.
         self.cook_ops.clear();
+        // Products land in `<doc_dir>/out` (v1.9), as they do for `expand_doc`: the
+        // arcs a product authors are relative (`../box.rusd`, a bare `rusd_op_*.rusd`)
+        // and only resolve where the document's own directory makes them true. Left
+        // unset the engine writes into the process's temp dir, and `../box.rusd` from
+        // there names a file that does not exist — which is exactly what E_COOK said.
+        self.cook.set_out_dir(
+            self.agent
+                .doc_dir()
+                .map(std::path::Path::new)
+                .map(|dir| dir.join("out")),
+        );
 
         let Some(text) = self.agent.doc_text().map(str::to_owned) else {
             return Pipeline {
@@ -1194,19 +1311,34 @@ impl Session {
             }
         }
         let root_id = stage.root_layer().identifier().to_owned();
-        let nodes = rusd_proc::nodes_from_doc(&doc, self.agent.doc_dir());
-        let result = self.cook.cook(&stage, &root_id, &nodes);
+        self.doc_stage = Some(stage.clone());
+        self.doc_root = root_id.clone();
+        let mut nodes = rusd_proc::nodes_from_doc(&doc, self.agent.doc_dir());
+
+        let result = self.cook.cook(&stage, &nodes);
         let stats = result.stats;
         let diags = result.diags;
+        // **The picture is composed, never accumulated** (v1.9, the user's rule:
+        // 哪里都不许插入). The cook wrote its output layers to files and inserted
+        // nothing, so the stack the viewport sees is built here — the document root
+        // first, then those layers in cook order — and it is the thing every
+        // downstream reader (`muted_for`, `snapshot_line`, `composition_tree`,
+        // picking) already knows how to read.
+        let mut ops = result.ops;
+        let composed = match self.compose(&stage, &mut ops) {
+            Ok(stage) => stage,
+            Err(diags) => return Pipeline::failed(diags),
+        };
         // The ops of *this* pass, wholesale (PROTOCOL v1.5.1): a rebuild mints
         // new output layers, so the previous list's `layer_id`s are gone. A cook
         // that failed to produce a layer for a node simply has no op for it, and
         // the tree falls back to `null` for that layer.
-        self.cook_ops = result.ops;
+        self.cook_ops = ops;
         self.reads_by_node = nodes_reads(&nodes);
-        let prim_count = rusd_scene::prim_count(&stage);
-        self.live(stage.clone(), stats, &diags, prim_count, nodes.len());
-        self.stage = Some(stage);
+        self.assets_by_node = nodes_assets(&nodes);
+        let prim_count = rusd_scene::prim_count(&composed);
+        self.live(composed.clone(), stats, &diags, prim_count, nodes.len());
+        self.stage = Some(composed);
         self.session_id = session_id;
         Pipeline { diags, ok: true }
     }
@@ -1224,7 +1356,7 @@ impl Session {
     /// whose inputs did not move are memo hits (D6).
     fn recook(&mut self) -> Pipeline {
         let (Some(stage), Some(text)) =
-            (self.stage.clone(), self.agent.doc_text().map(str::to_owned))
+            (self.doc_stage.clone(), self.agent.doc_text().map(str::to_owned))
         else {
             return Pipeline {
                 diags: Vec::new(),
@@ -1236,16 +1368,26 @@ impl Session {
             Err(diags) => return Pipeline::failed(diags),
         };
         let root_id = stage.root_layer().identifier().to_owned();
-        let nodes = rusd_proc::nodes_from_doc(&doc, self.agent.doc_dir());
-        let result = self.cook.cook(&stage, &root_id, &nodes);
+        self.doc_root = root_id.clone();
+        let mut nodes = rusd_proc::nodes_from_doc(&doc, self.agent.doc_dir());
+
+        let result = self.cook.cook(&stage, &nodes);
         let stats = result.stats;
         let diags = result.diags;
         // Wholesale, as in `rebuild`: memo hits keep their output layer, so this
-        // pass still lists them — a reused node is an op of the cook (v1.5.1).
-        self.cook_ops = result.ops;
+        // pass still lists them — a reused node is an op of the cook (v1.5.1) — and
+        // the stack a picture is made from is built again from the files.
+        let mut ops = result.ops;
+        let composed = match self.compose(&stage, &mut ops) {
+            Ok(stage) => stage,
+            Err(diags) => return Pipeline::failed(diags),
+        };
+        self.cook_ops = ops;
         self.reads_by_node = nodes_reads(&nodes);
-        let prim_count = rusd_scene::prim_count(&stage);
-        self.live(stage, stats, &diags, prim_count, nodes.len());
+        self.assets_by_node = nodes_assets(&nodes);
+        let prim_count = rusd_scene::prim_count(&composed);
+        self.live(composed.clone(), stats, &diags, prim_count, nodes.len());
+        self.stage = Some(composed);
         Pipeline { diags, ok: true }
     }
 
@@ -1263,6 +1405,7 @@ impl Session {
             diags: diags.to_vec(),
             prim_count,
             node_count,
+            ops: Vec::new(),
         }));
     }
 
@@ -1339,122 +1482,53 @@ impl Session {
     /// Replacement semantics survive the rule rather than compete with it: an input
     /// an upstream op hid is hidden by that op's own `visibility` override, which is
     /// composed exactly when the op that authored it is kept.
-    fn muted_for(&self, preview: &Option<Preview>) -> Vec<String> {
-        let Some(stage) = self.stage.as_ref() else {
-            return Vec::new();
-        };
-        let order = self.strength_order();
-        let session_id = stage.session_layer().map(|l| l.identifier().to_owned());
-        // Session and root are the two layers a preview never mutes: the root cannot
-        // be (a stack with no root composes nothing) and the session must not be (a
-        // preview is a view of the work, overrides included).
-        let immutable = |id: &String| Some(id) == session_id.as_ref() || *id == self.root_id(stage);
-        match preview {
-            None => Vec::new(),
-            Some(Preview::Solo(_)) => Vec::new(),
-            Some(stop) => {
-                let ops = crate::composition::cook_output_layers(stage);
-                let kept_ops = self.ops_inside(stop, &ops, &order);
-                let mut keep: Vec<String> = kept_ops.clone();
-                for op in &kept_ops {
-                    keep.extend(self.consumed_layers(stage, op));
-                }
-                order
-                    .iter()
-                    .filter(|open| {
-                        !immutable(open) && !kept_ops.contains(open) && !keep.contains(open)
-                    })
-                    .cloned()
-                    .collect()
-            }
-        }
-    }
-
-    /// The cook output layers a stop keeps, by the strength order they occupy —
-    /// which is how v1.8 reads all three spellings of a stop as one rule again: the
-    /// root stop keeps none, an op stop keeps the ops up to its cook position, and a
-    /// named layer keeps every op stronger than it (a stop *below* the ops is a stop
-    /// before them all).
-    fn ops_inside(&self, stop: &Preview, ops: &[String], order: &[String]) -> Vec<String> {
-        match stop {
-            Preview::Root => Vec::new(),
-            Preview::Op(position) => ops.iter().take(position + 1).cloned().collect(),
-            Preview::Layer(id) => order
-                .iter()
-                .take_while(|open| *open != id)
-                .filter(|open| ops.contains(open))
-                .cloned()
-                .collect(),
-            Preview::Solo(_) => Vec::new(),
-        }
-    }
-
-    /// The material layers the op on `layer` consumes: for every prim its node
-    /// declared as a read, the layers that prim's spec lands in.
-    ///
-    /// `Prim::prim_stack` is what makes this follow an arc rather than walk a layer:
-    /// a read of `/World/Terrain` lands in `terrain.usda`'s own `/World/Terrain`,
-    /// and a read under an instance of a nested asset lands in that asset's
-    /// differently-spelled path (`/World/Boxes/i000009` inside `cluster.usda`), which
-    /// no scan of the stage's namespace could have found.
-    ///
-    /// A **cook output layer is never material**, and that exclusion is what makes a
-    /// stop a stop. Two of an op's reads land in op layers: its anchor
-    /// (`/World/Boxes`, whose spec the node itself authored) and its input
-    /// (`/World/SurfaceSamples/points`, an earlier op's output). Neither is an asset
-    /// the op consumed — and a contributor that happened to be a *later* op would
-    /// otherwise be kept for a reason that has nothing to do with the stop, which
-    /// silently un-muted the rest of the cook and made every stop past the first
-    /// look like the final composition.
-    ///
-    /// The session and root are excluded for the same reason they are never muted.
-    fn consumed_layers(&self, stage: &Stage, layer: &str) -> Vec<String> {
-        let session_id = stage.session_layer().map(|l| l.identifier().to_owned());
-        let root_id = self.root_id(stage);
-        let ops = crate::composition::cook_output_layers(stage);
-        let Some(node) = self.cook_ops.iter().find(|op| op.layer_id == layer) else {
-            return Vec::new();
-        };
-        let mut out: Vec<String> = Vec::new();
-        for (prim, _attr) in self
-            .reads_by_node
-            .get(&node.id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-        {
-            let Ok(path) = sdf::path(prim) else {
-                continue;
-            };
-            let Ok(prim) = stage.prim(&path) else {
-                continue;
-            };
-            let Ok(sites) = prim.prim_stack() else {
-                continue;
-            };
-            for site in sites {
-                if site.layer == layer
-                    || site.layer == root_id
-                    || Some(&site.layer) == session_id.as_ref()
-                    || ops.contains(&site.layer)
-                {
-                    continue;
-                }
-                if !out.contains(&site.layer) {
-                    out.push(site.layer);
-                }
-            }
-        }
-        // The reads of one node can name the same prim twice (a scatter declares a
-        // surface, a volume and a points read of one path), and two ops can consume
-        // the same asset; the answer is a set, and the caller only asks membership.
-        out.sort();
-        out.dedup();
-        out
-    }
-
     /// The root layer's identifier, which a preview never mutes.
     fn root_id(&self, stage: &Stage) -> String {
+        if !self.doc_root.is_empty() {
+            return self.doc_root.clone();
+        }
         stage.root_layer().identifier().to_owned()
+    }
+
+    /// Build the stack a picture is made from: the document's root layer, then the op
+    /// output layers this pass wrote, weakest first — so the last op is the strongest,
+    /// which is what "later cooks override earlier" means.
+    ///
+    /// `sdf::Layer` is neither `Clone` nor reusable: `insert_layer` takes it by value,
+    /// so a layer that a stack holds cannot be put into a second one. Every layer here
+    /// is therefore **re-read**: the document's from its bytes, each op's from the file
+    /// the cook wrote (v1.9's rule — 哪里都不许插入: nothing is ever inserted into a
+    /// stack that outlives the picture).
+    ///
+    /// The op identifiers are refreshed in `ops`: a re-read layer is anonymous in a
+    /// fresh stage, so the ids the tree and the snapshots name must be the new ones.
+    /// A layer re-read from its own bytes, for the reason [`compose`](Self::compose)
+    /// gives: the object a stack holds cannot be put into a second stack.
+    fn reload(layer: &sdf::Layer) -> Result<sdf::Layer, Vec<Diagnostic>> {
+        let format = sdf::LayerRegistry::find_by_id("usda")
+            .ok_or_else(|| vec![Diagnostic::error("E_COMPOSE", "the usda format is not registered")])?;
+        let written = format
+            .write_bytes(layer.data())
+            .map_err(|e| vec![Diagnostic::error("E_COMPOSE", format!("usda write failed: {e}"))])?;
+        let tag = layer
+            .identifier()
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("rusd_layer.rusd")
+            .to_owned();
+        sdf::Layer::from_bytes(tag, written.bytes)
+            .map_err(|e| vec![Diagnostic::error("E_COMPOSE", e.to_string())])
+    }
+
+    fn compose(
+        &self,
+        doc: &Stage,
+        ops: &mut [rusd_proc::CookOp],
+    ) -> Result<Stage, Vec<Diagnostic>> {
+        // One definition of "the stack a picture is made from", shared with `rusd export`
+        // and the CLI (v1.9): the document's root layer, then the products in cook order,
+        // with each op's identifier refreshed to the one the new stack settles on.
+        rusd_proc::compose_stack(doc, ops)
     }
 
     /// The Tier A snapshot: the stage — or, for a preview, exactly the composition
@@ -1472,27 +1546,38 @@ impl Session {
         let Some(stage) = self.stage.as_ref() else {
             return Err("no scene open; nothing to snapshot".into());
         };
-        // A solo is not a subtraction from the stage: it is "this layer alone",
-        // which the stage cannot show by muting, because openusd refuses to mute
-        // the root layer (a stack with no root composes nothing) and the document's
-        // own prims live there. So a solo composes a stage of its own whose root is
-        // that layer, and the document's root layer is simply not in it.
-        if let Some(Preview::Solo(id)) = &upto {
-            let flat = self.solo_flatten(stage, id)?;
+        // **A row means one thing: compose that layer** (v1.9). No subtraction, no
+        // "keep set", no stop rules — the picture is what USD composes for the layer the
+        // row names, in a stage whose root is that layer and whose only company is the
+        // session.
+        if let Some(what) = &upto {
+            let Some(id) = self.layer_for_preview(stage, what) else {
+                return Err(format!("no layer for {what:?}"));
+            };
+            let flat = self.solo_flatten(stage, &id)?;
             return self.write_snapshot(version, &flat, &upto);
         }
-        let muted = self.muted_for(&upto);
-        for id in &muted {
-            stage.mute_layer(id.clone());
-        }
-        let flattened = stage.flatten();
-        for id in &muted {
-            stage.unmute_layer(id);
-        }
-        let flat = flattened.map_err(|e| format!("flatten failed: {e}"))?;
+        // **Nothing is composed until a row is chosen** (the user's rule): the products are
+        // separate USDs and putting all of them into one stage is not this viewer's job, so
+        // `final` is an empty picture — pick a product (or a layer it references) to see a
+        // USD at all.
+        let empty = Stage::builder()
+            .in_memory("rusd_empty.rusd")
+            .map_err(|e| format!("cannot open an empty stage: {e}"))?;
+        let flat = empty.flatten().map_err(|e| format!("flatten failed: {e}"))?;
         self.write_snapshot(version, &flat, &upto)
     }
-
+    /// The layer a preview row stands for: a product's row names its layer, the root row
+    /// the composed stack's root, a `Layer`/`Solo` its identifier.
+    fn layer_for_preview(&self, stage: &Stage, what: &Preview) -> Option<String> {
+        match what {
+            Preview::Root => Some(stage.root_layer().identifier().to_owned()),
+            Preview::Op(position) => crate::composition::cook_output_layers(stage)
+                .get(*position)
+                .cloned(),
+            Preview::Layer(id) | Preview::Solo(id) => Some(id.clone()),
+        }
+    }
     /// One layer composed on its own (PROTOCOL v1.7.1): the session's overrides
     /// plus the named layer, and nothing else — the document's root layer is not in
     /// this picture, so a solo of an asset shows the asset rather than the asset
@@ -1516,14 +1601,14 @@ impl Session {
             .export_to_string()
             .map_err(|e| format!("solo: cannot re-read {id:?}: {e}"))?;
         drop(borrowed);
-        let owned = sdf::Layer::from_bytes("solo_layer.usda", text.into_bytes())
+        let owned = sdf::Layer::from_bytes("solo_layer.rusd", text.into_bytes())
             .map_err(|e| format!("solo: cannot re-parse {id:?}: {e}"))?;
-        let mut builder = Stage::builder();
+        let mut builder = rusd_scene::document::stage_builder();
         if let Some(session) = stage.session_layer().map(|l| l.identifier().to_owned()) {
             builder = builder.session_layer(session);
         }
         let solo = builder
-            .in_memory("solo_root.usda")
+            .in_memory("solo_root.rusd")
             .map_err(|e| format!("solo: cannot open a stage: {e}"))?;
         let solo_root = solo.root_layer().identifier().to_owned();
         solo.insert_layer(&solo_root, 0, owned, sdf::LayerOffset::IDENTITY)
@@ -1968,6 +2053,32 @@ fn nodes_reads(nodes: &[rusd_proc::CookNode]) -> BTreeMap<String, Vec<(String, S
         .collect()
 }
 
+/// The asset file names each node **declares**, by node id — the `prototype`
+/// parameter's `<asset>:` half, for the reason [`consumed_layers`] gives.
+fn nodes_assets(nodes: &[rusd_proc::CookNode]) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for node in nodes {
+        let Some(rusd_core::Value::String(spec)) = node.params.get("prototype") else {
+            continue;
+        };
+        let Some((asset, _prim)) = spec.rsplit_once(':') else {
+            continue;
+        };
+        let base = asset.rsplit(['/', '\\']).next().unwrap_or(asset);
+        // v1.9: a prototype may name a **document** (`.rusd`), which composes as the layer
+        // compiled from it. Leaving `.rusd` out here dropped the entry entirely, and the
+        // material layer was then muted for every stop: the boxes drew nothing.
+        if !(base.ends_with(".usda") || base.ends_with(".usdc") || base.ends_with(".rusd")) {
+            continue;
+        }
+        let entry = out.entry(node.id.clone()).or_default();
+        if !entry.iter().any(|b| b.eq_ignore_ascii_case(base)) {
+            entry.push(base.to_owned());
+        }
+    }
+    out
+}
+
 fn diagnostics_line(diags: &[Diagnostic]) -> String {
     to_line(&json!({
         "method": "diagnostics",
@@ -1977,6 +2088,37 @@ fn diagnostics_line(diags: &[Diagnostic]) -> String {
 
 fn diags_message(diags: &[Diagnostic]) -> String {
     serde_json::to_string(&crate::diags_json(diags)).unwrap_or_else(|_| "diagnostics".to_owned())
+}
+
+/// Whether two layer identifiers name the same layer (v1.9).
+///
+/// An identifier is a **path**, and a path has more than one spelling: the stage's own
+/// is the resolved one (`\\?\C:\…\volume.usda`), while a client that kept the id in a
+/// path type hands it back as `C:/…/volume.usda`. Both name one layer, and the row a
+/// client clicked is the row it must be able to open — a stop refused over the spelling
+/// of a path is a row that draws nothing.
+fn same_identifier(a: &str, b: &str) -> bool {
+    fn norm(s: &str) -> String {
+        let s = s.strip_prefix(r"\\?\").unwrap_or(s);
+        s.replace('\\', "/").to_ascii_lowercase()
+    }
+    a == b || norm(a) == norm(b)
+}
+
+/// A stable hash of one block, for `layer_blocks`: the client compares hashes, not text.
+fn hash_block(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
+}
+
+/// The `path` a `blob_*` request names.
+fn file_param(p: &Value) -> Result<String, (i64, String)> {
+    p.get("path")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or((INVALID_PARAMS, "blob: `path` (string) required".to_owned()))
 }
 
 fn to_line(v: &Value) -> String {

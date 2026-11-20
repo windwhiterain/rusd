@@ -6,3 +6,5 @@
 python/.venv/
 __pycache__/
 .wt/
+# The cook writes one .rusd per operator into <文档目录>/out/ (v1.9): generated, not authored.
+/examples/out/

@@ -16,6 +16,11 @@ pub enum PropType {
     Asset,
     Vec2,
     Vec3,
+    /// `point3f`: a position, as `Xformable`'s `xformOp:translate` is authored
+    /// (v1.9). Its only difference from `Vec3` is the type name it writes —
+    /// `point3f` rather than `vector3f` — and a `.rusd` product has to write back
+    /// the type it was read as, so the two spellings have to be two types.
+    Point3f,
     Vec4,
     /// `point3f[]` / `vector3f[]`: an array of 3-vectors, one USD array value
     /// (D14: a `Points` prim's `points`, which a scatter reads as geometry in).
@@ -23,6 +28,12 @@ pub enum PropType {
     /// `int[]`: an array of integers, one USD array value (a `Mesh`'s
     /// `faceVertexCounts` / `faceVertexIndices`).
     IntArray,
+    /// `token[]`: `Xformable`'s `xformOpOrder` (v1.9). A list of bare words, which
+    /// no other array type may be mistaken for: `value inference` is exactly what
+    /// the schema type table exists to replace.
+    TokenArray,
+    /// `color3f[]`: `primvars:displayColor` (v1.9), one colour per element.
+    Color3Array,
     Color3f,
     Array,
     Dict,
@@ -44,9 +55,12 @@ impl PropType {
             Self::Asset => "asset",
             Self::Vec2 => "vec2",
             Self::Vec3 => "vec3",
+            Self::Point3f => "point3f",
             Self::Vec4 => "vec4",
             Self::Vec3Array => "vec3[]",
             Self::IntArray => "int[]",
+            Self::TokenArray => "token[]",
+            Self::Color3Array => "color3f[]",
             Self::Color3f => "color3f",
             Self::Array => "array",
             Self::Dict => "dict",
@@ -97,6 +111,22 @@ const fn req(name: &'static str, ty: PropType) -> PropDef {
 use PropType::*;
 
 static XFORM: &[PropDef] = &[p("kind", Token), p("active", Bool), p("instanceable", Bool)];
+/// The attributes **every** prim carries whatever its schema: `UsdGeomXformable`'s
+/// `xformOp*` and `UsdGeomImageable`'s `visibility` (v1.9).
+///
+/// They are not on `XFORM` because they are not the `Xform` schema's: an instance
+/// prim authored under a `references` arc has **no** `typeName` of its own (its type
+/// comes through the arc), and it still carries a transform. Keeping them in a second
+/// table is what lets a `.rusd` product write its own transform back with the type it
+/// was read as instead of guessing it from the value's shape.
+static COMMON: &[PropDef] = &[
+    p("xformOp:translate", Point3f),
+    p("xformOp:scale", Vec3),
+    p("xformOp:rotateXYZ", Vec3),
+    p("xformOpOrder", TokenArray),
+    p("visibility", Token),
+    p("primvars:displayColor", Color3Array),
+];
 static SPHERE: &[PropDef] = &[p("radius", F64), p("extent", Array)];
 static CUBE: &[PropDef] = &[p("size", F64), p("extent", Array)];
 static CYLINDER: &[PropDef] = &[p("radius", F64), p("height", F64)];
@@ -230,6 +260,26 @@ static GRID: &[PropDef] = &[
     p("radius", F64),
     p("seed", U64),
 ];
+
+/// The type `name` is authored with under `schema`: the schema's own table first,
+/// then [`COMMON`]. `None` means the schema table does not know the name — a
+/// `.rusd` writer must then **not write it** (the document carries values, and a
+/// value the reader has no type for is a value that would come back as a different
+/// type).
+pub fn prop_type(schema: &str, name: &str) -> Option<PropType> {
+    let own = lookup(schema).and_then(|s| {
+        s.props
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.ty)
+    });
+    own.or_else(|| {
+        COMMON
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.ty)
+    })
+}
 
 /// Look up a schema by name. `None` means unknown (tolerated with a warning).
 pub fn lookup(name: &str) -> Option<SchemaDef> {

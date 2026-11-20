@@ -1,0 +1,29 @@
+# 素材层：一片 10×10 的起伏地面（4 个四边形），**一个物体一个 USD**。
+#
+# 被 `[World.Terrain] references = "terrain.rusd:/World/Terrain"` 的 prim 级 reference
+# 弧打开：地形是素材，作者层只留一条引用弧，几何全部从这里合成。
+#
+# root 层的 /World/Terrain 因此没有自己的 typeName（引用会赢过局部类型），
+# 类型 `Mesh`、points / faceVertexCounts / faceVertexIndices 都由这一层给出。
+
+[stage]
+default_prim = "/World"
+
+[World]
+schema = "Xform"
+
+[World.Terrain]
+schema = "Mesh"
+faceVertexCounts = [4, 4, 4, 4]
+faceVertexIndices = [0, 1, 4, 3, 1, 2, 5, 4, 3, 4, 7, 6, 4, 5, 8, 7]
+points = [
+    [0.0, 0.0, 0.0],
+    [5.0, 0.0, 0.5],
+    [10.0, 0.0, 0.0],
+    [0.0, 5.0, 0.5],
+    [5.0, 5.0, 1.5],
+    [10.0, 5.0, 0.4],
+    [0.0, 10.0, 0.0],
+    [5.0, 10.0, 0.3],
+    [10.0, 10.0, 0.0],
+]

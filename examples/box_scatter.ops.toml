@@ -1,0 +1,55 @@
+# rusd 0.1 — **文档就是这张算子图**：两段实例化在同一张图里
+#
+# 词汇是本工具自己的：`operator` / `outputs` / `inputs`，没有 USD 词（没有 `schema`、
+# 没有 `reference`、没有 `typeName`）。图说的只有两件事：跑什么算子、谁读谁。
+#
+[stage]
+default_prim = "/World"
+meters_per_unit = 1.0
+seed = 20261118
+up_axis = "Z"
+
+
+# --- 第一段：volume 采样 → 每个点一个 box ------------------------------------
+[operator.Samples]
+operator    = "sample_points"
+description = "在 Volume 盒内均匀采 60 个点（第一阶段）"
+outputs     = ["/World/Samples", "/World/Samples/points"]
+count = 60
+seed  = 11
+
+[operator.Samples.inputs]
+domain = "volume.rusd:/World/Volume"
+
+[operator.Boxes]
+operator    = "instances"
+description = "每个点放一个 box，得到一簇 box（原型来自素材层）"
+outputs     = ["/World/Boxes"]
+max_prims = 5000
+seed      = 11
+
+[operator.Boxes.inputs]
+points    = "/World/Samples/points"
+prototype = "box.rusd:/World/Prototypes/Box"
+
+# --- 第二段：mesh 表面采样 → 每点一簇 ----------------------------------------
+[operator.SurfaceSamples]
+operator    = "sample_points"
+description = "在 Terrain 表面面积加权采 40 个点（第二阶段）"
+outputs     = ["/World/SurfaceSamples", "/World/SurfaceSamples/points"]
+count = 40
+seed  = 7
+
+[operator.SurfaceSamples.inputs]
+domain = "terrain.rusd:/World/Terrain"
+
+[operator.Clusters]
+operator    = "instances"
+description = "把第一阶段的一簇 box 实例化到 quad 表面"
+outputs     = ["/World/Clusters"]
+max_prims = 5000
+seed      = 7
+
+[operator.Clusters.inputs]
+points    = "/World/SurfaceSamples/points"
+prototype = "/World/Boxes"

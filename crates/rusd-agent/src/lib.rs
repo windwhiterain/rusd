@@ -183,6 +183,7 @@ impl Agent {
                     diags: live.diags.clone(),
                     prim_count: live.prim_count,
                     node_count: live.node_count,
+                    ops: live.ops.clone(),
                 },
                 geo: geometry::extract(&live.stage),
             });

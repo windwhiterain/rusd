@@ -42,6 +42,30 @@ struct Block {
     text: String,
 }
 
+/// One block of a document's text: a table header and everything under it, which is the
+/// unit the incremental parser caches and the unit a client syncs (v1.9).
+pub struct TextBlock {
+    /// The table's dotted key (`World.Boxes`), or `""` for the preamble.
+    pub key: String,
+    /// The block's own text, header line included.
+    pub text: String,
+}
+
+/// Split a document into its header-delimited blocks.
+///
+/// This is **the** block unit of the tool: [`IncrementalParser`] re-parses only the blocks
+/// whose text changed, and the wire syncs only the blocks a client does not have. One
+/// definition, so the two cannot disagree about what "a block" is.
+pub fn text_blocks(text: &str) -> Vec<TextBlock> {
+    split_blocks(text)
+        .into_iter()
+        .map(|b| TextBlock {
+            key: b.key,
+            text: b.text,
+        })
+        .collect()
+}
+
 impl IncrementalParser {
     pub fn new() -> Self {
         Self::default()
@@ -110,6 +134,7 @@ impl IncrementalParser {
             // `parse`'s question, not this one's.
             doc_dir: None,
             annotations: annotations.into_values().collect(),
+            graph: false,
         })
     }
 }

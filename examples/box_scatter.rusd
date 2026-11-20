@@ -8,7 +8,7 @@
 #   RusdInstances    /World/Boxes          （第一段：box 实例，原型来自 prototypes.usda）
 #   RusdSamplePoints /World/SurfaceSamples （第二段的采样）
 #   RusdInstances    /World/Clusters       （第二段：簇实例，原型是同栈 /World/Boxes）
-# 素材层（各自独立的 reference 层）：volume.usda / terrain.usda / prototypes.usda。
+# 素材层（各自独立的 reference 层）：volume.rusd / terrain.rusd / prototypes.usda。
 
 [stage]
 default_prim = "/World"
@@ -27,7 +27,7 @@ schema = "Camera"
 
 # --- 第一段：volume 采样 → box -----------------------------------------------
 [World.Volume]
-references = "volume.usda:/World/Volume"
+references = "volume.rusd:/World/Volume"
 
 [World.Samples]
 count = 60
@@ -40,13 +40,13 @@ seed = 11
 description = "每个点放一个 box，得到一簇 box（原型来自素材层）"
 input_points = "/World/Samples/points"
 max_prims = 5000
-prototype = "prototypes.usda:/World/Prototypes/Box"
+prototype = "box.rusd:/World/Prototypes/Box"
 schema = "RusdInstances"
 seed = 11
 
 # --- 第二段：mesh（quad）采样 → 簇 -------------------------------------------
 [World.Terrain]
-references = "terrain.usda:/World/Terrain"
+references = "terrain.rusd:/World/Terrain"
 
 [World.SurfaceSamples]
 count = 40
@@ -66,15 +66,15 @@ seed = 7
 # --- 三个素材层的说明（注记节点：无 schema + layer 键）-----------------------
 [doc.prototypes]
 description = "box 原型库（被第一段的实例跨资产引用）"
-layer = "prototypes.usda"
+layer = "box.rusd"
 
 [doc.terrain]
 description = "10×10 起伏地面素材（由 prim 级 reference 弧打开）"
-layer = "terrain.usda"
+layer = "terrain.rusd"
 
 [doc.volume]
 description = "第一阶段的采样域：一个 Cube 素材（由 prim 级 reference 弧打开）"
-layer = "volume.usda"
+layer = "volume.rusd"
 
 [doc.root]
 description = "box_scatter.rusd：两段实例化的作者层（volume→box，quad→簇）"

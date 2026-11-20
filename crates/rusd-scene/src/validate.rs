@@ -113,13 +113,13 @@ pub fn validate(doc: &ParsedDocument) -> Vec<Diagnostic> {
                 }
                 continue;
             }
-            match schema.props.iter().find(|d| d.name == name) {
-                Some(def) => {
-                    if !type_ok(val, def.ty) {
+            match schema::prop_type(prim.schema.as_str(), name) {
+                Some(ty) => {
+                    if !type_ok(val, ty) {
                         diags.push(
                             Diagnostic::error(
                                 "E_TYPE",
-                                format!("expected {}, got {}", def.ty.name(), val.type_name()),
+                                format!("expected {}, got {}", ty.name(), val.type_name()),
                             )
                             .at_prim(prim.path.as_str())
                             .at_property(name),
@@ -152,12 +152,19 @@ fn type_ok(val: &Value, ty: PropType) -> bool {
         Token => matches!(val, Value::String(_) | Value::Token(_)),
         Path => match val {
             Value::Path(_) => true,
-            Value::String(s) => PrimPath::parse(s).is_ok(),
+            // **An input is a USD path** (v1.9): a bare `/World/Boxes` (a prim of this
+            // stack, i.e. an upstream operator's output) or `volume.rusd:/World/Volume`
+            // (a prim in a named layer, read from that file). Both are prim references.
+            Value::String(s) => match PrimPath::parse(s) {
+                Ok(_) => true,
+                Err(_) => asset_prim_ok(s),
+            },
             _ => false,
         },
         Asset => matches!(val, Value::String(_) | Value::Asset(_)),
         Vec2 => matches!(val, Value::Vec2(_)) || num_array(val, 2),
         Vec3 => matches!(val, Value::Vec3(_)) || num_array(val, 3),
+        Point3f => matches!(val, Value::Vec3(_)) || num_array(val, 3),
         Vec4 => matches!(val, Value::Vec4(_)) || num_array(val, 4),
         // A `point3f[]` is an array of `[x,y,z]` arrays on the surface: `points =
         // [[0.0,0.0,0.0], [1.0,0.0,0.0]]`. An array of bare numbers is refused: three
@@ -177,6 +184,18 @@ fn type_ok(val: &Value, ty: PropType) -> bool {
         IntArray => {
             matches!(val, Value::Array(items) if items.iter().all(|v| matches!(v, Value::Int(i) if *i >= 0)))
         }
+        TokenArray => {
+            matches!(val, Value::Array(items) if items.iter().all(|v| matches!(v, Value::String(_) | Value::Token(_))))
+        }
+        Color3Array => match val {
+            Value::Array(items) => {
+                !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|v| matches!(v, Value::Vec3(_)) || num_array(v, 3))
+            }
+            _ => false,
+        },
         Color3f => matches!(val, Value::Vec3(_)) || num_array(val, 3),
         Array => matches!(val, Value::Array(_)),
         Dict => matches!(val, Value::Dict(_)),
@@ -186,6 +205,16 @@ fn type_ok(val: &Value, ty: PropType) -> bool {
         },
         Any => true,
     }
+}
+
+/// Whether `s` is an `asset:prim` reference: a layer, a `:`, and a prim path taken from
+/// the right (a Windows drive letter has a `:` of its own, so the split is from the end).
+fn asset_prim_ok(s: &str) -> bool {
+    let Some(i) = s.rfind(':') else {
+        return false;
+    };
+    let (asset, prim) = (&s[..i], &s[i + 1..]);
+    !asset.is_empty() && prim.starts_with('/') && PrimPath::parse(prim).is_ok()
 }
 
 fn num_array(val: &Value, len: usize) -> bool {

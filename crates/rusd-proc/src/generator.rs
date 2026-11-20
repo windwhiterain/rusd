@@ -203,6 +203,10 @@ pub struct GenContext<'a> {
     pub doc_dir: Option<&'a str>,
     reads: Vec<(String, String)>,
     warnings: Vec<Diagnostic>,
+    /// The stage a material input is read from: the USD the input names, opened on its
+    /// own (v1.9). A generator's input is `asset:prim` — *which file, which prim* — and
+    /// reading it needs nothing but that file. See [`GenContext::with_input`].
+    input_stage: Option<(String, Stage)>,
 }
 
 impl<'a> GenContext<'a> {
@@ -223,7 +227,44 @@ impl<'a> GenContext<'a> {
             doc_dir,
             reads: Vec::new(),
             warnings: Vec::new(),
+            input_stage: None,
         }
+    }
+
+    /// Run `f` against the stage a raw input names, and the prim path inside it.
+    ///
+    /// An input is a **USD path**: `volume.rusd:/World/Volume` names a layer and a prim in
+    /// it; a bare `/World/Boxes` names a prim of this stack (an upstream operator's
+    /// output). The first is read from the file itself — the layer opened on its own, no
+    /// composition with the document, so a sampling domain never enters the picture —
+    /// and the second from the composed stage, which is where an upstream product lives.
+    fn with_input<R>(&mut self, raw: &str, f: impl FnOnce(&Stage, &str) -> R) -> Option<R> {
+        let split = Self::split_asset_input(raw);
+        if let Some((asset, prim)) = split {
+            let abs = match self.doc_dir {
+                Some(dir) => std::path::Path::new(dir).join(&asset),
+                None => std::path::Path::new(&asset).to_path_buf(),
+            };
+            let key = abs.to_string_lossy().replace('\\', "/");
+            if self.input_stage.as_ref().map(|(a, _)| a.as_str()) != Some(key.as_str()) {
+                let opened = Stage::open(&key).ok()?;
+                self.input_stage = Some((key, opened));
+            }
+            let (_, stage) = self.input_stage.as_ref()?;
+            return Some(f(stage, &prim));
+        }
+        Some(f(self.stage, raw))
+    }
+
+    /// Split `asset:prim` into its two halves, at the `:` whose right side is a prim path
+    /// taken from the right (a Windows drive letter contains one too).
+    fn split_asset_input(raw: &str) -> Option<(&str, String)> {
+        let i = raw.rfind(':')?;
+        let rest = &raw[i + 1..];
+        if !rest.starts_with('/') || raw[..i].is_empty() {
+            return None;
+        }
+        Some((&raw[..i], rest.to_owned()))
     }
 
     /// The composed stage to read inputs from (read-only).
@@ -234,7 +275,8 @@ impl<'a> GenContext<'a> {
     /// Read a composed `double` input, recording the dependency.
     pub fn read_f64(&mut self, prim: &str, attr: &str) -> f64 {
         self.reads.push((prim.to_owned(), attr.to_owned()));
-        read_attr_f64(self.stage, prim, attr)
+        self.with_input(prim, |stage, path| read_attr_f64(stage, path, attr))
+            .unwrap_or(0.0)
     }
 
     /// Read a prim's authored point cloud as **geometry in** (D14), in world
@@ -242,7 +284,7 @@ impl<'a> GenContext<'a> {
     /// points re-cooks this node and nothing else.
     pub fn read_points(&mut self, prim: &str) -> Option<Vec<[f64; 3]>> {
         self.reads.push((prim.to_owned(), "points".to_owned()));
-        read_world_points(self.stage, prim)
+        self.with_input(prim, read_world_points)?
     }
 
     /// A prim's tessellated **world-space triangles** as an input (D14.1): a
@@ -250,7 +292,7 @@ impl<'a> GenContext<'a> {
     /// is the triangles themselves — moving a parent moves every one of them.
     pub fn read_triangles(&mut self, prim: &str) -> Option<Vec<rusd_scene::geometry::Triangle>> {
         self.reads.push((prim.to_owned(), SURFACE_READ.to_owned()));
-        rusd_scene::geometry::world_triangles(self.stage, prim)
+        self.with_input(prim, rusd_scene::geometry::world_triangles)?
     }
 
     /// A prim's **box volume** in world space (v1.5.8): what a `Cube` names, which
@@ -259,7 +301,7 @@ impl<'a> GenContext<'a> {
     /// re-cooks the sampler that drew from it.
     pub fn read_volume(&mut self, prim: &str) -> Option<rusd_scene::geometry::WorldBox> {
         self.reads.push((prim.to_owned(), VOLUME_READ.to_owned()));
-        rusd_scene::geometry::cube_volume(self.stage, prim)
+        self.with_input(prim, rusd_scene::geometry::cube_volume)?
     }
 
     /// A prim's composed world transform as an **input** (D14): recorded as
@@ -268,7 +310,7 @@ impl<'a> GenContext<'a> {
     pub fn read_world_xform(&mut self, prim: &str) -> Option<rusd_scene::Mat> {
         self.reads
             .push((prim.to_owned(), WORLD_XFORM_READ.to_owned()));
-        rusd_scene::geometry::world_xform_of(self.stage, prim)
+        self.with_input(prim, rusd_scene::geometry::world_xform_of)?
     }
 
     /// The actual reads performed during this evaluation (for precise memo keys).

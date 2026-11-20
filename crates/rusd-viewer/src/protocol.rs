@@ -379,7 +379,15 @@ fn parse_notification(method: &str, params: &Value) -> Result<Notification, Diag
                 // v1.4's optional field: absent (or `null`) is the final composition.
                 // A *present* value must be a string — a number here is a server
                 // bug, and treating it as "final" would silently show the wrong frame.
-                upto: match params.get("upto") {
+                //
+                // A **solo** frame (v1.7.1, the material row's click) names its layer
+                // under `solo` instead, and it is the same question this field answers:
+                // which composition is on screen. `ClientModel::preview` is the one
+                // place that is recorded, and the tree — not this model — says whether
+                // the id names a cook prefix or a solo. Reading only `upto` made a solo
+                // frame look like the final composition at an unmoved version, which
+                // the discard rule then threw away: the click did nothing.
+                upto: match params.get("upto").or_else(|| params.get("solo")) {
                     None | Some(Value::Null) => None,
                     Some(Value::String(s)) => Some(s.clone()),
                     Some(other) => {

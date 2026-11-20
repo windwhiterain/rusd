@@ -275,10 +275,29 @@ impl Generator for RusdInstances {
             ]
         })?;
         let proto_path = proto.path.clone();
-        let proto_asset = proto
-            .asset
-            .clone()
-            .unwrap_or_else(|| ctx.stage().root_layer().identifier().to_owned());
+        // **The asset as the document wrote it** (v1.9): `box.rusd` stays `box.rusd` in the
+        // product, so the arc resolves from wherever the product is read. Resolution to an
+        // absolute path is the *reading* side's job, not the written record's.
+        let proto_asset = match prototype.rfind(':') {
+            Some(i)
+                if prototype[i + 1..].starts_with('/')
+                    && !prototype[..i].is_empty()
+                    && proto.asset.is_some() =>
+            {
+                // Products are written into `<doc_dir>/out/`, so a material named beside the
+                // document is **one directory up** from the product that reads it (v1.9).
+                let authored = &prototype[..i];
+                if authored.starts_with('/') || authored.starts_with("../") {
+                    authored.to_owned()
+                } else {
+                    format!("../{authored}")
+                }
+            }
+            _ => proto
+                .asset
+                .clone()
+                .unwrap_or_else(|| ctx.stage().root_layer().identifier().to_owned()),
+        };
         // The prototype's own values are what the arc composes; reading its radius
         // records the dependency that a change there reaches these instances.
         let _ = ctx.read_f64(proto_path.as_str(), "radius");

@@ -674,11 +674,19 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         // of the prim the edges point at (`comp_node{目标}`), which is the node whose
         // layer view says what the class is -- the contract's 「该行仍选择目标 prim
         // （comp_node{目标}）」, honoured for the *ask* while the viewport stays put.
+        // A group's id is the **layer its edges point into** (`box.rusd`), not the prim in
+        // it: `prim:<path>` is only a `comp_node` node when the stage holds that prim, and
+        // a prototype lives in the material layer, so the id the row handed out was one the
+        // server refused (`comp_node: no node has the id "prim:/World/Prototypes/Box"`) —
+        // a click that showed an error and no picture. The layer id is a node the server
+        // always has, and clicking it means what the user's ruling says an arc's click
+        // means: 点 reference 的层叶子 == 点这个 layer 的本身 (`crate::panel::action_for`
+        // opens the layer for a row with no prim).
         let (id, prim) = if group.count() == 1 {
             let arc = group.representative();
             (arc.id.clone(), Some(arc.source_prim.clone()))
         } else {
-            (prim_node_id(&group.key.target_prim), None)
+            (group.key.target_layer.clone(), None)
         };
         children.push(TreeNode {
             id,

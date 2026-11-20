@@ -73,7 +73,7 @@ seed = 11
 [World.Tufts]
 input_points = "/World/TuftSamples/points"
 max_prims = 5000
-prototype = "prototypes.usda:/World/Prototypes/Tuft"
+prototype = "tuft.rusd:/World/Prototypes/Tuft"
 scale = { dist = "uniform", min = 0.7, max = 1.5 }
 schema = "RusdInstances"
 seed = 11

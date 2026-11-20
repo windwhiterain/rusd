@@ -26,7 +26,7 @@ use bytemuck::{Pod, Zeroable};
 use rusd_core::Diagnostic;
 use rusd_render::RenderConfig;
 use rusd_render::render::RenderOutput;
-use rusd_scene::geometry::{self, Camera, Mat, SceneGeometry};
+use rusd_scene::geometry::{self, Camera, GeoItem, Mat, SceneGeometry};
 use wgpu::util::DeviceExt;
 
 use crate::diag;
@@ -73,10 +73,12 @@ fn vs_main(
     out.flag = flag;
     if (flag > 0.5) {
         // A point marker is a screen-space dot: the quad is built in clip space
-        // from its centre, so zooming never turns a point into a tile.
+        // from its centre, so zooming never turns a point into a tile. The half-size is
+        // 14 px (v1.9: it was 6, and a sampling node's 40 points then read as an empty
+        // frame — the dot has to be visible on its own, since a cloud is all that node is).
         var clip = u.view_proj * vec4<f32>(pos, 1.0);
-        clip.x = clip.x + normal.x * u.params.y * clip.w * 6.0;
-        clip.y = clip.y + normal.y * u.params.z * clip.w * 6.0;
+        clip.x = clip.x + normal.x * u.params.y * clip.w * 14.0;
+        clip.y = clip.y + normal.y * u.params.z * clip.w * 14.0;
         out.pos = clip;
         out.normal = vec3<f32>(0.0, 0.0, 1.0);
     } else {
@@ -103,6 +105,38 @@ fn fs_beauty(in: VsOut) -> @location(0) vec4<f32> {
 fn fs_id(in: VsOut) -> @location(0) u32 {
     return in.id;
 }
+
+// --- the selection's outline (v1.10: drawn on the GPU, from the id buffer) ----------
+@group(1) @binding(0) var id_tex: texture_2d<u32>;
+
+@vertex
+fn vs_outline(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
+    // One full-screen triangle: three vertices, no buffer.
+    var corners = array<vec2<f32>, 3>(vec2<f32>(-1.0, -1.0), vec2<f32>(3.0, -1.0), vec2<f32>(-1.0, 3.0));
+    return vec4<f32>(corners[index], 0.0, 1.0);
+}
+
+@fragment
+fn fs_outline(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let selected = u32(u.params.w);
+    if (selected == 0u) {
+        discard;
+    }
+    let dim = vec2<i32>(textureDimensions(id_tex));
+    let at = vec2<i32>(i32(pos.x), i32(pos.y));
+    if (textureLoad(id_tex, at, 0).x != selected) {
+        discard;
+    }
+    // The selected prim's pixels that touch a pixel of anything else are the outline.
+    var neighbours = array<vec2<i32>, 4>(vec2<i32>(1, 0), vec2<i32>(-1, 0), vec2<i32>(0, 1), vec2<i32>(0, -1));
+    for (var k = 0; k < 4; k = k + 1) {
+        let q = clamp(at + neighbours[k], vec2<i32>(0, 0), dim - vec2<i32>(1, 1));
+        if (textureLoad(id_tex, q, 0).x != selected) {
+            return vec4<f32>(1.0, 0.235, 0.235, 1.0);
+        }
+    }
+    discard;
+}
 "#;
 
 /// Beauty target format: sRGB, so written values are gamma-encoded bytes and the
@@ -122,6 +156,11 @@ pub struct Viewport {
 
     beauty_pipeline: wgpu::RenderPipeline,
     id_pipeline: wgpu::RenderPipeline,
+    /// The selection's outline (v1.10): draws the border of the selected prim from the
+    /// id buffer, so a selection costs no CPU pixel work and `capture` shows it too.
+    outline_pipeline: wgpu::RenderPipeline,
+    id_bgl: wgpu::BindGroupLayout,
+    id_bind_group: wgpu::BindGroup,
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
 
@@ -132,11 +171,42 @@ pub struct Viewport {
     id_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
 
-    // Scene buffers, rebuilt on set_scene.
+    // Scene buffers, **kept across snapshots** (v1.10: 渲染是 incremental 的 — a USD
+    // delta is a GPU buffer delta). Each prim owns a slab; only the slabs whose prim
+    // moved are rewritten, so a drag costs one prim's vertices and a one-operator patch
+    // costs that operator's prims. The buffers are an append-only arena: a slab that
+    // outgrows its space is appended at the tail and the old space is waste until the
+    // arena is compacted (at half waste, or when it must grow).
     vertex_buf: Option<wgpu::Buffer>,
     index_buf: Option<wgpu::Buffer>,
-    index_count: u32,
+    /// Capacity in vertices / in indices.
+    vertex_cap: u32,
+    index_cap: u32,
+    /// Where the next append starts.
+    vertex_len: u32,
+    index_len: u32,
+    /// What the live slabs actually hold, so the waste is visible at a glance.
+    live_vertices: u32,
+    live_indices: u32,
+    slots: std::collections::BTreeMap<String, Slot>,
+    /// The id a prim is drawn under in the `prim-id` pass. Stable for the life of the
+    /// session, so a slab can be rewritten without renaming the prim to the picker.
+    id_of: std::collections::BTreeMap<String, u32>,
     paths: Vec<String>,
+    /// [`Self::paths_arc`]'s cached share of the same list.
+    paths_arc: Option<std::sync::Arc<Vec<String>>>,
+    /// What generation the current targets are; bumped by [`Self::resize`] so a UI that
+    /// displays [`Self::beauty_view`] knows when to register the texture again.
+    generation: u64,
+    /// The 256-byte staging buffer a pick reads one texel into.
+    pick_read: Option<wgpu::Buffer>,
+    /// The draws the live slabs leave, as `(first index, count)` runs over the index
+    /// buffer; contiguous slabs merge, so a freshly compacted arena is one draw.
+    draws: Vec<(u32, u32)>,
+    /// How many prims the last sync actually rewrote, and how many draws it left. What
+    /// makes "only the delta went to the GPU" observable instead of a claim.
+    pub rewritten: usize,
+    pub slots_live: usize,
 
     // Reused readback buffers (grown as needed).
     beauty_read: wgpu::Buffer,
@@ -267,11 +337,62 @@ impl Viewport {
         let beauty_pipeline = make("beauty", BEAUTY_FORMAT, "fs_beauty");
         let id_pipeline = make("prim-id", ID_FORMAT, "fs_id");
 
+        // **The selection's outline, on the GPU** (v1.10): a full-screen pass that reads
+        // the id buffer the prim-id pass just wrote and colours the selected prim's
+        // border. Until this existed the outline was a CPU pass over the read-back frame,
+        // which is why a selected prim cost a whole-frame copy every frame.
+        let id_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("viewer-prim-id"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Uint,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            }],
+        });
+        let outline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("viewer-outline"),
+            bind_group_layouts: &[Some(&bgl), Some(&id_bgl)],
+            immediate_size: 0,
+        });
         let targets = Targets::new(&device, width, height);
+        let outline_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("selection-outline"),
+            layout: Some(&outline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_outline"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_outline"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: BEAUTY_FORMAT,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let read_bytes_per_row = aligned_bytes_per_row(width);
         let read_len = u64::from(read_bytes_per_row * height);
         let beauty_read = readback_buffer(&device, read_len);
         let id_read = readback_buffer(&device, read_len);
+        let id_bind_group = Self::id_bind(&device, &id_bgl, &targets.id_view);
 
         Self {
             device,
@@ -280,6 +401,9 @@ impl Viewport {
             height,
             beauty_pipeline,
             id_pipeline,
+            outline_pipeline,
+            id_bgl,
+            id_bind_group,
             bind_group,
             uniform_buf,
             beauty_tex: targets.beauty_tex,
@@ -289,12 +413,25 @@ impl Viewport {
             depth_view: targets.depth_view,
             vertex_buf: None,
             index_buf: None,
-            index_count: 0,
             paths: Vec::new(),
+            paths_arc: None,
+            generation: 0,
+            pick_read: None,
             beauty_read,
             id_read,
             read_bytes_per_row,
             uploaded: 0,
+            vertex_cap: 0,
+            index_cap: 0,
+            vertex_len: 0,
+            index_len: 0,
+            live_vertices: 0,
+            live_indices: 0,
+            slots: std::collections::BTreeMap::new(),
+            id_of: std::collections::BTreeMap::new(),
+            draws: Vec::new(),
+            rewritten: 0,
+            slots_live: 0,
         }
     }
 
@@ -306,6 +443,19 @@ impl Viewport {
     /// The prim paths in id order: `paths[id - 1]` is the prim an id names.
     pub fn paths(&self) -> &[String] {
         &self.paths
+    }
+
+    /// How many draw runs the live slabs leave (diagnostics, and what a test reads to
+    /// tell an uncompacted arena from a fragmented one).
+    pub fn draws_count(&self) -> usize {
+        self.draws.len()
+    }
+
+    /// The id a prim draws under, if it is on the GPU: what the outline pass needs to
+    /// know which prim to outline.
+    pub fn id_of(&self, path: &str) -> Option<u32> {
+        let id = self.id_of.get(path).copied()?;
+        self.slots.contains_key(path).then_some(id)
     }
 
     /// The beauty texture, for a UI to display without a CPU round trip.
@@ -322,6 +472,7 @@ impl Viewport {
         }
         self.width = width;
         self.height = height;
+        self.generation += 1;
         let targets = Targets::new(&self.device, width, height);
         self.beauty_tex = targets.beauty_tex;
         self.beauty_view = targets.beauty_view;
@@ -332,52 +483,396 @@ impl Viewport {
         let len = u64::from(self.read_bytes_per_row * height);
         self.beauty_read = readback_buffer(&self.device, len);
         self.id_read = readback_buffer(&self.device, len);
+        self.id_bind_group = Self::id_bind(&self.device, &self.id_bgl, &self.id_view);
     }
 
-    /// Bake `geo`'s world-space geometry onto the GPU. This is the one step per
-    /// snapshot: the camera is not baked, so orbiting afterwards re-uploads
-    /// nothing.
+    /// The bind group the outline pass reads the id buffer through.
+    fn id_bind(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("viewer-prim-id"),
+            layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(view),
+            }],
+        })
+    }
+
+    /// Bring the GPU geometry up to `geo`: **only the prims that actually changed are
+    /// baked and written** (v1.10 — a USD delta is a GPU buffer delta).
+    ///
+    /// `overrides` is a gizmo drag's per-prim translation, and its keys are the only
+    /// prims that can have moved — `only` is what says so, and with it set a drag costs
+    /// one prim's vertices instead of the scene's. `None` means "diff the whole scene",
+    /// which is what a fresh snapshot needs: it still bakes nothing whose signature
+    /// matches the slab already on the GPU.
     pub fn set_scene(&mut self, geo: &SceneGeometry) {
-        self.upload(geo, &std::collections::BTreeMap::new());
+        self.sync(geo, &std::collections::BTreeMap::new(), None);
     }
 
     /// The same, with a few prims moved: `overrides` maps a prim path to the
     /// world translation it should be drawn at. This is a gizmo drag's preview —
     /// local, so the prim follows the pointer without waiting for the server's
-    /// snapshot — and it is the only reason a drag costs a re-bake.
+    /// snapshot.
     pub fn set_scene_with_translates(
         &mut self,
         geo: &SceneGeometry,
         overrides: &std::collections::BTreeMap<String, [f64; 3]>,
     ) {
-        self.upload(geo, overrides);
+        let only: std::collections::BTreeSet<String> = overrides.keys().cloned().collect();
+        self.sync(geo, overrides, Some(&only));
     }
 
-    fn upload(
+    fn sync(
         &mut self,
         geo: &SceneGeometry,
         overrides: &std::collections::BTreeMap<String, [f64; 3]>,
+        only: Option<&std::collections::BTreeSet<String>>,
     ) {
-        let (vertices, indices, paths) = bake(geo, overrides);
-        self.vertex_buf = Some(
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("viewer-vertices"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                }),
-        );
-        self.index_buf = Some(
-            self.device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("viewer-indices"),
-                    contents: bytemuck::cast_slice(&indices),
-                    usage: wgpu::BufferUsages::INDEX,
-                }),
-        );
-        self.index_count = indices.len() as u32;
-        self.paths = paths;
+        let vertex_stride = std::mem::size_of::<Vertex>() as u64;
         self.uploaded += 1;
+        self.rewritten = 0;
+        if self.vertex_buf.is_none() {
+            self.allocate(1024, 4096);
+        }
+        // What the scene would need if every prim were appended fresh, and how much of
+        // the arena is already dead: either answer is a compaction.
+        let need_v: u32 = geo.items.iter().map(item_vertices).sum();
+        let need_i: u32 = geo.items.iter().map(item_indices).sum();
+        let waste_v = self.vertex_len.saturating_sub(self.live_vertices);
+        let waste_i = self.index_len.saturating_sub(self.live_indices);
+        let grow = self.vertex_len + need_v > self.vertex_cap || self.index_len + need_i > self.index_cap;
+        let stale = (self.vertex_cap > 8192 && waste_v > self.vertex_cap / 2)
+            || (self.index_cap > 8192 && waste_i > self.index_cap / 2);
+        if grow || stale {
+            // **A compaction is a device-to-device move** (v1.10): the live slabs are copied
+            // from the old buffers to the new ones with `copy_buffer_to_buffer`, so nothing
+            // that did not change crosses the bus — no re-bake, no re-upload, no CPU pixels.
+            // Amortised: the new arena has room to spare, so this is rare.
+            let cap_v = (need_v.max(1024) * 2).max(self.live_vertices * 2);
+            let cap_i = (need_i.max(4096) * 2).max(self.live_indices * 2);
+            let old_vertex = self.vertex_buf.take();
+            let old_index = self.index_buf.take();
+            self.allocate(cap_v, cap_i);
+            let (Some(new_vertex), Some(new_index)) = (self.vertex_buf.clone(), self.index_buf.clone())
+            else {
+                return;
+            };
+            let stride = std::mem::size_of::<Vertex>() as u64;
+            let mut moved = std::collections::BTreeMap::new();
+            let mut vertex_at = 0u32;
+            let mut index_at = 0u32;
+            let mut slabs: Vec<(String, Slot)> = self
+                .slots
+                .iter()
+                .map(|(path, slot)| (path.clone(), slot.clone()))
+                .collect();
+            slabs.sort_by_key(|(_, slot)| slot.vstart);
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("viewer-compact"),
+            });
+            if let (Some(from_v), Some(from_i)) = (&old_vertex, &old_index) {
+                for (path, slot) in slabs {
+                    if slot.vcount > 0 {
+                        encoder.copy_buffer_to_buffer(
+                            from_v,
+                            u64::from(slot.vstart) * stride,
+                            &new_vertex,
+                            u64::from(vertex_at) * stride,
+                            u64::from(slot.vcount) * stride,
+                        );
+                    }
+                    if slot.icount > 0 {
+                        encoder.copy_buffer_to_buffer(
+                            from_i,
+                            u64::from(slot.istart) * 4,
+                            &new_index,
+                            u64::from(index_at) * 4,
+                            u64::from(slot.icount) * 4,
+                        );
+                    }
+                    moved.insert(
+                        path,
+                        Slot {
+                            vstart: vertex_at,
+                            istart: index_at,
+                            ..slot
+                        },
+                    );
+                    vertex_at += slot.vcount;
+                    index_at += slot.icount;
+                }
+            }
+            self.queue.submit(Some(encoder.finish()));
+            self.slots = moved;
+            self.vertex_len = vertex_at;
+            self.index_len = index_at;
+            self.live_vertices = vertex_at;
+            self.live_indices = index_at;
+        }
+        let mut live: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for item in &geo.items {
+            live.insert(item.path.clone());
+            let transform = match overrides.get(&item.path) {
+                Some(t) => {
+                    let mut m = item.transform;
+                    m[12] = t[0];
+                    m[13] = t[1];
+                    m[14] = t[2];
+                    m
+                }
+                None => item.transform,
+            };
+            // A prim the hint says cannot have moved keeps its slab without even being
+            // hashed: that is what makes a drag a one-prim delta rather than a scene walk.
+            let skipped = only.is_some_and(|set| !set.contains(&item.path));
+            if skipped && self.slots.contains_key(&item.path) {
+                continue;
+            }
+            let signature = signature_of(item, &transform);
+            if let Some(slot) = self.slots.get(&item.path) {
+                if slot.signature == signature {
+                    continue;
+                }
+            }
+            let id = self.prim_id(&item.path);
+            let (vcount, icount) = (item_vertices(item), item_indices(item));
+            // In place when the prim's slab is exactly the right size (the common case:
+            // a moved instance, a re-coloured prim); otherwise a fresh slab at the tail.
+            let in_place = self
+                .slots
+                .get(&item.path)
+                .is_some_and(|s| s.vcount == vcount && s.icount == icount);
+            let (vstart, istart) = if in_place {
+                let s = &self.slots[&item.path];
+                (s.vstart, s.istart)
+            } else {
+                (self.vertex_len, self.index_len)
+            };
+            let mut vertices: Vec<Vertex> = Vec::with_capacity(vcount as usize);
+            let mut indices: Vec<u32> = Vec::with_capacity(icount as usize);
+            bake_item(item, id, transform, vstart, &mut vertices, &mut indices);
+            let Some(vertex_buf) = &self.vertex_buf else { return };
+            let Some(index_buf) = &self.index_buf else { return };
+            if !vertices.is_empty() {
+                self.queue.write_buffer(
+                    vertex_buf,
+                    u64::from(vstart) * vertex_stride,
+                    bytemuck::cast_slice(&vertices),
+                );
+            }
+            if !indices.is_empty() {
+                self.queue.write_buffer(
+                    index_buf,
+                    u64::from(istart) * 4,
+                    bytemuck::cast_slice(&indices),
+                );
+            }
+            if !in_place {
+                self.vertex_len += vcount;
+                self.index_len += icount;
+                self.live_vertices += vcount;
+                self.live_indices += icount;
+            }
+            self.slots.insert(
+                item.path.clone(),
+                Slot {
+                    signature,
+                    vstart,
+                    vcount,
+                    istart,
+                    icount,
+                },
+            );
+            self.rewritten += 1;
+        }
+        // Prims the scene no longer has: their ids stay (a pick may still name one for
+        // a frame), their slabs become waste.
+        let gone: Vec<String> = self
+            .slots
+            .keys()
+            .filter(|p| !live.contains(p.as_str()))
+            .cloned()
+            .collect();
+        for path in gone {
+            if let Some(slot) = self.slots.remove(&path) {
+                self.live_vertices = self.live_vertices.saturating_sub(slot.vcount);
+                self.live_indices = self.live_indices.saturating_sub(slot.icount);
+            }
+        }
+        // The draws the slabs leave: contiguous runs merge, so an arena whose slabs were
+        // appended together is one draw, and a fragmented one a few more.
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        let mut slabs: Vec<&Slot> = self.slots.values().collect();
+        slabs.sort_by_key(|s| s.istart);
+        for slot in slabs {
+            if slot.icount == 0 {
+                continue;
+            }
+            match runs.last_mut() {
+                Some((start, count)) if *start + *count == slot.istart => *count += slot.icount,
+                _ => runs.push((slot.istart, slot.icount)),
+            }
+        }
+        self.draws = runs;
+        self.slots_live = self.slots.len();
+    }
+
+    /// (Re)create the two scene buffers at `vertex_cap` vertices and `index_cap` indices.
+    fn allocate(&mut self, vertex_cap: u32, index_cap: u32) {
+        let vb = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("viewer-vertices"),
+            size: u64::from(vertex_cap) * std::mem::size_of::<Vertex>() as u64,
+            // COPY_SRC as well: a compaction moves the live slabs to a bigger buffer
+            // **on the GPU** (v1.10), so the old one has to be a copy source.
+            usage: wgpu::BufferUsages::VERTEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let ib = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("viewer-indices"),
+            size: u64::from(index_cap) * 4,
+            usage: wgpu::BufferUsages::INDEX
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        self.vertex_buf = Some(vb);
+        self.index_buf = Some(ib);
+        self.vertex_cap = vertex_cap.max(1);
+        self.index_cap = index_cap.max(1);
+    }
+
+    /// The stable id a prim draws under in the `prim-id` pass.
+    fn prim_id(&mut self, path: &str) -> u32 {
+        if let Some(id) = self.id_of.get(path) {
+            return *id;
+        }
+        let id = (self.paths.len() + 1) as u32;
+        self.paths.push(path.to_owned());
+        self.id_of.insert(path.to_owned(), id);
+        // A new id is a new list: the cached shareable copy is stale.
+        self.paths_arc = None;
+        id
+    }
+
+    /// The id→path list as a **shareable** copy: a frame hands it to the UI thread for a
+    /// few hundred microseconds and gives it back, so it is cloned when a prim is added,
+    /// never once per frame (a 2500-prim scene would clone 2500 strings a frame).
+    pub fn paths_arc(&mut self) -> std::sync::Arc<Vec<String>> {
+        if self.paths_arc.is_none() {
+            self.paths_arc = Some(std::sync::Arc::new(self.paths.clone()));
+        }
+        self.paths_arc.clone().expect("just filled")
+    }
+
+    /// The beauty texture's generation: bumped whenever the texture is replaced (a
+    /// resize). A UI that displays the texture directly re-registers on a new generation.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Copy the **current** frame back to the CPU: the beauty bytes and the prim ids.
+    ///
+    /// This is no longer part of drawing a frame (v1.10). A frame is displayed straight
+    /// from [`Self::beauty_view`], so the round trip happens only when someone actually
+    /// needs pixels on the CPU — a `capture` (a PNG to write) or a selection's outline —
+    /// and a pick asks for one texel ([`Self::pick`]) instead of a whole buffer.
+    pub fn grab(&mut self) -> Result<(Vec<u8>, Vec<u32>), Vec<Diagnostic>> {
+        let (Some(vertex_buf), Some(index_buf)) = (&self.vertex_buf, &self.index_buf) else {
+            return Err(vec![diag(
+                "E_VIEW_NO_SCENE",
+                "no snapshot has been uploaded yet",
+            )]);
+        };
+        let _ = (vertex_buf, index_buf);
+        let (width, height) = (self.width, self.height);
+        let bpr = self.read_bytes_per_row;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("viewer-grab"),
+            });
+        copy_to_buffer(
+            &mut encoder,
+            &self.beauty_tex,
+            &self.beauty_read,
+            width,
+            height,
+            bpr,
+        );
+        copy_to_buffer(&mut encoder, &self.id_tex, &self.id_read, width, height, bpr);
+        self.queue.submit(Some(encoder.finish()));
+        read_back(
+            &self.device,
+            &self.beauty_read,
+            &self.id_read,
+            width,
+            height,
+            bpr,
+        )
+    }
+
+    /// The prim id at one pixel of the last frame: **one texel read back**, not a whole
+    /// buffer (v1.10). Zero is the background.
+    pub fn pick(&mut self, x: u32, y: u32) -> Result<u32, Vec<Diagnostic>> {
+        if x >= self.width || y >= self.height {
+            return Ok(0);
+        }
+        let buf = self.pick_read.get_or_insert_with(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("viewer-pick"),
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("viewer-pick"),
+            });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.id_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(256),
+                    rows_per_image: Some(1),
+                },
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.queue.submit(Some(encoder.finish()));
+        let slice = buf.slice(0..4);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        rx.recv()
+            .map_err(device_err)?
+            .map_err(device_err)?;
+        let data = slice.get_mapped_range().map_err(device_err)?;
+        let id = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+        drop(data);
+        buf.unmap();
+        Ok(id)
     }
 
     /// Draw both passes with `cam` and read them back.
@@ -391,6 +886,7 @@ impl Viewport {
         cam: &Camera,
         bounds: ([f64; 3], [f64; 3]),
         cfg: &RenderConfig,
+        selected: Option<u32>,
     ) -> Result<RenderOutput, Vec<Diagnostic>> {
         let (Some(vertex_buf), Some(index_buf)) = (&self.vertex_buf, &self.index_buf) else {
             return Err(vec![diag(
@@ -412,6 +908,9 @@ impl Viewport {
         uni[20] = cfg.diffuse;
         uni[21] = 2.0 / width as f32;
         uni[22] = 2.0 / height as f32;
+        // Zero means "nothing selected": the outline pass discards every pixel then, and
+        // no prim has id 0 (ids start at 1).
+        uni[23] = selected.map(|id| id as f32).unwrap_or(0.0);
         self.queue
             .write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(&uni));
 
@@ -450,7 +949,12 @@ impl Viewport {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, vertex_buf.slice(..));
             pass.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.index_count, 0, 0..1);
+            // One draw per *run* of live slabs (v1.10): the index buffer is an arena whose
+            // slabs are appended in prim order, so an uncompacted scene is one run and a
+            // fragmented one is a few. Indices are absolute, so the base vertex is 0.
+            for (start, count) in &self.draws {
+                pass.draw_indexed(*start..*start + *count, 0, 0..1);
+            }
         }
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -478,41 +982,46 @@ impl Viewport {
             pass.set_bind_group(0, &self.bind_group, &[]);
             pass.set_vertex_buffer(0, vertex_buf.slice(..));
             pass.set_index_buffer(index_buf.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..self.index_count, 0, 0..1);
+            for (start, count) in &self.draws {
+                pass.draw_indexed(*start..*start + *count, 0, 0..1);
+            }
         }
-        let bpr = self.read_bytes_per_row;
-        copy_to_buffer(
-            &mut encoder,
-            &self.beauty_tex,
-            &self.beauty_read,
-            width,
-            height,
-            bpr,
-        );
-        copy_to_buffer(
-            &mut encoder,
-            &self.id_tex,
-            &self.id_read,
-            width,
-            height,
-            bpr,
-        );
+        // **The selection's outline** (v1.10): after the id pass, colour the border of the
+        // selected prim in the beauty target. It reads the id buffer, writes only the
+        // outline pixels (LoadOp::Load), and costs one full-screen triangle.
+        if selected.is_some() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("selection-outline"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.beauty_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.outline_pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.set_bind_group(1, &self.id_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
         self.queue.submit(Some(encoder.finish()));
 
-        let (beauty, ids) = read_back(
-            &self.device,
-            &self.beauty_read,
-            &self.id_read,
-            width,
-            height,
-            bpr,
-        )?;
+        // **No readback when drawing** (v1.10): the picture is displayed straight from
+        // [`Self::beauty_view`], so a frame costs the two passes and nothing else. The
+        // CPU copy is [`Self::grab`], asked for only by a capture or a selection outline.
         Ok(RenderOutput {
             width,
             height,
-            beauty,
-            ids,
-            paths: self.paths.clone(),
+            beauty: Vec::new(),
+            ids: Vec::new(),
+            paths: Vec::new(),
             diags: Vec::new(),
         })
     }
@@ -540,7 +1049,11 @@ impl Targets {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: BEAUTY_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                // Sampled by egui itself (v1.10): the frame is shown straight from this
+                // texture, so it has to be bindable.
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let id_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -550,7 +1063,11 @@ impl Targets {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: ID_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                // Read by the outline pass (v1.10): the selection's outline is drawn on
+                // the GPU from this buffer, so it has to be bindable.
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let depth_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -678,75 +1195,132 @@ fn device_err(e: impl std::fmt::Display) -> Vec<Diagnostic> {
 
 // --- bake (identical to rusd_render's) ------------------------------------
 
-fn bake(
-    geo: &SceneGeometry,
-    overrides: &std::collections::BTreeMap<String, [f64; 3]>,
-) -> (Vec<Vertex>, Vec<u32>, Vec<String>) {
-    let mut vertices: Vec<Vertex> = Vec::new();
-    let mut indices: Vec<u32> = Vec::new();
-    let mut paths: Vec<String> = Vec::new();
-    for (i, item) in geo.items.iter().enumerate() {
-        let id = (i + 1) as u32;
-        let base = vertices.len() as u32;
-        let transform = match overrides.get(&item.path) {
-            Some(t) => {
-                let mut m = item.transform;
-                m[12] = t[0];
-                m[13] = t[1];
-                m[14] = t[2];
-                m
-            }
-            None => item.transform,
-        };
-        if let Some(markers) = &item.markers {
-            // One screen-space quad per marker (6 vertices): `normal` carries the
-            // corner (-1..1) and `flag` tells the shader to build the dot in clip
-            // space, so a point keeps its pixel size at any zoom.
-            for c in markers {
-                let wp = geometry::mat_transform_point(
-                    transform,
-                    [c[0] as f64, c[1] as f64, c[2] as f64],
-                );
-                for (dx, dy) in [
-                    (-1.0, -1.0),
-                    (1.0, -1.0),
-                    (-1.0, 1.0),
-                    (1.0, -1.0),
-                    (1.0, 1.0),
-                    (-1.0, 1.0),
-                ] {
-                    vertices.push(Vertex {
-                        pos: [wp[0] as f32, wp[1] as f32, wp[2] as f32],
-                        normal: [dx, dy, 0.0],
-                        color: item.color,
-                        id,
-                        flag: 1.0,
-                    });
+/// One prim's slab in the two scene buffers (v1.10). `vstart` is in vertices, `istart`
+/// in indices; the slab's indices are **absolute** (already biased by `vstart`), which is
+/// what lets a slab be rewritten in place or skipped altogether.
+/// One prim's slab in the two scene buffers (v1.10). `vstart` is in vertices, `istart`
+/// in indices; the slab's indices are **absolute** (already biased by `vstart`), which is
+/// what lets a slab be rewritten in place, skipped, or copied device-to-device unchanged.
+#[derive(Clone)]
+struct Slot {
+    /// What the slab was baked from. Equal means "the prim did not move" and the GPU is
+    /// left alone — the whole point of the delta path.
+    signature: u64,
+    vstart: u32,
+    vcount: u32,
+    istart: u32,
+    icount: u32,
+}
+
+/// The vertices and indices one prim needs.
+fn item_vertices(item: &GeoItem) -> u32 {
+    match &item.markers {
+        Some(markers) => (markers.len() * 6) as u32,
+        None => item.mesh.positions.len() as u32,
+    }
+}
+
+fn item_indices(item: &GeoItem) -> u32 {
+    match &item.markers {
+        Some(markers) => (markers.len() * 6) as u32,
+        None => item.mesh.indices.len() as u32,
+    }
+}
+
+/// A hash of everything `bake_item` reads. The mesh is hashed whole rather than by
+/// pointer: `extract` builds fresh vectors per scene, so identity says nothing, and a
+/// signature that lies would leave a stale slab on the GPU.
+fn signature_of(item: &GeoItem, transform: &Mat) -> u64 {
+    fn mix(state: &mut u64, value: u64) {
+        // FNV-1a over the value, one multiply per word: cheap and order-sensitive.
+        *state ^= value;
+        *state = state.wrapping_mul(0x100_0000_01b3);
+    }
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for v in transform.iter() {
+        mix(&mut h, v.to_bits());
+    }
+    for v in item.color.iter() {
+        mix(&mut h, u64::from(v.to_bits()));
+    }
+    match &item.markers {
+        Some(markers) => {
+            mix(&mut h, 1);
+            mix(&mut h, markers.len() as u64);
+            for p in markers {
+                for v in p {
+                    mix(&mut h, u64::from(v.to_bits()));
                 }
-                let n = vertices.len() as u32;
-                indices.extend_from_slice(&[n - 6, n - 5, n - 4, n - 3, n - 2, n - 1]);
             }
-        } else {
-            let nm = NormalMatrix::new(transform);
-            for (p, n) in item.mesh.positions.iter().zip(&item.mesh.normals) {
-                let wp = geometry::mat_transform_point(
-                    transform,
-                    [p[0] as f64, p[1] as f64, p[2] as f64],
-                );
-                let wn = nm.apply(*n);
+        }
+        None => {
+            mix(&mut h, 2);
+            mix(&mut h, item.mesh.positions.len() as u64);
+            for p in &item.mesh.positions {
+                for v in p {
+                    mix(&mut h, u64::from(v.to_bits()));
+                }
+            }
+            for center in &item.mesh.indices {
+                mix(&mut h, u64::from(*center));
+            }
+        }
+    }
+    h
+}
+
+fn bake_item(
+    item: &GeoItem,
+    id: u32,
+    transform: Mat,
+    base: u32,
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+) {
+    if let Some(markers) = &item.markers {
+        // One screen-space quad per marker (6 vertices): `normal` carries the
+        // corner (-1..1) and `flag` tells the shader to build the dot in clip
+        // space, so a point keeps its pixel size at any zoom.
+        for c in markers {
+            let wp =
+                geometry::mat_transform_point(transform, [c[0] as f64, c[1] as f64, c[2] as f64]);
+            let start = vertices.len() as u32;
+            for (dx, dy) in [
+                (-1.0, -1.0),
+                (1.0, -1.0),
+                (-1.0, 1.0),
+                (1.0, -1.0),
+                (1.0, 1.0),
+                (-1.0, 1.0),
+            ] {
                 vertices.push(Vertex {
                     pos: [wp[0] as f32, wp[1] as f32, wp[2] as f32],
-                    normal: wn,
+                    normal: [dx, dy, 0.0],
                     color: item.color,
                     id,
-                    flag: 0.0,
+                    flag: 1.0,
                 });
             }
-            indices.extend(item.mesh.indices.iter().map(|&idx| base + idx));
+            for k in 0..6 {
+                indices.push(base + start + k);
+            }
         }
-        paths.push(item.path.clone());
+    } else {
+        let nm = NormalMatrix::new(transform);
+        let start = vertices.len() as u32;
+        for (p, n) in item.mesh.positions.iter().zip(&item.mesh.normals) {
+            let wp = geometry::mat_transform_point(transform, [p[0] as f64, p[1] as f64, p[2] as f64]);
+            let wn = nm.apply(*n);
+            vertices.push(Vertex {
+                pos: [wp[0] as f32, wp[1] as f32, wp[2] as f32],
+                normal: wn,
+                color: item.color,
+                id,
+                flag: 0.0,
+            });
+        }
+        indices.extend(item.mesh.indices.iter().map(|&i| base + start + i));
     }
-    (vertices, indices, paths)
 }
 
 /// Normal matrix = inverse-transpose of the upper 3x3 = cofactor / det.

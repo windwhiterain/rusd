@@ -58,6 +58,7 @@
 //!   and carried out by the shell's own functions (`crate::app::Shell::on_control`).
 
 pub mod anchor;
+pub mod cache;
 pub mod app;
 pub mod camera;
 pub mod capture;

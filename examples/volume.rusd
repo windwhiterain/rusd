@@ -1,0 +1,19 @@
+# 素材层：第一段的采样域，**一个物体一个 USD**。
+#
+# 被 `[World.Volume] references = "volume.rusd:/World/Volume"` 的 prim 级 reference
+# 弧打开：采样域是素材，作者层只留一条引用弧，`size` 全部从这里合成。
+#
+# 位置也写在这个 USD 里：整段抬高 20，和地面那一段分开（采样在世界坐标里算，
+# 所以采出来的 60 个 box 会跟着上去）。
+
+[stage]
+default_prim = "/World"
+
+[World]
+schema = "Xform"
+
+[World.Volume]
+schema = "Cube"
+size = 6.0
+"xformOp:translate" = [0.0, 0.0, 20.0]
+"xformOpOrder" = ["xformOp:translate"]

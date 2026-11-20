@@ -266,6 +266,16 @@ pub fn action_for(node: &TreeNode) -> TreeAction {
             selection,
             ask: ask_for(node),
         },
+        // **An edge class whose edges point into a layer** (v1.9): the row is drawn as
+        // `reference → box.rusd:… ×60`, it stands for no prim on screen (`prim: None`), and
+        // its id is the target **layer** (`crate::tree`). Clicking it is therefore clicking
+        // that layer — the user's ruling, 点 reference 的层叶子 == 点这个 layer 的本身 — and
+        // that is the only click on this row that can show a picture: asking `comp_node` for
+        // the prototype prim was a question the server refused.
+        TreeNodeKind::Arc if node.prim.is_none() => TreeAction::Layer {
+            selection,
+            ask: Some(LayerAsk::Solo),
+        },
         _ => TreeAction::Select(selection),
     }
 }
@@ -488,11 +498,22 @@ fn row(
     preview: Option<&str>,
     scroll_to: &mut Option<String>,
 ) -> Option<TreeAction> {
-    let is_selected = selected.is_some_and(|s| s.id == node.id);
+    // **One click, one lit row.** Rows share ids on purpose — a layer's own row, the leaf
+    // under every arc that reaches it, and (v1.9) the arc class that points at it all name
+    // the same layer — so a bare id comparison lit three of them for one click (the user's
+    // 点了最后一行，有三行都被点亮). A layer selection therefore lights the layer's **own**
+    // row (`depth == 0`, the one the shell scrolls to) and never its leaves, and an arc's
+    // selection stays on the arc row.
+    let is_selected = selected.is_some_and(|s| {
+        s.id == node.id
+            && s.kind == node.kind
+            && (node.kind != TreeNodeKind::Layer || depth == 0)
+    });
     // A row that is **the current preview** is marked too: the user needs to see where
     // they are, and the current prefix is not a selection (it does not follow a
-    // `comp_node` ask).
-    let is_current_preview = is_current_preview(node, preview);
+    // `comp_node` ask). Only the layer's own row carries that mark — a leaf that merely
+    // points at the same layer is not where the composition stops.
+    let is_current_preview = depth == 0 && is_current_preview(node, preview);
     // The row's **drawn** title: an op row already carries the `<=` marker in its label
     // (v1.4), and the root row gains it while it is the prefix in force (v1.5.3).
     let title = control_row_title(node, is_current_preview);
@@ -534,7 +555,7 @@ fn row(
         ui.horizontal(|ui| {
             indent(ui, depth);
             let response = ui
-                .selectable_label(is_current_preview, text)
+                .selectable_label(is_selected, text)
                 .on_hover_text(row_hover_text(node, true));
             if wants_scroll {
                 response.scroll_to_me(Some(Align::Center));
@@ -559,7 +580,7 @@ fn row(
         ui.horizontal(|ui| {
             indent(ui, depth);
             let response = ui
-                .selectable_label(is_selected || is_current_preview, text)
+                .selectable_label(is_selected, text)
                 .on_hover_text(row_hover_text(node, is_preview_row(node)));
             if wants_scroll {
                 response.scroll_to_me(Some(Align::Center));
@@ -613,7 +634,7 @@ fn row(
                 ui.data_mut(|d| d.insert_temp(id.with("open"), open));
             }
             let response = ui
-                .selectable_label(is_selected || is_current_preview, text)
+                .selectable_label(is_selected, text)
                 .on_hover_text(row_hover_text(node, is_preview_row(node)));
             if wants_scroll {
                 response.scroll_to_me(Some(Align::Center));

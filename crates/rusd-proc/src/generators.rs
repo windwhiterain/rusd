@@ -9,7 +9,7 @@ use openusd::usd::Stage;
 use rusd_core::Diagnostic;
 use rusd_core::syntax::ParsedDocument;
 
-use crate::cook::{CookEngine, CookStats, nodes_from_doc};
+use crate::cook::{CookEngine, CookOp, CookStats, nodes_from_doc};
 use crate::generator::{GenContext, Generator};
 
 /// A parametric grid of spheres: count_x × count_y at `spacing`, each `radius`.
@@ -104,6 +104,9 @@ pub struct ExpandOutput {
     pub diags: Vec<Diagnostic>,
     pub prim_count: usize,
     pub node_count: usize,
+    /// What the cook wrote, in cook order (v1.9): the files this pass's picture is made
+    /// from. A caller that wants the products without the stack has them here.
+    pub ops: Vec<CookOp>,
 }
 
 /// Lower a document to a Stage, then cook its generator nodes (D8/D9).
@@ -132,16 +135,27 @@ pub fn expand_doc(
         doc
     };
     let stage = rusd_scene::lower(doc)?;
-    let root_id = stage.root_layer().identifier().to_owned();
     let nodes = nodes_from_doc(doc, doc_dir);
     let mut engine = default_registry();
-    let result = engine.cook(&stage, &root_id, &nodes);
-    let prim_count = rusd_scene::prim_count(&stage);
+    // Products land in `<doc_dir>/out`, beside the materials they name (v1.9): an arc can
+    // then be relative, and the same directory can be copied to another machine.
+    engine.set_out_dir(
+        doc_dir
+            .map(std::path::Path::new)
+            .map(|d| d.join("out")),
+    );
+    let mut result = engine.cook(&stage, &nodes);
+    // **The picture is the composed stack** (v1.9): the cook writes products to files and
+    // inserts nothing, so a caller asking for a stage to look at gets the document plus
+    // those products, in cook order — the same stack the viewer builds.
+    let composed = crate::cook::compose_stack(&stage, &mut result.ops)?;
+    let prim_count = rusd_scene::prim_count(&composed);
     Ok(ExpandOutput {
-        stage,
+        stage: composed,
         stats: result.stats,
         diags: result.diags,
         prim_count,
         node_count: nodes.len(),
+        ops: result.ops,
     })
 }

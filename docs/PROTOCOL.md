@@ -624,3 +624,59 @@ prim**（视口描边高亮 + `comp_node` 详情，与视口 pick 同一条路�
   root 档为空（文档自己不写几何）。
 - `preview{solo: id}`（v1.7.1 并入）不变：只该层 + session。
 - 已被上游 op 以 visibility over 隐藏的输入照常隐藏（替换语义优先于合入规则）。
+
+## v1.9 增补（产品落盘 / 全用 `.rusd` / 停点按依赖闭包；2026-11-19 用户裁定）
+
+### 一、产物落盘，哪里都不许插入
+
+- cook 的产物**不再是栈里的层**：每个 generator 的产物写成一个文件（`%TEMP%/rusd_op_<pid>_<n>.rusd`），
+  栈里什么都不插。要看画面时现搭一个栈（文档根层 + 产品层，弱到强）——现搭现弃。
+  理由有二：`sdf::Layer` 既不可 `Clone`、`insert_layer` 又按值取走，所以插过一次的层打不开第二次；
+  而「合成图」要的是可重放的输入，不是一个活着的 stage。
+- `sublayer` 不出现：产品与素材都只通过 `reference` 弧（或显式栈）参与合成。
+
+### 二、`.rusd` 就是 USD 层文件（用户原话：rusd 就是 usd）
+
+- `.rusd` **不是**另一种场景模型，也不是「文档要编译成层」：它就是 `usda` 承载的那一层——同样的 prim、
+  类型、属性值、reference 弧、层元数据——只是用 TOML 表写。所以它能放在组合里的任何位置：stage 的根层、
+  sublayer、`references` 弧的目标、cook 的产物、素材。
+- 实现：openusd 的格式表里注册了 `rusd`（`vendor/openusd/src/rusd.rs`，`DEFAULT_FORMATS`
+  里第四项）。格式只管**字节**：它向宿主（rusd）要一个解码器（`openusd::rusd::set_decoder`）和一个
+  编码器（`set_encoder`），`rusd-scene::document::install()` 装上它们——`decode` = `parse_in` →
+  `adapter::author_into`，`encode` = `layer_to_document`。一个定义，两个调用方（stage 的根层、层文件）。
+  没有编译副本、没有缓存目录、没有第二套拼写；`Layer::open("x.rusd")` 就走这一条。
+- **产物是 `.rusd`**：cook 把每个 generator 的输出层写成 `%TEMP%/rusd_op_<pid>_<n>.rusd`，
+  `cook_stack` / `compose` 用 `Layer::open` 读回并插入。**素材也是 `.rusd`**：`volume.rusd` /
+  `terrain.rusd` / `prototypes.rusd`。
+- **属性类型���从 schema 表来**（用户原话「1 only」）：文档只写值，不写类型、不按值的形状推断；
+  schema 表里没有的键**不写**（写出时告警 `W_RUSD_WRITE`，导出时 `W_EXPORT_RUSD`）。
+  每个 prim 都有的属性单独一张表（`xformOp:translate`/`:scale`/`:rotateXYZ`、`xformOpOrder`、
+  `visibility`、`primvars:displayColor`），所以一个没有本地 `typeName` 的实例 prim 也拿得到自己的类型。
+- 会话层与两个包装层（`rusd_composed.rusd` / `rusd_root.rusd`）是引擎自己的名字，不是文档节点。
+  唯一还是 `.usda` 的文件是 `%TEMP%/rusd_session_<pid>_<n>.usda`——那是引擎在**任何文档被打开之前**
+  就要读的一个草稿层，树里那一行叫 `session`，不显示文件名。
+
+### 三、停点（撤销 v1.8「root 档为空」，用户裁定：每个层节点点开都要能渲染）
+
+- **root 档 = 整份文档**：它保留所有 op 层，以及这些 op 消费的素材层；不再是一个空场景。
+- 一个 op 档 = 该 op 的**依赖闭包**（按声明的 reads 往上追），不是「cook 顺序在它之前的全部」。
+- 保留集 = 依赖闭包 + **引用闭包**（一层引用另一层，例如簇引用上游产物那一层）取到不动点为圢；
+  否则被引用的层被静音，停点里的实例全是空壳（实测 ink 0.000%）。
+- `preview` 接受**同一层的另一种路径拼写**（`\\?\C:\…` / `C:/…`）：层 id 是路径，客户端把 id
+  存进路径类型再递回来，拼写变了但层没变；拒绝一个拼写不同的停点，就是一行点不开。
+
+### 四、算子图就是文档（用户裁定）
+
+- **文档本身就是图，不是另一个文件。** 节点是文档里 `schema` 为生成器的那几个 prim
+  （`RusdSamplePoints` / `RusdInstances` …），边是节点自己声明的输入（`input_points`、`prototype`
+  ——指向另一个节点的输出，或指到素材的 `asset:prim`）。
+- 没有 `*.ops.toml`：读它的代码（`operator_graph` / `apply_operator_graph` / `ops_path`）已删，
+  仓库里也没有这个文件。想改图就改文档里的节点。
+- 树上不出现算子图的边：树按 **USD 图**画，边只用 `reference`。
+
+### 验收
+
+- `box_scatter.rusd`：**10 层 · 106 arc · 2510 prim**，最终快照 263,710 B（产品与素材全为 `.rusd` 时）。
+- 每个层行点开都有图（ink > 0）：root/Clusters 16.02%、Boxes 6.56%、两段采样 10.67%/3.62%、
+  prototypes 30.16%、编译出的产物层 16.02%、root 子层 12.00%、terrain 5.05%、volume 45.09%。
+- `cargo test -p rusd-proc --test compose_products` 把上面的数字钉成回归测试。

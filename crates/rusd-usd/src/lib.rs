@@ -9,6 +9,11 @@
 //! - `bake = false`: export generator prims as custom schemas (params preserved,
 //!   not renderable in a DCC without the Rusd runtime).
 //!
+//! An `out` spelled `.rusd` is a **document** export (v1.9): the flattened stage is
+//! written back as TOML, values only, with every type taken from the schema table —
+//! so it round-trips through `parse_in`/`lower` like any other `.rusd`. Properties the
+//! table cannot type are left out and reported, never guessed at.
+//!
 //! The stage is Z-up (D7) and declares `upAxis = "Z"`; DCCs honor the declared axis.
 //! (A baked Y-up conversion is a later refinement.)
 
@@ -21,6 +26,9 @@ pub struct ExportInfo {
     pub format: String,
     pub prim_count: usize,
     pub baked: bool,
+    /// What the export left out, if anything (v1.9: a `.rusd` export cannot carry a
+    /// property the schema table has no type for).
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// Export a `.rusd` document (source text) to `out` (`.usda`/`.usdc`/`.usdz`).
@@ -48,18 +56,39 @@ pub fn export_text(
     let flat = stage
         .flatten()
         .map_err(|e| vec![Diagnostic::error("E_FLATTEN", e.to_string())])?;
-    flat.export(out)
-        .map_err(|e| vec![Diagnostic::error("E_EXPORT", e.to_string())])?;
     let format = std::path::Path::new(out)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("usda")
-        .to_owned();
+        .to_ascii_lowercase();
+    let mut diags: Vec<Diagnostic> = Vec::new();
+    if format == "rusd" {
+        // A flattened stage is one layer; a document is that layer's prims.
+        let rendered = rusd_scene::document::layer_to_document(&flat, &|_, _| None)
+            .map_err(|e| vec![Diagnostic::error("E_EXPORT", e)])?;
+        if !rendered.skipped.is_empty() {
+            diags.push(Diagnostic::warning(
+                "W_EXPORT_RUSD",
+                format!(
+                    "{} properties have no type in the schema table and are not in the \
+                     document: {}",
+                    rendered.skipped.len(),
+                    rendered.skipped.join(", ")
+                ),
+            ));
+        }
+        std::fs::write(out, rendered.text)
+            .map_err(|e| vec![Diagnostic::error("E_EXPORT", format!("{out}: {e}"))])?;
+    } else {
+        flat.export(out)
+            .map_err(|e| vec![Diagnostic::error("E_EXPORT", e.to_string())])?;
+    }
     Ok(ExportInfo {
         path: out.to_owned(),
         format,
         prim_count,
         baked: bake,
+        warnings: diags,
     })
 }
 

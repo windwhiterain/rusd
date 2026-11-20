@@ -38,6 +38,11 @@ pub struct AssetRef {
     /// The external layer, absolute and `/`-spelled; `None` for a prim of this
     /// stage (an internal reference).
     pub asset: Option<String>,
+    /// The asset half **as the document wrote it** (v1.9): `../box.rusd`, or an absolute
+    /// path when that is what was authored. A layer written back to disk keeps this
+    /// spelling, so the file resolves from wherever it is read — the same record copied to
+    /// another machine still opens, because a relative arc means "beside this file".
+    pub authored: Option<String>,
     /// The prim inside that layer.
     pub path: sdf::Path,
 }
@@ -81,7 +86,11 @@ pub fn parse(value: &str, doc_dir: Option<&str>) -> Result<AssetRef, AssetRefErr
     });
     let Some(split) = split else {
         let path = sdf::path(value).map_err(|e| AssetRefError::path(value, e.to_string()))?;
-        return Ok(AssetRef { asset: None, path });
+        return Ok(AssetRef {
+            asset: None,
+            authored: None,
+            path,
+        });
     };
     let authored = &value[..split];
     let prim = &value[split + 1..];
@@ -89,6 +98,7 @@ pub fn parse(value: &str, doc_dir: Option<&str>) -> Result<AssetRef, AssetRefErr
     let resolved = resolve_layer(authored, doc_dir)?;
     Ok(AssetRef {
         asset: Some(resolved),
+        authored: Some(authored.to_owned()),
         path,
     })
 }

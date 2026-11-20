@@ -13,6 +13,7 @@
 
 pub mod diag;
 pub mod fmt;
+pub mod graph;
 pub mod incremental;
 pub mod path;
 pub mod syntax;
@@ -20,7 +21,8 @@ pub mod value;
 
 pub use diag::{Diagnostic, Severity};
 pub use fmt::canonicalize;
-pub use incremental::{IncrementalParser, Stats};
+pub use graph::parse as parse_graph;
+pub use incremental::{IncrementalParser, Stats, TextBlock, text_blocks};
 pub use path::{PathError, PrimPath};
 pub use syntax::{Annotation, ParsedDocument, PrimBlock};
 pub use value::Value;

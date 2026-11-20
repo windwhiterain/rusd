@@ -22,7 +22,7 @@ pub mod pipeline;
 pub mod rng;
 
 pub use city::{RusdBuilding, RusdScatter, RusdStreetGrid};
-pub use cook::{CookEngine, CookNode, CookOp, CookResult, CookStats, nodes_from_doc};
+pub use cook::{CookEngine, CookNode, CookOp, CookResult, CookStats, compose_stack, nodes_from_doc};
 pub use generator::{GenContext, Generator};
 pub use generators::{ExpandOutput, RusdGrid, default_registry, expand_doc};
 pub use pipeline::{RusdInstances, RusdSamplePoints, points_path};

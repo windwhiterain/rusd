@@ -1755,8 +1755,6 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 [[package]]
 name = "openusd"
 version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54f38d869c64c96492e1a482fb621eda620d120d91dbe93072112ee315a8923c"
 dependencies = [
  "bitflags 2.13.2",
  "bytemuck",

@@ -79,6 +79,11 @@ pub struct ParsedDocument {
     /// node path so the surface stays deterministic. Two may name one layer; that
     /// is `E_ANNOTATION` at validation, not something this parser resolves.
     pub annotations: Vec<Annotation>,
+    /// Whether this is an **operator graph** rather than a USD document (v1.9). A graph is
+    /// the document an author writes, and it is not USD: its `prims` are the operators the
+    /// cook runs, and **none of them is authored into the composed stage**. The stage a
+    /// picture is made from is the layers the operators wrote, and nothing else.
+    pub graph: bool,
 }
 
 /// Parse a `.rusd` document. Returns all error diagnostics on failure.
@@ -159,6 +164,7 @@ pub fn parse(text: &str) -> Result<ParsedDocument, Vec<Diagnostic>> {
         prims,
         doc_dir: None,
         annotations,
+        graph: false,
     })
 }
 
@@ -166,6 +172,11 @@ pub fn parse(text: &str) -> Result<ParsedDocument, Vec<Diagnostic>> {
 /// in: that is what a relative `references`/`prototype` asset resolves against
 /// (v1.5.10). The directory is not touched, only joined against after the fact.
 pub fn parse_in(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Diagnostic>> {
+    // **An operator graph is a document too** (v1.9): the graph spelling is translated
+    // here, so one lowerer, one cook and one composition serve both spellings.
+    if crate::graph::looks_like_graph(text) {
+        return crate::graph::parse(text, doc_dir);
+    }
     let mut doc = parse(text)?;
     doc.doc_dir = doc_dir.map(str::to_owned);
     Ok(doc)
