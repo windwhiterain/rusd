@@ -444,28 +444,43 @@ pub fn tree_panel(ui: &mut egui::Ui, panel: &mut TreePanel) -> TreeAction {
     // **[v1.4] the whole body reads which rows are previews from the rows themselves.**
     // `row` returns a `TreeAction`, not a `TreeSelection`, so the click rule lives in
     // exactly one place: [`action_for`], over the flags `crate::tree::roots` set.
-    let mut action = TreeAction::None;
+    let mut action: Option<TreeAction> = None;
+    DRAWN.with(|c| c.set(0));
     let out = egui::ScrollArea::vertical()
         .id_salt("composition-tree")
         .auto_shrink([false, false])
         .show(ui, |ui| {
             for (root_index, root) in roots.iter().enumerate() {
-                if let TreeAction::None = &action
-                    && let Some(a) = row(
-                        ui,
-                        root,
-                        0,
-                        root_index,
-                        panel.selection.as_ref(),
-                        panel.preview.as_deref(),
-                    )
-                {
-                    action = a;
+                // **Every row is drawn, clicked or not** (the user: 只要我滑动过再点，就必然
+                // 跳回原处). This used to stop at the row whose click produced an action, so
+                // one frame held only the rows above it: the content shrank, egui clamped
+                // the scroll to the shorter content, and the list jumped. One click is one
+                // action — the first one — and the rest of the tree still draws.
+                if let Some(a) = row(
+                    ui,
+                    root,
+                    0,
+                    root_index,
+                    panel.selection.as_ref(),
+                    panel.preview.as_deref(),
+                ) {
+                    action.get_or_insert(a);
                 }
             }
         });
-    note_scroll("tree", &out.state, out.content_size.y);
-    action
+    note_scroll("tree", &out.state, out.content_size.y, DRAWN.with(|c| c.get()));
+    {
+        // Every change of the drawn row count, whether or not anything scrolled: a list
+        // that loses rows under the cursor jumps without any scroll call at all.
+        use std::sync::atomic::{AtomicI32, Ordering};
+        static ROWS: AtomicI32 = AtomicI32::new(i32::MIN);
+        let n = DRAWN.with(|c| c.get()) as i32;
+        let prev = ROWS.swap(n, Ordering::Relaxed);
+        if prev != i32::MIN && prev != n {
+            eprintln!("TREE-ROWS {prev} -> {n}");
+        }
+    }
+    action.unwrap_or(TreeAction::None)
 }
 
 /// The action a click **at `depth`** asks for: the same action, with the depth of the row
@@ -512,6 +527,7 @@ fn row(
     selected: Option<&TreeSelection>,
     preview: Option<&str>,
 ) -> Option<TreeAction> {
+    DRAWN.with(|c| c.set(c.get() + 1));
     // **One click, one lit row.** Rows share ids on purpose — a layer's own row, the leaf
     // under every arc that reaches it, and (v1.9) the arc class that points at it all name
     // the same layer — so a bare id comparison lit three of them for one click (the user's
@@ -688,6 +704,16 @@ fn row(
                     clicked = Some(a);
                 }
             }
+        } else {
+            // A branch that was shut — say which, and by what: a list that loses rows under
+            // the cursor jumps with no scroll call anywhere, and this is the only place in
+            // this panel that can hide rows it has.
+            eprintln!(
+                "ROW-CLOSED {}{} ({} children, depth {depth}, root {root})",
+                "  ".repeat(0),
+                node.label,
+                node.children.len()
+            );
         }
     }
     clicked
@@ -786,14 +812,21 @@ pub fn detail_panel(ui: &mut egui::Ui, panel: &TreePanel) {
                 ui.label(RichText::new(line).monospace());
             }
         });
-    note_scroll("detail", &out.state, out.content_size.y);
+    note_scroll("detail", &out.state, out.content_size.y, 0);
+}
+
+/// How many rows the last draw actually put on screen — a collapsed branch is drawn once,
+/// not with its children, so this is the number that says whether a jump was content
+/// disappearing or text re-flowing.
+thread_local! {
+    static DRAWN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Report a scroll offset that moved **by itself** — the class of bug behind 「我点东西的时候
 /// scroll 被跳来跳去」. `what` names the area, and the content height says which way it went:
 /// a changed offset with the same content is something code did; an unchanged offset with
 /// new content is the list being rebuilt under the reader.
-fn note_scroll(what: &'static str, state: &egui::scroll_area::State, content_h: f32) {
+fn note_scroll(what: &'static str, state: &egui::scroll_area::State, content_h: f32, rows: usize) {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<HashMap<&'static str, i32>>> = OnceLock::new();
@@ -805,7 +838,7 @@ fn note_scroll(what: &'static str, state: &egui::scroll_area::State, content_h: 
     if let Some(prev) = seen.insert(what, now)
         && prev != now
     {
-        eprintln!("SCROLL {what} {prev} -> {now} content_h={content_h:.0}");
+        eprintln!("SCROLL {what} {prev} -> {now} content_h={content_h:.0} rows={rows}");
     }
 }
 
