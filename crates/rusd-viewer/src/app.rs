@@ -470,6 +470,7 @@ fn orbit_json(o: Orbit) -> serde_json::Value {
 fn action_word(action: &crate::panel::TreeAction) -> &'static str {
     match action {
         crate::panel::TreeAction::Select(_) => "select",
+        crate::panel::TreeAction::Render(_) => "render",
         crate::panel::TreeAction::Layer { ask: Some(ask), .. } => ask.as_str(),
         crate::panel::TreeAction::Layer { ask: None, .. } => "layer-detail",
         crate::panel::TreeAction::PreviewSolo(_) => "preview-solo",
@@ -1188,6 +1189,25 @@ impl Shell {
     /// The preview goes through [`Shell::ask_preview`] / [`Shell::ask_solo`] like the
     /// 「final」 button does, so a refused id (`-32602`) is reported the same way rather
     /// than leaving the bar claiming a composition the viewport never showed.
+    /// A click on a row of the **hierarchy an operator declares** (v1.13): select that
+    /// prim and show *only* it. The path a row stands for is its id, so this is the same
+    /// two-state change 「只看选中」 makes — selection, then the filter that draws nothing
+    /// else — applied to one named path instead of to whatever the pointer picked.
+    fn on_tree_render(&mut self, selection: crate::tree::TreeSelection) {
+        let Some(path) = selection.prim.clone() else {
+            return;
+        };
+        self.model.selection = Some(path.clone());
+        self.status = self.model.status_line();
+        if !self.only_selected {
+            self.toggle_only_selected();
+        } else {
+            self.ask_render();
+            self.copy_toast(path);
+        }
+        self.window.request_redraw();
+    }
+
     fn on_tree_layer(
         &mut self,
         selection: crate::tree::TreeSelection,
@@ -1855,10 +1875,16 @@ impl Shell {
         if is_link {
             let action = crate::panel::action_for(&row);
             let word = action_word(&action).to_owned();
-            if let crate::panel::TreeAction::Select(sel) = action {
-                self.on_tree_select(sel);
+            match action {
+                // A row of the operator's declared hierarchy renders its path alone; it
+                // is not a file, so nothing is opened here.
+                crate::panel::TreeAction::Render(sel) => self.on_tree_render(sel),
+                crate::panel::TreeAction::Select(sel) => {
+                    self.on_tree_select(sel);
+                    self.show_layer_local(&row.id);
+                }
+                _ => self.show_layer_local(&row.id),
             }
-            self.show_layer_local(&row.id);
             self.request_repaint();
             return Some(Ok(json!({
                 "action": word,
@@ -1885,6 +1911,7 @@ impl Shell {
         self.waiting.push(Waiting::with(reply, shape, owed));
         match action {
             crate::panel::TreeAction::Select(sel) => self.on_tree_select(sel),
+            crate::panel::TreeAction::Render(sel) => self.on_tree_render(sel),
             crate::panel::TreeAction::Layer { selection, ask } => {
                 self.on_tree_layer(selection, ask)
             }
@@ -2325,6 +2352,7 @@ impl Shell {
                         });
                     match crate::panel::tree_panel(ui, &mut self.tree) {
                         crate::panel::TreeAction::Select(sel) => self.on_tree_select(sel),
+                        crate::panel::TreeAction::Render(sel) => self.on_tree_render(sel),
                         crate::panel::TreeAction::Layer { selection, ask } => {
                             self.on_tree_layer(selection, ask)
                         }

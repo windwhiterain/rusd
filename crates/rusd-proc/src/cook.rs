@@ -74,6 +74,9 @@ pub struct CookOp {
     /// metadata: the tree carries it on the op row, and it is never authored into
     /// the layer.
     pub description: Option<String>,
+    /// **The named prim paths this node's output authors** (v1.13), from
+    /// [`CookNode::writes`]: the output half of the hierarchy the operator declares.
+    pub writes: Vec<String>,
 }
 
 /// Result of a cook pass: counters plus diagnostics (warnings/errors).
@@ -374,6 +377,7 @@ impl CookEngine {
                         _ => None,
                     }),
                     inputs: node.inputs.clone(),
+                    writes: node.writes.clone(),
                     layer_id: entry.layer_id.clone(),
                     layer_path: entry.layer_path.to_string_lossy().into_owned(),
                     description: node.description.clone(),

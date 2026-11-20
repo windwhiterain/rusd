@@ -91,6 +91,9 @@ impl LayerAsk {
 pub enum TreeAction {
     /// Nothing this pass.
     None,
+    /// **A named path of the hierarchy an operator declares** (v1.13): select that prim
+    /// and show *only* it — the click renders that path alone.
+    Render(TreeSelection),
     /// A row was clicked: select it, ask its detail, and (when it stands for a
     /// prim) also select that prim and copy its path.
     Select(TreeSelection),
@@ -261,6 +264,12 @@ impl TreePanel {
 /// ask for the composition [`ask_for`] names. Every other row is a plain selection.
 pub fn action_for(node: &TreeNode) -> TreeAction {
     let selection = TreeSelection::of(node);
+    // **A row of the operator's declared hierarchy renders its path alone** (v1.13):
+    // `secondary = render` is the row's own word for it, set where the row is built, so
+    // the panel needs no list of which rows those are.
+    if node.secondary.as_deref() == Some("render") && node.prim.is_some() {
+        return TreeAction::Render(selection);
+    }
     match node.kind {
         TreeNodeKind::Layer => TreeAction::Layer {
             selection,

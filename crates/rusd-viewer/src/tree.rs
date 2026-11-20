@@ -88,6 +88,9 @@ pub struct LayerNode {    /// The layer identifier, which is also this node's id
     /// names — `points`, `prototype`, `domain`, or however many an operator has. Each
     /// names the USD it points at: a layer (`box.rusd`) or a prim of this stack.
     pub inputs: Vec<DeclaredInput>,
+    /// **The named prim paths the operator's output authors** (v1.13): `outputs` in the
+    /// document, as USD paths. Half of the hierarchy an operator declares.
+    pub outputs: Vec<String>,
     /// The op's **output layer** identifier, as the server joined it to this entry
     /// (`CookOp.layer_id == layers[].id`, v1.5.1).
     ///
@@ -330,6 +333,16 @@ impl CompositionTree {
                                     asset: optional_string(i, "asset"),
                                     prim: optional_string(i, "prim"),
                                 })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    outputs: l
+                        .get("outputs")
+                        .and_then(Value::as_array)
+                        .map(|a| {
+                            a.iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_owned)
                                 .collect()
                         })
                         .unwrap_or_default(),
@@ -633,6 +646,53 @@ pub fn roots(tree: &CompositionTree) -> Vec<TreeNode> {
         .collect()
 }
 
+/// The named hierarchy a layer declares, as nested rows.
+///
+/// `/World/Samples/points` and `/World/Boxes` become `World → Samples → points` and
+/// `World → Boxes`: the components are the rows, a shared prefix is one branch, and the
+/// path a row stands for is its id (`prim:<path>`). Every row is marked `render`, which
+/// is what makes a click on it show **that path alone**.
+fn hierarchy_rows(paths: &[String]) -> Vec<TreeNode> {
+    use std::collections::BTreeSet;
+    let mut nodes: BTreeSet<String> = BTreeSet::new();
+    for path in paths {
+        let mut acc = String::new();
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            acc.push('/');
+            acc.push_str(part);
+            nodes.insert(acc.clone());
+        }
+    }
+    fn children_of<'a>(nodes: &'a BTreeSet<String>, prefix: &str) -> Vec<&'a String> {
+        nodes
+            .iter()
+            .filter(|n| n.rsplit_once('/').map(|(p, _)| p == prefix).unwrap_or(false))
+            .collect()
+    }
+    fn make(nodes: &BTreeSet<String>, path: &str) -> TreeNode {
+        TreeNode {
+            id: format!("prim:{path}"),
+            kind: TreeNodeKind::Prim,
+            label: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            prim: Some(path.to_owned()),
+            op: false,
+            root: false,
+            session: false,
+            // The one word that says what a click means for this row.
+            secondary: Some("render".to_owned()),
+            hover: Some(format!("{path} · 点击只渲染这个命名路径")),
+            children: children_of(nodes, path)
+                .into_iter()
+                .map(|child| make(nodes, child))
+                .collect(),
+        }
+    }
+    children_of(&nodes, "")
+        .into_iter()
+        .map(|root| make(&nodes, root))
+        .collect()
+}
+
 /// One layer's branch: its arcs and the prims it authors.
 fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     let mut children: Vec<TreeNode> = Vec::new();
@@ -741,42 +801,38 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
         });
     }
 
-    // **Every input, expressed as the USD named structure it points at** (v1.12, the
-    // user's ruling): an operator has one USD **reference** input and one USD output, and
-    // its other inputs resolve to named structures inside the USD tree — so a slot is
-    // drawn as that structure (`reference \u{2192} box.rusd:/World/Prototypes/Box` or
-    // `\u{2192} /World/Samples/points`), never as the document's own bookkeeping name.
-    // The slot name lives in the hover, where "which input was this" is answered.
+    // **The hierarchy the operator declares** (v1.13, the user's ruling): its inputs and
+    // outputs are USD named structures, drawn as the paths they are — `World / Samples /
+    // points` — and a click renders that path alone. The one external USD is a
+    // `reference → <file>:<prim>` row; everything else is a branch of this hierarchy.
     for input in &layer.inputs {
-        let (id, prim, label) = match (&input.asset, &input.prim) {
-            (Some(asset), Some(prim)) => (
-                asset.clone(),
-                None,
-                format!(
+        if let (Some(asset), Some(prim)) = (&input.asset, &input.prim) {
+            children.push(TreeNode {
+                id: asset.clone(),
+                kind: TreeNodeKind::Arc,
+                label: format!(
                     "reference \u{2192} {}:{prim}",
                     strip_anon_prefix(asset).rsplit(['/', '\\']).next().unwrap_or(asset)
                 ),
-            ),
-            (None, Some(prim)) => (
-                format!("prim:{prim}"),
-                Some(prim.clone()),
-                format!("\u{2192} {prim}"),
-            ),
-            _ => continue,
-        };
-        children.push(TreeNode {
-            id,
-            kind: TreeNodeKind::Arc,
-            label,
-            prim,
-            op: false,
-            root: false,
-            session: false,
-            secondary: None,
-            hover: Some(format!("文档声明的输入 {} = {}", input.slot, input.value)),
-            children: Vec::new(),
-        });
+                prim: None,
+                op: false,
+                root: false,
+                session: false,
+                secondary: None,
+                hover: Some(format!("文档声明的输入 {} = {}", input.slot, input.value)),
+                children: Vec::new(),
+            });
+        }
     }
+    let mut named: Vec<String> = layer.outputs.clone();
+    named.extend(
+        layer
+            .inputs
+            .iter()
+            .filter(|i| i.asset.is_none())
+            .filter_map(|i| i.prim.clone()),
+    );
+    children.extend(hierarchy_rows(&named));
 
     // **No prim rows.** v1.3 (user ruling, `docs/PROTOCOL.md`): a city stack has
     // hundreds of prims and listing them ``既撑爆面板宽度又没人读`` — the tree is

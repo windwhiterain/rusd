@@ -152,6 +152,9 @@ struct LayerEntry {
     /// entry names the USD it points at: an **asset** (`box.rusd:/World/Prototypes/Box`)
     /// or a prim of this stack (`/World/Samples/points`).
     inputs: Vec<DeclaredInput>,
+    /// **The named prim paths this node's output authors** (v1.13): the other half of the
+    /// hierarchy an operator declares — its `outputs` in the document, as USD paths.
+    outputs: Vec<String>,
     /// What this layer **is**, in words (PROTOCOL v1.5.9). Two sources, one field:
     /// an `op` layer takes its generator node's own `description = "..."`, and any
     /// other layer takes a document **layer annotation**
@@ -394,6 +397,7 @@ impl CompositionTree {
                     node: joined.map(|o| o.id.clone()),
                     op_input: joined.and_then(|o| o.input.clone()),
                     inputs: joined.map(declared_inputs).unwrap_or_default(),
+                    outputs: joined.map(|o| o.writes.clone()).unwrap_or_default(),
                     description,
                 }
             })
@@ -428,6 +432,7 @@ impl CompositionTree {
                 node: None,
                 op_input: Some(input),
                 inputs: Vec::new(),
+                outputs: Vec::new(),
                 // No description: the row reads `<file> [reference · n]`, the same shape
                 // every other material row has. What the operator said about it is the
                 // file's detail (`comp_node`), not its row.
@@ -519,6 +524,7 @@ impl CompositionTree {
                             "prim": i.prim,
                         }))
                         .collect::<Vec<_>>());
+                    row["outputs"] = json!(l.outputs);
                     row["output"] = json!(l.id);
                     row["node"] = json!(l.node);
                 }
