@@ -962,11 +962,15 @@ impl Viewport {
         }
 
         // --- write the records that differ ---------------------------------------
-        // Dead records waste the table, so half of it being dead is a compaction — and a
-        // compaction renumbers records, which is the one thing that makes the next write
-        // the whole table. A delta sync never does it.
+        // Dead records waste the table, so a full rewrite is the moment to drop them (it
+        // costs nothing extra, and it leaves the table exactly the live prims), and half of
+        // it being dead is a compaction on its own. A compaction renumbers records, which
+        // is the one thing that makes the next write the whole table — and a delta sync
+        // never does either.
         let dead = self.insts.iter().filter(|slot| !slot.alive).count();
-        let compacted = only.is_none() && dead > 0 && dead * 2 > self.insts.len() && self.compact_insts();
+        let compacted = dead > 0
+            && (regrown || (only.is_none() && dead * 2 > self.insts.len()))
+            && self.compact_insts();
         if regrown || compacted {
             self.write_all_insts();
         } else {
