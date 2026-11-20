@@ -798,7 +798,12 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
             children.push(TreeNode {
                 id,
                 kind: TreeNodeKind::Arc,
-                label: input.slot.clone(),
+                // The name, then the hierarchy it stands for — spelled exactly as the
+                // document spells it: `points → /World/Samples/points`,
+                // `prototype → box.rusd:/World/Prototypes/Box`. The operator's schema *is*
+                // these hierarchies; the name is what the document calls each one.
+                label: format!("{} \u{2192} {}", input.slot, input.value),
+
                 prim: prim.clone(),
                 op: false,
                 root: false,
@@ -1952,6 +1957,7 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
 
 
