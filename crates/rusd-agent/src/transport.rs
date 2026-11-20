@@ -963,7 +963,13 @@ impl Session {
     /// `comp_node` for a node the client just read must see the same tree, and
     /// the build walks every layer, so it is not something to repeat per node.
     fn composition_tree(&mut self, _p: &Value) -> Result<Value, (i64, String)> {
-        let Some(stage) = self.stage.clone() else {
+        // **The tree is the document's, not the picture's** (the user: 只要我滑动过再点，就必然
+        // 跳回原处). A `preview{solo}` swaps the composed stage for one layer's own, and a
+        // tree built from *that* picture loses every row the document has — the list
+        // shrinks under the cursor and the scroll clamps back to where the content ends.
+        // The document's own stack does not move when a preview does, so the rows do not
+        // either: the tree answers 「文档里有什么」, and the viewport answers 「现在看哪个」.
+        let Some(stage) = self.doc_stage.clone().or_else(|| self.stage.clone()) else {
             return Err(server_error("no scene open; call open first".into()));
         };
         let descriptions = self.descriptions();
