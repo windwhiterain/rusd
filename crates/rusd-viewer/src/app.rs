@@ -282,6 +282,9 @@ pub struct Shell {
     /// The local translation the dragged prim is currently drawn at, so an
     /// unchanged drag re-bakes nothing.
     preview: Option<[f64; 3]>,
+    /// A named path to show alone once the layer that authors it has finished opening
+    /// (v1.13): set by a hierarchy row's click, applied by `poll_local_open`.
+    pending_render: Option<String>,
 
     status: String,
     fps: f64,
@@ -611,6 +614,7 @@ impl Shell {
             throttle: protocol::Throttle::hz(GIZMO_HZ),
             sent: None,
             preview: None,
+            pending_render: None,
             status: format!("connecting to {}", args.connect),
             fps: 0.0,
             last_frame_at: Instant::now(),
@@ -1189,14 +1193,32 @@ impl Shell {
     /// The preview goes through [`Shell::ask_preview`] / [`Shell::ask_solo`] like the
     /// 「final」 button does, so a refused id (`-32602`) is reported the same way rather
     /// than leaving the bar claiming a composition the viewport never showed.
-    /// A click on a row of the **hierarchy an operator declares** (v1.13): select that
-    /// prim and show *only* it. The path a row stands for is its id, so this is the same
-    /// two-state change 「只看选中」 makes — selection, then the filter that draws nothing
-    /// else — applied to one named path instead of to whatever the pointer picked.
+    /// A click on a row of the **hierarchy an operator declares** (v1.13): show *only*
+    /// that named path.
+    ///
+    /// The path is first resolved to the layer that **authored** it. A consumer hides what
+    /// it reads with a `visibility` opinion in its **own** layer — the input itself is not
+    /// replaced (v1.5.1) — so drawing an input path from the consumer's stack would draw
+    /// nothing. Composing its author's layer and then filtering to the path is what shows
+    /// the structure the document declared.
     fn on_tree_render(&mut self, selection: crate::tree::TreeSelection) {
         let Some(path) = selection.prim.clone() else {
             return;
         };
+        let shown = self.model.preview.clone();
+        match self.tree.model.owner_of(&path) {
+            Some(owner) if Some(owner.clone()) != shown => {
+                self.pending_render = Some(path);
+                self.show_layer_local(&owner);
+                self.window.request_redraw();
+            }
+            _ => self.render_alone(path),
+        }
+    }
+
+    /// Select `path` and turn 「只看选中」 on: the same two-state change the filter makes,
+    /// applied to one named path instead of to whatever the pointer picked.
+    fn render_alone(&mut self, path: String) {
         self.model.selection = Some(path.clone());
         self.status = self.model.status_line();
         if !self.only_selected {
@@ -1314,7 +1336,11 @@ impl Shell {
                 self.adopt_scene(made);
                 self.model.preview = Some(id);
                 self.status = "本地打开完成".to_owned();
-                self.opening = None;
+                // A hierarchy row asked to show one path: now that its author's layer is
+                // the one composed, filter to that path.
+                if let Some(path) = self.pending_render.take() {
+                    self.render_alone(path);
+                }                self.opening = None;
                 self.request_repaint();
             }
             Ok(Err(message)) => {

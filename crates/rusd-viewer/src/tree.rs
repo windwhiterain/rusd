@@ -490,6 +490,23 @@ impl CompositionTree {
             .map(|p| p.id.as_str())
     }
 
+    /// The layer that **authors** `path`: an op layer whose declared output is that path
+    /// or one of its ancestors.
+    ///
+    /// A consumer's `visibility` over a path is authored in the **consumer's** layer — the
+    /// input itself is not replaced (v1.5.1) — so showing a named path alone means
+    /// composing the layer that wrote it, not the one that hides it.
+    pub fn layer_owner(&self, path: &str) -> Option<String> {
+        self.layers
+            .iter()
+            .find(|l| {
+                l.outputs
+                    .iter()
+                    .any(|o| path == o || path.starts_with(&format!("{o}/")))
+            })
+            .map(|l| l.id.clone())
+    }
+
     /// The layer `id` names, when it is one of this tree's.
     pub fn layer(&self, id: &str) -> Option<&LayerNode> {
         self.layers.iter().find(|l| l.id == id)
@@ -1731,6 +1748,10 @@ impl TreeModel {
         self.tree()?.prim_id(path)
     }
 
+    /// The layer that authors `path`, when the tree knows one.
+    pub fn owner_of(&self, path: &str) -> Option<String> {
+        self.tree()?.layer_owner(path)
+    }
     /// The roots to draw: empty unless a tree is ready.
     pub fn roots(&self) -> Vec<TreeNode> {
         match self {
