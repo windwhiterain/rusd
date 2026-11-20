@@ -785,33 +785,14 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
     // hierarchy the operator *declares* has exactly the number of entries its document's
     // inputs table has.
     if !layer.inputs.is_empty() {
-        // **The operator's schema is the set of its inputs** (v1.13): `{points, prototype}`
-        // for an `instances` op, `{domain}` for a sampler. That set is what the tree shows,
-        // one row per name; the USD structure a name stands for is the row's tooltip and its
-        // `comp_node`, not a row of its own.
-        for input in &layer.inputs {
-            let (id, prim) = match (&input.asset, &input.prim) {
-                (Some(asset), _) => (asset.clone(), None),
-                (None, Some(prim)) => (format!("prim:{prim}"), Some(prim.clone())),
-                _ => continue,
-            };
-            children.push(TreeNode {
-                id,
-                kind: TreeNodeKind::Arc,
-                // The name, then the hierarchy it stands for — spelled exactly as the
-                // document spells it: `points → /World/Samples/points`,
-                // `prototype → box.rusd:/World/Prototypes/Box`. The operator's schema *is*
-                // these hierarchies; the name is what the document calls each one.
-                label: format!("{} \u{2192} {}", input.slot, input.value),
-
-                prim: prim.clone(),
-                op: false,
-                root: false,
-                session: false,
-                secondary: Some(if prim.is_some() { "render" } else { "open" }.to_owned()),
-                hover: Some(input.value.clone()),
-                children: Vec::new(),
-            });
+        // **An operator has one USD input, and that USD's hierarchy is its schema**
+        // (v1.13, the user's ruling). A same-stack prim the op also reads — the point
+        // cloud it instances, another operator's output — is not a second input: it lives
+        // in the same USD, so it is not part of the schema.
+        for input in layer.inputs.iter().filter(|i| i.asset.is_some()) {
+            if let Some(root) = structure_rows(&input.structure, &input.slot) {
+                children.push(root);
+            }
         }
 
         return TreeNode {
@@ -1957,6 +1938,7 @@ pub fn arc_ends(tree: &CompositionTree) -> BTreeMap<String, (String, String)> {
         })
         .collect()
 }
+
 
 
 
