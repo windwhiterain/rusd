@@ -843,7 +843,9 @@ fn layer_subtree(tree: &CompositionTree, layer: &LayerNode) -> TreeNode {
                 op: false,
                 root: false,
                 session: false,
-                secondary: None,
+                // Open on arrival, like the hierarchy under it: the branch is the input,
+                // and a collapsed one says nothing about what the operator reads.
+                secondary: Some("open".to_owned()),
                 hover: Some(input.value.clone()),
                 children: hierarchy_rows(&[prim.clone()]),
             }),

@@ -613,9 +613,10 @@ fn row(
         let id = ui.make_persistent_id((&node.id, root, depth));
         let mut open = ui.data(|d| {
             d.get_temp::<bool>(id.with("open")).unwrap_or(
-                // A hierarchy row (v1.13) is open by default: `World / Samples / points` is
-                // the structure the operator declares, and a collapsed `World` says nothing.
-                depth == 0 || node.secondary.as_deref() == Some("render"),
+                // A branch of a declared hierarchy (v1.13) is open by default — the
+                // `reference → file` root as much as the paths under it — because a
+                // collapsed one is a row that says nothing about what it holds.
+                depth == 0 || node.secondary.is_some(),
             )
         });
         ui.horizontal(|ui| {
