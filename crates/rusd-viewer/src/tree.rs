@@ -748,9 +748,10 @@ fn structure_rows(structure: &[(String, Option<String>)]) -> Option<TreeNode> {
             .and_then(|(_, s)| s.clone())
             .filter(|s| !s.is_empty());
         let leaf = path.rsplit('/').next().unwrap_or(path);
-        // **The row is the schema that level composes to** — `Xform`, `Cube`, `Points` —
-        // because the hierarchy *is* the schema: a prim path is only where it is.
-        let label = schema.clone().unwrap_or_else(|| leaf.to_owned());
+        // **The row is the USD path of that level**, spelled whole: `/World`,
+        // `/World/Samples`, `/World/Samples/points`. A path is how a prim is addressed, and
+        // the schema that level composes to is the row's tooltip.
+        let label = path.to_owned();
         let children = structure
             .iter()
             .filter(|(p, _)| p.rsplit_once('/').map(|(parent, _)| parent == path).unwrap_or(false))
@@ -765,10 +766,12 @@ fn structure_rows(structure: &[(String, Option<String>)]) -> Option<TreeNode> {
             root: false,
             session: false,
             secondary: Some("render".to_owned()),
-            hover: Some(path.to_owned()),
+            hover: Some(match schema.as_deref().filter(|s| !s.is_empty()) {
+                Some(schema) => format!("{path} : {schema}"),
+                None => format!("{path} : {leaf} (no typeName)"),
+            }),
             children,
-        }
-    }
+        }    }
     let root = structure.first()?.0.clone();
     Some(make(structure, &root))
 }
