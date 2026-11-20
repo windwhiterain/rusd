@@ -747,15 +747,10 @@ fn structure_rows(structure: &[(String, Option<String>)], branch: &str) -> Optio
             .and_then(|(_, s)| s.clone())
             .filter(|s| !s.is_empty());
         let leaf = path.rsplit('/').next().unwrap_or(path);
-        // **The row is the USD path of that level, and the schema it composes to**:
-        // `/World/Volume : Cube`, `/World/Samples/points : Points`. The path is how a prim is
-        // addressed; the schema is what the hierarchy *is* — one row carries both, so
-        // neither is left to a tooltip.
-        let label = match schema.as_deref().filter(|s| !s.is_empty()) {
-            Some(schema) => format!("{path} : {schema}"),
-            None => path.to_owned(),
-        };
-        let children = structure
+        // **The row is the hierarchy itself** (v1.13, the user's ruling: hierarchy *is*
+        // the schema). Nothing is appended to it — no document slot name and no typeName:
+        // the path is how USD names the structure the operator reads.
+        let label = path.to_owned();        let children = structure
             .iter()
             .filter(|(p, _)| p.rsplit_once('/').map(|(parent, _)| parent == path).unwrap_or(false))
             .map(|(child, _)| make(structure, branch, child))
