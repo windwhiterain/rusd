@@ -125,29 +125,6 @@ fn declared_inputs(op: &CookOp, stage: &Stage) -> Vec<DeclaredInput> {
     out
 }
 
-/// **The named structures an operator's output authors** (v1.13): the prim it computed
-/// plus the schema entries the product carries under it — `{points, prototype}` for an
-/// `instances` node, `{domain, points}` for a sampler. That set *is* the operator's
-/// schema, and the output USD contains exactly it, so the tree can draw the same
-/// hierarchy on the output side that it draws on the input side.
-fn authored_structures(op: &CookOp) -> Vec<String> {
-    let mut out = op.writes.clone();
-    let mut add = |path: String| {
-        if !out.contains(&path) {
-            out.push(path);
-        }
-    };
-    // The cloud is the first entry the schema names for an `instances` node, the same
-    // order the input side reads it in.
-    if matches!(op.generator.as_str(), "RusdInstances" | "RusdScatter") {
-        add(format!("{}/points", op.id));
-    }
-    for (slot, _) in &op.inputs {
-        add(format!("{}/{slot}", op.id));
-    }
-    out
-}
-
 /// The document's own `input` string for this operator: `"/World/Boxes"`,
 /// `"volume.rusd:/World/Volume"`. The declaration is the cook's `inputs`, whose slot the
 /// graph spells `input`; a document that names its slots otherwise is read by the one entry
@@ -644,7 +621,7 @@ impl CompositionTree {
                 node: Some(op.id.clone()),
                 op_input: op.input.clone(),
                 inputs: declared_inputs(op, stage),
-                outputs: authored_structures(op),
+                outputs: op.writes.clone(),
                 file: op.output_file.clone(),
                 description: op.description.clone(),
             });
