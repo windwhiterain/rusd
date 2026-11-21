@@ -191,12 +191,33 @@ pub fn parse(text: &str, doc_dir: Option<&str>) -> Result<ParsedDocument, Vec<Di
         // parameter each one fills.
         if let Some(Item::Table(wires)) = t.get("inputs") {
             for (slot, item) in wires.iter() {
-                let Some(value) = item.as_str() else { continue };
+                // A slot names one prim (a string) or a list of them (an array of
+                // strings) — list input, in the order the document names them.
+                let values: Vec<String> = if let Some(s) = item.as_str() {
+                    vec![s.to_owned()]
+                } else if let Some(arr) = item.as_array() {
+                    arr.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect()
+                } else {
+                    continue;
+                };
+                if values.is_empty() {
+                    continue;
+                }
                 match slot_parameter(kind, slot) {
                     Some(parameter) => {
-                        props.insert(parameter.to_owned(), Value::String(value.to_owned()));
-                        if !declared.iter().any(|(s, _)| s == slot) {
-                            declared.push((slot.to_owned(), value.to_owned()));
+                        if values.len() == 1 {
+                            props.insert(parameter.to_owned(), Value::String(values[0].clone()));
+                            if !declared.iter().any(|(s, _)| s == slot) {
+                                declared.push((slot.to_owned(), values[0].clone()));
+                            }
+                        } else {
+                            props.insert(
+                                parameter.to_owned(),
+                                Value::Array(values.iter().cloned().map(Value::String).collect()),
+                            );
+                            for v in &values {
+                                declared.push((slot.to_owned(), v.clone()));
+                            }
                         }
                     }
                     None => diags.push(Diagnostic::warning(

@@ -49,19 +49,60 @@ pub fn points_path(anchor: &str) -> String {
 
 /// The `input_points` parameter both ops share, which is required by both (v1.5.1:
 /// neither has a meaningful default — a sample op with no surface has nothing to
-/// sample, and an instances op with no cloud has nothing to instantiate).
-fn require_input(ctx: &GenContext, generator: &str, base: &str) -> Result<String, Vec<Diagnostic>> {
-    ctx.param_path("input_points")
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            vec![
-                Diagnostic::error(
-                    "E_INPUT_GEOMETRY",
-                    format!("{generator} needs `input_points` (the prim whose geometry it reads)"),
-                )
-                .at_prim(base),
-            ]
-        })
+/// sample, and an instances op with no cloud has nothing to instantiate). It names
+/// **one prim or a list of them** (list input); the result is never empty.
+fn require_inputs(ctx: &GenContext, generator: &str, base: &str) -> Result<Vec<String>, Vec<Diagnostic>> {
+    let inputs = ctx.param_paths("input_points");
+    if inputs.is_empty() {
+        Err(vec![
+            Diagnostic::error(
+                "E_INPUT_GEOMETRY",
+                format!("{generator} needs `input_points` (the prim whose geometry it reads)"),
+            )
+            .at_prim(base),
+        ])
+    } else {
+        Ok(inputs)
+    }
+}
+
+/// Split `count` samples across domains in proportion to their measure (a cube's
+/// volume, a mesh's surface area), by largest remainder so the shares sum to exactly
+/// `count`. One domain takes all of `count` — the single-input case, unchanged — and
+/// a zero total measure falls back to an even split.
+fn apportion(count: usize, measures: &[f64]) -> Vec<usize> {
+    let n = measures.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let total: f64 = measures.iter().sum();
+    if total <= 0.0 {
+        let base = count / n;
+        let mut rem = count % n;
+        return (0..n)
+            .map(|_| {
+                let extra = if rem > 0 { rem -= 1; 1 } else { 0 };
+                base + extra
+            })
+            .collect();
+    }
+    let raw: Vec<f64> = measures.iter().map(|m| count as f64 * m / total).collect();
+    let mut shares: Vec<usize> = raw.iter().map(|r| r.floor() as usize).collect();
+    let mut assigned: usize = shares.iter().sum();
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| {
+        let ra = raw[a] - raw[a].floor();
+        let rb = raw[b] - raw[b].floor();
+        rb.partial_cmp(&ra).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    for i in order {
+        if assigned >= count {
+            break;
+        }
+        shares[i] += 1;
+        assigned += 1;
+    }
+    shares
 }
 
 /// `inverse(anchor world)`: what a world point is undone by before it is authored as
@@ -143,44 +184,71 @@ impl Generator for RusdSamplePoints {
 
     fn eval(&self, ctx: &mut GenContext) -> Result<sdf::Layer, Vec<Diagnostic>> {
         let base = ctx.path.as_str().to_owned();
-        let input = require_input(ctx, "RusdSamplePoints", &base)?;
+        let inputs = require_inputs(ctx, "RusdSamplePoints", &base)?;
         // **The slot's contract, then the geometry's.** The operator declares `domain`
-        // as a `Gprim` — the class that covers a `Cube` and a `Mesh` — and the wire is
+        // as a `Gprim` — the class that covers a `Cube` and a `Mesh` — and each wire is
         // checked against it here. Which of them it can actually draw from is settled by
         // the read below: a `Points` is a `Gprim` too, and has neither a volume nor a
         // surface, so it passes this check and fails `E_INPUT_GEOMETRY`.
-        ctx.expect_slot(&input, "RusdSamplePoints", "domain", &base);
+        for input in &inputs {
+            ctx.expect_slot(input, "RusdSamplePoints", "domain", &base);
+        }
         let count = ctx.param_u64("count", 100) as usize;
         let mut rng = Rng::seeded(ctx.stage_seed, &base, ctx.seed);
-        let local: Vec<[f64; 3]> = if let Some(volume) = ctx.read_volume(&input) {
-            // v1.5.8: a `Cube` is a **volume**: `count` points uniform inside the
-            // box, each in the box's own world frame, then into the anchor's local
-            // space like every other placement this pipeline makes.
-            let inv = inverse_anchor(ctx, &base)?;
-            (0..count)
-                .map(|_| {
-                    let u = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
-                    to_local(inv, volume.sample(u))
-                })
-                .collect()
-        } else if let Some(tris) = ctx.read_triangles(&input).filter(|t| !t.is_empty()) {
-            let sampled = surface_samples(&tris, count, &mut rng);
-            let inv = inverse_anchor(ctx, &base)?;
-            sampled.iter().map(|w| to_local(inv, *w)).collect()
-        } else {
-            return Err(vec![
-                Diagnostic::error(
-                    "E_INPUT_GEOMETRY",
-                    format!(
-                        "input_points {input} is neither a box volume nor a readable mesh \
-                         surface; RusdSamplePoints samples a Cube's volume or a Mesh's \
-                         triangles, and does not fall back to bare vertices"
-                    ),
-                )
-                .at_prim(&base)
-                .at_property("input_points"),
-            ]);
-        };
+        let inv = inverse_anchor(ctx, &base)?;
+        // Each domain is a volume (a `Cube`) or a surface (a `Mesh`); its measure is
+        // what weights how many of the `count` samples it receives. A list of domains
+        // is one combined region, sampled `count` times in total.
+        enum Domain {
+            Volume(rusd_scene::geometry::WorldBox),
+            Surface(Vec<rusd_scene::geometry::Triangle>),
+        }
+        let mut domains: Vec<(f64, Domain)> = Vec::new();
+        for input in &inputs {
+            if let Some(volume) = ctx.read_volume(input) {
+                let measure = (volume.max[0] - volume.min[0])
+                    * (volume.max[1] - volume.min[1])
+                    * (volume.max[2] - volume.min[2]);
+                domains.push((measure.max(0.0), Domain::Volume(volume)));
+            } else if let Some(tris) = ctx.read_triangles(input).filter(|t| !t.is_empty()) {
+                let measure: f64 =
+                    tris.iter().map(|t| rusd_scene::geometry::triangle_area(*t)).sum();
+                domains.push((measure, Domain::Surface(tris)));
+            } else {
+                return Err(vec![
+                    Diagnostic::error(
+                        "E_INPUT_GEOMETRY",
+                        format!(
+                            "input_points {input} is neither a box volume nor a readable mesh \
+                             surface; RusdSamplePoints samples a Cube's volume or a Mesh's \
+                             triangles, and does not fall back to bare vertices"
+                        ),
+                    )
+                    .at_prim(&base)
+                    .at_property("input_points"),
+                ]);
+            }
+        }
+        let measures: Vec<f64> = domains.iter().map(|(m, _)| *m).collect();
+        let shares = apportion(count, &measures);
+        let mut local: Vec<[f64; 3]> = Vec::new();
+        for ((_, domain), share) in domains.iter().zip(shares) {
+            match domain {
+                // v1.5.8: a `Cube` is a **volume**: points uniform inside the box, each
+                // in the box's own world frame, then into the anchor's local space like
+                // every other placement this pipeline makes.
+                Domain::Volume(volume) => {
+                    for _ in 0..share {
+                        let u = [rng.next_f64(), rng.next_f64(), rng.next_f64()];
+                        local.push(to_local(inv, volume.sample(u)));
+                    }
+                }
+                Domain::Surface(tris) => {
+                    let sampled = surface_samples(tris, share, &mut rng);
+                    local.extend(sampled.iter().map(|w| to_local(inv, *w)));
+                }
+            }
+        }
         let cloud = points_path(&base);
 
         let mut layer = sdf::Layer::new_anonymous("rusd_sample_points.usda");
@@ -221,10 +289,12 @@ impl Generator for RusdInstances {
 
     fn eval(&self, ctx: &mut GenContext) -> Result<sdf::Layer, Vec<Diagnostic>> {
         let base = ctx.path.as_str().to_owned();
-        let input = require_input(ctx, "RusdInstances", &base)?;
+        let inputs = require_inputs(ctx, "RusdInstances", &base)?;
         // …and an `instances` node's `points` is a point cloud; anything else is a
         // mismatch between the operator's schema and the wire.
-        ctx.expect_slot(&input, "RusdInstances", "points", &base);
+        for input in &inputs {
+            ctx.expect_slot(input, "RusdInstances", "points", &base);
+        }
         let prototype = ctx
             .param_str("prototype")
             .map(str::to_owned)
@@ -253,30 +323,35 @@ impl Generator for RusdInstances {
         // breaks the operator's contract is reported even when the geometry would have
         // failed first, so one cook names every mismatch it can see instead of only the
         // one it tripped over.
-        let cloud = match ctx.read_points(&input) {
-            Some(pts) if !pts.is_empty() => pts,
-            Some(_) => {
-                return Err(vec![
-                    Diagnostic::error(
-                        "E_INPUT_GEOMETRY",
-                        format!("input_points {input} authors an empty `points` array"),
-                    )
-                    .at_prim(&base),
-                ]);
-            }
-            None => {
-                return Err(vec![
-                    Diagnostic::error(
-                        "E_INPUT_GEOMETRY",
-                        format!(
-                            "input_points {input} authors no `points` cloud; RusdInstances \
+        // One cloud, or a list of them: concatenate every input's points in the order
+        // the document names them, and instance one per point across the whole run.
+        let mut cloud: Vec<[f64; 3]> = Vec::new();
+        for input in &inputs {
+            match ctx.read_points(input) {
+                Some(pts) if !pts.is_empty() => cloud.extend(pts),
+                Some(_) => {
+                    return Err(vec![
+                        Diagnostic::error(
+                            "E_INPUT_GEOMETRY",
+                            format!("input_points {input} authors an empty `points` array"),
+                        )
+                        .at_prim(&base),
+                    ]);
+                }
+                None => {
+                    return Err(vec![
+                        Diagnostic::error(
+                            "E_INPUT_GEOMETRY",
+                            format!(
+                                "input_points {input} authors no `points` cloud; RusdInstances \
                              instantiates one per point and reads no surface"
-                        ),
-                    )
-                    .at_prim(&base),
-                ]);
+                            ),
+                        )
+                        .at_prim(&base),
+                    ]);
+                }
             }
-        };
+        }
         let proto_path = proto.path.clone();
         // **The asset as the document wrote it** (v1.9): `box.rusd` stays `box.rusd` in the
         // product, so the arc resolves from wherever the product is read. Resolution to an

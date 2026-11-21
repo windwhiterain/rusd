@@ -361,3 +361,125 @@ fn a_prototype_of_the_wrong_schema_is_reported() {
         "a prototype that is not an Xformable is E_SCHEMA: {seen:?}"
     );
 }
+
+/// **A list of domains is one combined region** (list input): `count` is the total
+/// number of samples across every domain, split by their measure — not `count` per
+/// domain. Two cubes of different sizes still yield exactly `count` points, and the
+/// instances node downstream copies one per point.
+#[test]
+fn a_list_of_domains_samples_count_total() {
+    use rusd_script::graph::{Graph, out};
+    use rusd_script::ops::{self, InstancesIn, InstancesParams, SamplePointsIn, SamplePointsParams};
+
+    let dir = std::env::temp_dir().join(format!("rusd-list-domains-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_text = dir.to_string_lossy().replace('\\', "/");
+
+    let mut domains = rusd_script::usd::Layer::new("domains.rusd");
+    let a = domains.cube("/World/A", 6.0);
+    let b = domains.cube("/World/B", 2.0);
+    domains.write(&dir).unwrap();
+    let mut proto = rusd_script::usd::Layer::new("box.rusd");
+    let box_prim = proto.cube("/World/Prototypes/Box", 0.6);
+    proto.write(&dir).unwrap();
+
+    let mut g = Graph::new();
+    g.default_prim("/World");
+    let cloud = ops::sample_points(
+        &mut g,
+        out("Samples", "samples.rusd:/World/Samples"),
+        SamplePointsIn::many([a, b]),
+        SamplePointsParams { count: 60, seed: 11 },
+    );
+    let _boxes = ops::instances(
+        &mut g,
+        out("Boxes", "boxes.rusd:/World/Boxes"),
+        InstancesIn::new(cloud.ports.points, box_prim),
+        InstancesParams { max_prims: 5000, seed: 11, ..Default::default() },
+    );
+    g.write(&dir.join("scene.ops.toml")).unwrap();
+
+    let text = std::fs::read_to_string(dir.join("scene.ops.toml")).unwrap();
+    let doc = rusd_core::syntax::parse_in(&text, Some(&dir_text)).unwrap();
+    let stage = rusd_scene::lower(&doc).unwrap();
+    let nodes = rusd_proc::nodes_from_doc(&doc, Some(&dir_text));
+    let mut engine = rusd_proc::default_registry();
+    engine.set_out_dir(Some(dir.join("out")));
+    let result = engine.cook(&stage, &nodes);
+    assert!(
+        result.diags.iter().all(|d| d.severity != rusd_core::Severity::Error),
+        "a list of domains cooks clean: {:?}",
+        result.diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+    );
+    let boxes = result.ops.iter().find(|o| o.id == "/World/Boxes").unwrap();
+    let paths = prims_of(boxes);
+    assert_eq!(
+        paths.iter().filter(|p| is_instance(p, "/World/Boxes")).count(),
+        60,
+        "count is the total across the list of domains, not per domain"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **A list of clouds instances every point** (list input): an instances node wired
+/// with several clouds concatenates them in the order named and copies one prototype
+/// per point across the whole run — here 30 + 20 = 50.
+#[test]
+fn a_list_of_clouds_instances_every_point() {
+    use rusd_script::graph::{Graph, out};
+    use rusd_script::ops::{self, InstancesIn, InstancesParams, SamplePointsIn, SamplePointsParams};
+
+    let dir = std::env::temp_dir().join(format!("rusd-list-clouds-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir_text = dir.to_string_lossy().replace('\\', "/");
+
+    let mut domains = rusd_script::usd::Layer::new("domains.rusd");
+    let a = domains.cube("/World/A", 6.0);
+    domains.write(&dir).unwrap();
+    let mut proto = rusd_script::usd::Layer::new("box.rusd");
+    let box_prim = proto.cube("/World/Prototypes/Box", 0.6);
+    proto.write(&dir).unwrap();
+
+    let mut g = Graph::new();
+    g.default_prim("/World");
+    let c1 = ops::sample_points(
+        &mut g,
+        out("S1", "s1.rusd:/World/S1"),
+        SamplePointsIn::new(a.clone()),
+        SamplePointsParams { count: 30, seed: 1 },
+    );
+    let c2 = ops::sample_points(
+        &mut g,
+        out("S2", "s2.rusd:/World/S2"),
+        SamplePointsIn::new(a),
+        SamplePointsParams { count: 20, seed: 2 },
+    );
+    let _boxes = ops::instances(
+        &mut g,
+        out("Boxes", "boxes.rusd:/World/Boxes"),
+        InstancesIn::many([c1.ports.points, c2.ports.points], box_prim),
+        InstancesParams { max_prims: 5000, seed: 11, ..Default::default() },
+    );
+    g.write(&dir.join("scene.ops.toml")).unwrap();
+
+    let text = std::fs::read_to_string(dir.join("scene.ops.toml")).unwrap();
+    let doc = rusd_core::syntax::parse_in(&text, Some(&dir_text)).unwrap();
+    let stage = rusd_scene::lower(&doc).unwrap();
+    let nodes = rusd_proc::nodes_from_doc(&doc, Some(&dir_text));
+    let mut engine = rusd_proc::default_registry();
+    engine.set_out_dir(Some(dir.join("out")));
+    let result = engine.cook(&stage, &nodes);
+    assert!(
+        result.diags.iter().all(|d| d.severity != rusd_core::Severity::Error),
+        "a list of clouds cooks clean: {:?}",
+        result.diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+    );
+    let boxes = result.ops.iter().find(|o| o.id == "/World/Boxes").unwrap();
+    let paths = prims_of(boxes);
+    assert_eq!(
+        paths.iter().filter(|p| is_instance(p, "/World/Boxes")).count(),
+        50,
+        "one instance per point across every cloud in the list (30 + 20)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

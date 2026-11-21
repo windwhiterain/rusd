@@ -334,7 +334,7 @@ static SCATTER: &[PropDef] = &[
 // `Mesh`'s surface (never its bare vertices) and authors a `Points` prim in its own
 // output layer, so a pipeline prefix stopped after this op shows the cloud and a
 // prefix stopped before it shows the mesh.
-static SAMPLE_POINTS: &[PropDef] = &[req("input_points", Path), p("count", U64), p("seed", U64)];
+static SAMPLE_POINTS: &[PropDef] = &[req("input_points", PathArray), p("count", U64), p("seed", U64)];
 
 // v1.5: points -> instances. The second half: one prototype instance per input
 // point, in the cloud's own order. No `count`: the cloud decides how many there
@@ -342,7 +342,7 @@ static SAMPLE_POINTS: &[PropDef] = &[req("input_points", Path), p("count", U64),
 static INSTANCES: &[PropDef] = &[
     // v1.13: **not required** — an operator has one USD input (`input`), and the cloud an
     // instances node consumes is the graph's data flow (the earlier node's `points`).
-    p("input_points", Path),
+    p("input_points", PathArray),
     // v1.5.8: `prototype` also accepts an **asset** spelling,
     // `"prototypes.usda:/World/Prototypes/Box"`, which is not a prim path — the
     // instances then carry a reference across the asset boundary instead of a

@@ -227,6 +227,19 @@ fn type_ok(val: &Value, ty: PropType) -> bool {    use PropType::*;
             },
             _ => false,
         },
+        // One path or a list of them (list input): a single path is a list of one,
+        // and an array must be non-empty with every element a path.
+        PathArray => match val {
+            Value::Array(items) => {
+                !items.is_empty()
+                    && items.iter().all(|v| match v {
+                        Value::Path(_) => true,
+                        Value::String(s) => PrimPath::parse(s).is_ok() || asset_prim_ok(s),
+                        _ => false,
+                    })
+            }
+            other => type_ok(other, Path),
+        },
         Asset => matches!(val, Value::String(_) | Value::Asset(_)),
         Vec2 => matches!(val, Value::Vec2(_)) || num_array(val, 2),
         Vec3 => matches!(val, Value::Vec3(_)) || num_array(val, 3),

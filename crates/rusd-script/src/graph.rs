@@ -170,8 +170,23 @@ impl Graph {
             }
             if !node.wires.is_empty() {
                 text.push_str(&format!("\n[operator.{}.inputs]\n", node.name));
-                for (slot, wire) in &node.wires {
-                    text.push_str(&format!("{slot} = {}\n", quote(wire)));
+                // A slot wired once is a string; wired several times (a list input) it
+                // is an array, in the order the script named its prims.
+                let mut order: Vec<&str> = Vec::new();
+                for (slot, _) in &node.wires {
+                    if !order.contains(&slot.as_str()) {
+                        order.push(slot.as_str());
+                    }
+                }
+                for slot in order {
+                    let vals: Vec<&String> =
+                        node.wires.iter().filter(|(s, _)| s == slot).map(|(_, w)| w).collect();
+                    if vals.len() == 1 {
+                        text.push_str(&format!("{slot} = {}\n", quote(vals[0])));
+                    } else {
+                        let items: Vec<String> = vals.iter().map(|w| quote(w)).collect();
+                        text.push_str(&format!("{slot} = [{}]\n", items.join(", ")));
+                    }
                 }
             }
             text.push('\n');

@@ -186,3 +186,61 @@ fn a_products_shape_is_its_ports() {
         Cloud::shape()
     );
 }
+
+/// **A list input round-trips as an array** (list input): a sampler wired with several
+/// domains, and an instances node wired with several clouds, declare each prim under its
+/// slot, and the engine parameter `input_points` is the list of them in order.
+#[test]
+fn a_list_input_round_trips_as_an_array() {
+    use rusd_script::schema::Points;
+    let mut g = Graph::new();
+    g.default_prim("/World").seed(11);
+    let a = g.material::<Cube>("a.rusd", "/World/A");
+    let b = g.material::<Cube>("b.rusd", "/World/B");
+    let proto = g.material::<Cube>("box.rusd", "/World/Prototypes/Box");
+    let cloud = ops::sample_points(
+        &mut g,
+        out("Samples", "samples.rusd:/World/Samples"),
+        SamplePointsIn::many([a, b]),
+        SamplePointsParams { count: 60, seed: 11 },
+    );
+    let other = g.material::<Points>("c.rusd", "/World/C/points");
+    let _boxes = ops::instances(
+        &mut g,
+        out("Boxes", "boxes.rusd:/World/Boxes"),
+        InstancesIn::many([cloud.ports.points, other], proto),
+        InstancesParams { max_prims: 5000, seed: 11, ..Default::default() },
+    );
+    let text = g.to_ops_toml();
+    assert!(
+        text.contains("domain = [\"a.rusd:/World/A\", \"b.rusd:/World/B\"]"),
+        "a list slot is an array in the inputs table:\n{text}"
+    );
+    let doc = rusd_core::parse_graph(&text, Some("examples")).expect("the graph parses");
+    let samples = &doc.prims[0];
+    assert_eq!(
+        samples.inputs,
+        vec![
+            ("domain".to_owned(), "a.rusd:/World/A".to_owned()),
+            ("domain".to_owned(), "b.rusd:/World/B".to_owned()),
+        ]
+    );
+    let ip = samples.props.get("input_points").expect("input_points");
+    let rusd_core::Value::Array(items) = ip else { panic!("input_points is a list: {ip:?}") };
+    let strs: Vec<&str> = items
+        .iter()
+        .map(|v| match v {
+            rusd_core::Value::String(s) => s.as_str(),
+            _ => panic!("a path string"),
+        })
+        .collect();
+    assert_eq!(strs, vec!["a.rusd:/World/A", "b.rusd:/World/B"]);
+    let boxes = &doc.prims[1];
+    let points: Vec<&str> = boxes
+        .inputs
+        .iter()
+        .filter(|(s, _)| s == "points")
+        .map(|(_, w)| w.as_str())
+        .collect();
+    assert_eq!(points, vec!["/World/Samples/points", "c.rusd:/World/C/points"]);
+}

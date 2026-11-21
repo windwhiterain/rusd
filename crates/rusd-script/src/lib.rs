@@ -63,4 +63,4 @@ pub mod usd;
 
 pub use graph::{Graph, Node, Output, out};
 pub use prim::{Prim, Wire};
-pub use shape::{Arr, List, Ports, ShapeOf};
+pub use shape::{Arr, List, Many, Ports, ShapeOf};

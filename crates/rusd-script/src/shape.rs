@@ -98,6 +98,26 @@ impl<T: ShapeOf> ShapeOf for List<T> {
     }
 }
 
+/// **A slot wired with one prim or a list of them**, each of type `T`. The declared
+/// shape is the element contract — `Prim<T>`, what every wired prim must be — while
+/// the multiplicity is the author's wiring choice: a sampler may draw from several
+/// domains, an instances node copy along several clouds. Unlike [`List`], the script
+/// holds the elements (it names them), so this is a `Vec` of handles, not a run whose
+/// length the data decides.
+pub struct Many<T: Schema>(pub Vec<Prim<T>>);
+
+impl<T: Schema> Clone for Many<T> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<T: Schema> ShapeOf for Many<T> {
+    fn shape() -> Shape {
+        Prim::<T>::shape()
+    }
+}
+
 /// **An array**: exactly `N` of `T`, named `<prefix>{k:06}` under one parent. The length
 /// is the schema's, which is the one difference from [`List`].
 pub struct Arr<T: ShapeOf, const N: usize> {

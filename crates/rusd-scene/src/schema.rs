@@ -24,6 +24,10 @@ pub enum PropType {
     String,
     Token,
     Path,
+    /// A path, or a non-empty list of paths (list input): one prim reference or
+    /// several, each a `path`. The sampler's `domain` and the instances node's
+    /// `points` take this — wire one geometry, or a list of them.
+    PathArray,
     Asset,
     Vec2,
     Vec3,
@@ -63,6 +67,7 @@ impl PropType {
             Self::String => "string",
             Self::Token => "token",
             Self::Path => "path",
+            Self::PathArray => "path[]",
             Self::Asset => "asset",
             Self::Vec2 => "vec2",
             Self::Vec3 => "vec3",

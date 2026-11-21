@@ -52,7 +52,7 @@ use crate::graph::{Graph, Node, Output};
 use crate::ports;
 use crate::prim::{Prim, Wire};
 use crate::schema::{Cube, Gprim, Material, Points, Schema, Sphere, Untyped, Xform, Xformable};
-use crate::shape::{List, Port, Ports, Shape, ShapeOf};
+use crate::shape::{List, Many, Port, Ports, Shape, ShapeOf};
 
 // --- What a call returns ---------------------------------------------------
 
@@ -149,13 +149,24 @@ ports! {
     /// geometry is read, because a `Points` is a `Gprim` too and has neither a volume
     /// nor a surface.
     pub struct SamplePointsIn {
-        domain: Prim<Gprim>,
+        domain: Many<Gprim>,
     }
 }
 
 impl SamplePointsIn {
+    /// One domain to sample.
     pub fn new(domain: impl Wire<Gprim>) -> Self {
-        Self { domain: domain.wire() }
+        Self { domain: Many(vec![domain.wire()]) }
+    }
+
+    /// Several domains: the sampler draws from each, splitting `count` across them
+    /// by their measure (a cube's volume, a mesh's surface area).
+    pub fn many<I, T>(domains: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Wire<Gprim>,
+    {
+        Self { domain: Many(domains.into_iter().map(|d| d.wire()).collect()) }
     }
 }
 
@@ -197,15 +208,13 @@ pub fn sample_points(
     input: SamplePointsIn,
     params: SamplePointsParams,
 ) -> Product<Cloud> {
-    let wire = input.domain.reference();
-    let anchor = node(
-        g,
-        at,
-        "sample_points",
-        Some(wire.clone()),
-        vec![("domain".to_owned(), wire)],
-        params.entries(),
-    );
+    let domains: Vec<String> = input.domain.0.iter().map(|p| p.reference()).collect();
+    let wires: Vec<(String, String)> =
+        domains.iter().map(|d| ("domain".to_owned(), d.clone())).collect();
+    // One domain keeps the single-USD-input spelling; several are a list the inputs
+    // table carries as an array, and there is no single `input` to name.
+    let input = if domains.len() == 1 { domains.first().cloned() } else { None };
+    let anchor = node(g, at, "sample_points", input, wires, params.entries());
     let points = anchor.child("points");
     Product { anchor, ports: Cloud { points } }
 }
@@ -216,14 +225,28 @@ ports! {
     /// **What an instances node reads**: the cloud it copies along, and the prim it
     /// copies. The prototype is an `Xformable` — anything USD can place.
     pub struct InstancesIn {
-        points: Prim<Points>,
+        points: Many<Points>,
         prototype: Prim<Xformable>,
     }
 }
 
 impl InstancesIn {
+    /// One cloud to instance along.
     pub fn new(points: impl Wire<Points>, prototype: impl Wire<Xformable>) -> Self {
-        Self { points: points.wire(), prototype: prototype.wire() }
+        Self { points: Many(vec![points.wire()]), prototype: prototype.wire() }
+    }
+
+    /// Several clouds: one instance per point across all of them, in the order the
+    /// clouds are named, bounded by `max_prims`.
+    pub fn many<I, T>(points: I, prototype: impl Wire<Xformable>) -> Self
+    where
+        I: IntoIterator<Item = T>,
+        T: Wire<Points>,
+    {
+        Self {
+            points: Many(points.into_iter().map(|p| p.wire()).collect()),
+            prototype: prototype.wire(),
+        }
     }
 }
 
@@ -268,17 +291,10 @@ pub fn instances(
     params: InstancesParams,
 ) -> Product<InstancesOut> {
     let prototype = input.prototype.reference();
-    let anchor = node(
-        g,
-        at,
-        "instances",
-        Some(prototype.clone()),
-        vec![
-            ("points".to_owned(), input.points.reference()),
-            ("prototype".to_owned(), prototype),
-        ],
-        params.entries(),
-    );
+    let mut wires: Vec<(String, String)> =
+        input.points.0.iter().map(|p| ("points".to_owned(), p.reference())).collect();
+    wires.push(("prototype".to_owned(), prototype.clone()));
+    let anchor = node(g, at, "instances", Some(prototype), wires, params.entries());
     let items = List::new(anchor.path(), "i");
     Product { anchor, ports: InstancesOut { items } }
 }

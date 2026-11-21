@@ -423,6 +423,23 @@ impl<'a> GenContext<'a> {
         self.param_str(name)
     }
 
+    /// A `path` parameter that names **one prim or a list of them** (list input): a
+    /// string is one path, an array of strings is several, in the document's order.
+    pub fn param_paths(&self, name: &str) -> Vec<String> {
+        fn one(v: &Value) -> Option<String> {
+            match v {
+                Value::String(s) => Some(s.clone()),
+                Value::Path(p) => Some(p.as_str().to_owned()),
+                _ => None,
+            }
+        }
+        match self.params.get(name) {
+            Some(Value::Array(items)) => items.iter().filter_map(one).collect(),
+            Some(v) => one(v).into_iter().collect(),
+            None => Vec::new(),
+        }
+    }
+
     pub fn param_vec2(&self, name: &str, default: [f64; 2]) -> [f64; 2] {
         match self.params.get(name) {
             Some(Value::Array(items)) if items.len() == 2 => {

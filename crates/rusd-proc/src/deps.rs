@@ -34,6 +34,23 @@ fn path_param(props: &std::collections::BTreeMap<String, Value>, name: &str) -> 
     }
 }
 
+/// One `path`-typed parameter as a list of paths: a string is one, an array of
+/// strings is several (list input), in the document's order.
+fn path_params(props: &std::collections::BTreeMap<String, Value>, name: &str) -> Vec<String> {
+    fn one(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Path(p) => Some(p.as_str().to_owned()),
+            _ => None,
+        }
+    }
+    match props.get(name) {
+        Some(Value::Array(items)) => items.iter().filter_map(one).collect(),
+        Some(v) => one(v).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
 /// The declared reads of a generator node, by schema name.
 pub(crate) fn reads_for(
     schema: &str,
@@ -41,28 +58,32 @@ pub(crate) fn reads_for(
     anchor: &str,
 ) -> Vec<(String, String)> {
     let mut reads: Vec<(String, String)> = Vec::new();
-    let input = path_param(props, "input_points");
+    let inputs = path_params(props, "input_points");
     match schema {
         // v1.5: mesh -> points. A surface read only: the op samples a `Mesh`'s
         // triangles, and its bare vertices are deliberately **not** an input (taking
         // them would place points on vertices, which is different geometry).
         "RusdSamplePoints" => {
-            if let Some(p) = input {
-                // v1.5.8: the input is a **surface** (a `Mesh`: its triangles) or a
+            if !inputs.is_empty() {
+                // v1.5.8: each input is a **surface** (a `Mesh`: its triangles) or a
                 // **volume** (a `Cube`: the box it names). Both are declared, for the
                 // reason `RusdScatter` declares both forms — which one a path answers
                 // with is the scene's business, not this list's, and the memo value of
-                // each is the geometry itself.
-                reads.push((p.clone(), SURFACE_READ.to_owned()));
-                reads.push((p, VOLUME_READ.to_owned()));
+                // each is the geometry itself. A list input declares every domain.
+                for p in &inputs {
+                    reads.push((p.clone(), SURFACE_READ.to_owned()));
+                    reads.push((p.clone(), VOLUME_READ.to_owned()));
+                }
                 reads.push((anchor.to_owned(), WORLD_XFORM_READ.to_owned()));
             }
         }
         // v1.5: points -> instances. A cloud read, plus the prototype's radius (the
         // arc composes the prototype's values into every instance).
         "RusdInstances" => {
-            if let Some(p) = input {
-                reads.push((p, rusd_scene::geometry::POINTS_ATTR.to_owned()));
+            if !inputs.is_empty() {
+                for p in &inputs {
+                    reads.push((p.clone(), rusd_scene::geometry::POINTS_ATTR.to_owned()));
+                }
                 reads.push((anchor.to_owned(), WORLD_XFORM_READ.to_owned()));
             }
             if let Some(p) = path_param(props, "prototype") {
